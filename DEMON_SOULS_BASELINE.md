@@ -11,4 +11,4 @@ The preferred Windows build for Demon’s Souls is **KytyPS5 Build 32 LTO BEST**
 
 This repository's current `main` source tree is not proven to reproduce the archived executable. Do not infer the source commit from the ZIP timestamps. Keep this binary as the comparison build; identify matching source separately before treating source changes as improvements over Build 32.
 
-The archive must be attached to a GitHub Release separately. This note does not contain or publish the binary.
+The exact archive is published as the [Build 32 LTO BEST release](https://github.com/MILLYONYT/Demon-Souls-KytyPS5/releases/tag/DemonSoulsKytyPS5). Its executable identifies itself as `fbcc0c6-dirty`; that source revision and its uncommitted changes are unavailable here. The [verified baseline workflow](https://github.com/MILLYONYT/Demon-Souls-KytyPS5/actions/workflows/best-baseline.yml) copies the release asset and checks its hash, while `tools/build_from_best.py` can prepare guarded byte-patch experiments.
