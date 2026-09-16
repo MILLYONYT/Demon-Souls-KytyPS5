@@ -1,3 +1,7 @@
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+
 #include "graphics/shader/recompiler/ir/passes/LinearSrt.h"
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 
