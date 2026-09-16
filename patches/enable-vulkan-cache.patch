@@ -1,0 +1,28 @@
+diff --git a/src/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp b/src/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp
+index 83cabcd..5df595a 100644
+--- a/src/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp
++++ b/src/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp
+@@ -486,11 +486,6 @@ void PipelineCache::InitializeDriverCache() {
+ 		PipelineCacheLog("Vulkan pipeline cache: disabled (unknown git revision)");
+ 		return;
+ 	}
+-	if (git_hash.ends_with("-dirty")) {
+-		PipelineCacheLog("Vulkan pipeline cache: disabled (dirty build)");
+-		return;
+-	}
+-
+ 	m_driver_cache_path     = std::filesystem::path("_PipelineCache") / (title_id + ".bin");
+ 	const auto path         = Common::PathToString(m_driver_cache_path);
+ 	const bool cache_exists = Common::File::IsFileExisting(m_driver_cache_path);
+diff --git a/src/graphics/shader/recompiler/ir/passes/SrtWalker.cpp b/src/graphics/shader/recompiler/ir/passes/SrtWalker.cpp
+index 2aedc25..e54e7f8 100644
+--- a/src/graphics/shader/recompiler/ir/passes/SrtWalker.cpp
++++ b/src/graphics/shader/recompiler/ir/passes/SrtWalker.cpp
+@@ -1,3 +1,7 @@
++#ifndef NOMINMAX
++#define NOMINMAX
++#endif
++
+ #include "graphics/shader/recompiler/ir/passes/LinearSrt.h"
+ #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
+ 
