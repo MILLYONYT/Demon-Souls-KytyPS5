@@ -1,0 +1,50 @@
+name: Demon Souls Build 32 Windows tests
+
+on:
+  push:
+    branches: [best32-windows-tests]
+    paths:
+      - .github/workflows/best32-windows-tests.yml
+      - tools/build_from_best.py
+      - patches/best32.json
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-x64:
+    name: Build 32 Windows x64 test
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Create test ZIP from verified Build 32
+        shell: pwsh
+        run: |
+          $output = 'KytyPS5-B32-Windows-TEST.zip'
+          if (Test-Path 'patches/best32.json') {
+            python tools/build_from_best.py $output --patch patches/best32.json
+          } else {
+            python tools/build_from_best.py $output
+          }
+      - name: Verify test ZIP
+        shell: pwsh
+        run: |
+          @'
+          from pathlib import Path
+          import zipfile
+          archive = Path('KytyPS5-B32-Windows-TEST.zip')
+          with zipfile.ZipFile(archive) as z:
+              assert z.testzip() is None
+              assert {'kyty_emulator.exe', 'launcher.exe'} <= set(z.namelist())
+          print('Verified Windows x64 test ZIP:', archive.stat().st_size, 'bytes')
+          '@ | python -
+      - name: Upload Windows x64 test artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DemonSouls-B32-Windows-TEST-${{ github.run_number }}-${{ github.run_attempt }}
+          path: KytyPS5-B32-Windows-TEST.zip
+          if-no-files-found: error
