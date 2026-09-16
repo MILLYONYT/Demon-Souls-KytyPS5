@@ -1,3 +1,82 @@
+diff --git a/src/graphics/host_gpu/renderer/cache/bufferCache.cpp b/src/graphics/host_gpu/renderer/cache/bufferCache.cpp
+index f1864a7..40d6d6a 100644
+--- a/src/graphics/host_gpu/renderer/cache/bufferCache.cpp
++++ b/src/graphics/host_gpu/renderer/cache/bufferCache.cpp
+@@ -493,7 +493,11 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
+ 	if (mapped != nullptr) {
+ 		for (auto& copy: copies) {
+ 			const auto address = buffer.CpuAddress() + copy.dstOffset;
+-			std::memcpy(mapped + copy.srcOffset, reinterpret_cast<const void*>(address), copy.size);
++			if (!Libs::LibKernel::Memory::TryReadBacking(address, mapped + copy.srcOffset,
++			                                            copy.size)) {
++				EXIT("BufferCache: unreadable guest buffer upload at 0x%016llx\n",
++				     static_cast<unsigned long long>(address));
++			}
+ 			copy.srcOffset += base_offset;
+ 		}
+ 		m_staging_buffer.Commit();
+@@ -504,8 +508,11 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
+ 	                                         vk::BufferUsageFlagBits::eTransferSrc, total_size);
+ 	for (const auto& copy: copies) {
+ 		const auto address = buffer.CpuAddress() + copy.dstOffset;
+-		std::memcpy(temporary->Mapped().data() + copy.srcOffset,
+-		            reinterpret_cast<const void*>(address), copy.size);
++		if (!Libs::LibKernel::Memory::TryReadBacking(
++		        address, temporary->Mapped().data() + copy.srcOffset, copy.size)) {
++			EXIT("BufferCache: unreadable guest buffer upload at 0x%016llx\n",
++			     static_cast<unsigned long long>(address));
++		}
+ 	}
+ 	temporary->Flush(0, total_size);
+ 	const auto handle = temporary->Handle();
+diff --git a/src/graphics/host_gpu/renderer/cache/textureCache.cpp b/src/graphics/host_gpu/renderer/cache/textureCache.cpp
+index 18d5b4b..0166f1f 100644
+--- a/src/graphics/host_gpu/renderer/cache/textureCache.cpp
++++ b/src/graphics/host_gpu/renderer/cache/textureCache.cpp
+@@ -518,22 +518,26 @@ TextureCache::ImageIds TextureCache::FindImagesInRegion(uint64_t address, uint64
+ 
+ ImageId TextureCache::GetNullImage(const ImageDesc& desc) {
+ 	const auto format = desc.info.pixel_format;
+-	if (const auto found = m_null_images.find(format); found != m_null_images.end()) {
++	const auto key = static_cast<uint64_t>(static_cast<uint32_t>(format)) |
++	                 (static_cast<uint64_t>(static_cast<uint32_t>(desc.info.type)) << 32) |
++	                 (static_cast<uint64_t>(desc.info.samples) << 48);
++	if (const auto found = m_null_images.find(key); found != m_null_images.end()) {
+ 		return found->second;
+ 	}
+ 	ImageInfo info {};
+ 	info.pixel_format    = desc.info.pixel_format;
+ 	info.guest_format    = desc.info.guest_format;
+-	info.type            = Prospero::ImageType::kColor2D;
++	// Null 3D/1D descriptors still require an image of the matching Vulkan type.
++	info.type            = desc.info.type;
+ 	info.extent          = {1, 1, 1};
+ 	info.resources       = {1, 1};
+ 	info.pitch           = 1;
+ 	info.bytes_per_block = std::max(desc.info.bytes_per_block, 1u);
+-	info.samples         = 1;
++	info.samples         = desc.info.samples;
+ 	info.tile_mode       = Prospero::TileMode::kLinear;
+ 	info.mip_layout[0]   = {0, info.bytes_per_block, 1, 1};
+ 	const auto id        = InsertImage(info);
+-	m_null_images.emplace(format, id);
++	m_null_images.emplace(key, id);
+ 	return id;
+ }
+ 
+diff --git a/src/graphics/host_gpu/renderer/cache/textureCache.h b/src/graphics/host_gpu/renderer/cache/textureCache.h
+index f373595..c75086b 100644
+--- a/src/graphics/host_gpu/renderer/cache/textureCache.h
++++ b/src/graphics/host_gpu/renderer/cache/textureCache.h
+@@ -168,7 +168,7 @@ private:
+ 	BufferCache&                                      m_buffer_cache;
+ 	Common::SlotVector<Image>                         m_slot_images;
+ 	ImagePageTable                                    m_image_page_table;
+-	std::unordered_map<vk::Format, ImageId>           m_null_images;
++	std::unordered_map<uint64_t, ImageId>              m_null_images;
+ 	Common::LeastRecentlyUsedCache<ImageId, uint64_t> m_lru_cache;
+ 	std::unordered_set<ImageId>                       m_download_images;
+ 	std::map<uint64_t, MetaDataInfo>                  m_surface_metas;
 diff --git a/src/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp b/src/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp
 index 83cabcd..5df595a 100644
 --- a/src/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp
@@ -14,6 +93,41 @@ index 83cabcd..5df595a 100644
  	m_driver_cache_path     = std::filesystem::path("_PipelineCache") / (title_id + ".bin");
  	const auto path         = Common::PathToString(m_driver_cache_path);
  	const bool cache_exists = Common::File::IsFileExisting(m_driver_cache_path);
+diff --git a/src/graphics/host_gpu/vma.cpp b/src/graphics/host_gpu/vma.cpp
+index f7b512f..3deb1fa 100644
+--- a/src/graphics/host_gpu/vma.cpp
++++ b/src/graphics/host_gpu/vma.cpp
+@@ -136,11 +136,29 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
+ 	alloc_info.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+ 
+ 	vk::Image::CType native_image = VK_NULL_HANDLE;
+-	const auto        result       = static_cast<vk::Result>(
++	auto              result       = static_cast<vk::Result>(
+ 	    vmaCreateImage(allocator, static_cast<const vk::ImageCreateInfo::NativeType*>(image_info),
+ 	                   &alloc_info, &native_image, &image.allocation, nullptr));
++	if (result == vk::Result::eErrorOutOfDeviceMemory ||
++	    result == vk::Result::eErrorOutOfHostMemory) {
++		// Prefer the original device-local allocation. If it is exhausted, let VMA
++		// choose another memory type supported by this image before giving up.
++		LOGF("vmaCreateImage: %s; retrying with device-local memory preferred\n",
++		     vk::to_string(result).c_str());
++		native_image        = VK_NULL_HANDLE;
++		image.allocation    = nullptr;
++		alloc_info.requiredFlags  = 0;
++		alloc_info.preferredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
++		result = static_cast<vk::Result>(vmaCreateImage(
++		    allocator, static_cast<const vk::ImageCreateInfo::NativeType*>(image_info),
++		    &alloc_info, &native_image, &image.allocation, nullptr));
++	}
+ 	image.image = native_image;
+ 	if (result != vk::Result::eSuccess) {
++		LOGF("vmaCreateImage failed: %s, format=%d extent=%ux%ux%u layers=%u levels=%u\n",
++		     vk::to_string(result).c_str(), static_cast<int>(image_info.format),
++		     image_info.extent.width, image_info.extent.height, image_info.extent.depth,
++		     image_info.arrayLayers, image_info.mipLevels);
+ 		LogMemoryBudget();
+ 		return false;
+ 	}
 diff --git a/src/graphics/shader/recompiler/ir/passes/SrtWalker.cpp b/src/graphics/shader/recompiler/ir/passes/SrtWalker.cpp
 index 2aedc25..e54e7f8 100644
 --- a/src/graphics/shader/recompiler/ir/passes/SrtWalker.cpp
