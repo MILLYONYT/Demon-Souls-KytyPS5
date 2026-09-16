@@ -3,7 +3,7 @@ name: Build and Release KytyPS5
 on:
   workflow_dispatch:
   push:
-    branches: [ main, master ]
+    branches: [ main, master, demons-souls-b32-cache-test ]
   pull_request:
 
 env:
@@ -120,7 +120,7 @@ jobs:
       - name: Upload Windows artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: KytyPS5-Windows-x64
+          name: KytyPS5-B32-CACHE-TEST-Windows-x64
           path: _Build/windows/install/**
           if-no-files-found: error
 
