@@ -1,0 +1,28 @@
+name: Verify Demon Souls Build 32 baseline
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/best-baseline.yml
+      - tools/build_from_best.py
+      - tools/README-BEST.md
+
+jobs:
+  reproduce:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Reproduce exact working ZIP from the release
+        run: python3 tools/build_from_best.py KytyPS5-Build32-LTO-BEST-verified.zip
+      - name: Verify ZIP integrity and pinned checksum
+        run: |
+          unzip -t KytyPS5-Build32-LTO-BEST-verified.zip | tail -1
+          echo 'b4c9aad01b22886beef0dda58d1978b8acfc5fe39577ed1a348fd34abc502dea  KytyPS5-Build32-LTO-BEST-verified.zip' | sha256sum -c -
+      - name: Save verified build
+        uses: actions/upload-artifact@v4
+        with:
+          name: Demon-Souls-Build32-LTO-BEST-verified
+          path: KytyPS5-Build32-LTO-BEST-verified.zip
+          if-no-files-found: error
