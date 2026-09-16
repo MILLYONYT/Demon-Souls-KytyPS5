@@ -1,0 +1,102 @@
+name: Demon Souls Build 32 Vulkan cache Windows test
+
+on:
+  push:
+    branches: [best32-windows-tests]
+    paths:
+      - .github/workflows/b32-cache-source-test.yml
+      - patches/enable-vulkan-cache.patch
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-x64:
+    name: Build 32 cache test Windows x64
+    runs-on: windows-2022
+    steps:
+      - name: Checkout test branch
+        uses: actions/checkout@v4
+      - name: Verify working binary baseline
+        shell: pwsh
+        run: python tools/build_from_best.py KytyPS5-B32-baseline-reference.zip
+      - name: Checkout Build 32 source revision
+        uses: actions/checkout@v4
+        with:
+          ref: fbcc0c6914a9e76ae5dc52358b935657dcfcb7d7
+          path: source
+          submodules: recursive
+      - name: Apply isolated cache fix
+        shell: pwsh
+        run: git -C source apply "$env:GITHUB_WORKSPACE/patches/enable-vulkan-cache.patch"
+      - name: Setup Visual Studio environment
+        uses: ilammy/msvc-dev-cmd@v1
+      - name: Setup Ninja
+        uses: seanmiddleditch/gha-setup-ninja@v5
+      - name: Locate vcpkg
+        id: vcpkg
+        shell: pwsh
+        run: |
+          $vcpkgRoot = Split-Path (Get-Command vcpkg).Source
+          $portHash = (Get-FileHash "$vcpkgRoot\ports\glslang\vcpkg.json" -Algorithm SHA256).Hash
+          "root=$vcpkgRoot" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "port_hash=$($portHash.ToLowerInvariant())" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+      - name: Cache glslang
+        id: glslang_cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ steps.vcpkg.outputs.root }}\installed\x64-windows
+          key: glslang-${{ runner.os }}-${{ runner.arch }}-${{ steps.vcpkg.outputs.port_hash }}-tools-opt
+      - name: Install glslang
+        shell: pwsh
+        run: |
+          $vcpkgRoot = "${{ steps.vcpkg.outputs.root }}"
+          if ("${{ steps.glslang_cache.outputs.cache-hit }}" -ne "true") {
+            vcpkg install glslang[tools,opt]:x64-windows
+          }
+          "$vcpkgRoot\installed\x64-windows\tools\glslang" |
+            Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+      - name: Install Qt 6.10.3
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: '6.10.3'
+          host: windows
+          target: desktop
+          arch: win64_msvc2022_64
+          cache: true
+      - name: Configure Release LTO
+        shell: cmd
+        run: |
+          cmake -S source -B _Build/windows ^
+            -G Ninja ^
+            -DCMAKE_BUILD_TYPE=Release ^
+            -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=ON ^
+            -DKYTY_BUILD_ORIGIN=Fork ^
+            -DKYTY_BUILD_REPOSITORY=${{ github.repository }} ^
+            -DKYTY_RELEASE_TAG=B32-CACHE-TEST-${{ github.sha }} ^
+            -DCMAKE_C_COMPILER=clang-cl ^
+            -DCMAKE_CXX_COMPILER=clang-cl ^
+            -DCMAKE_PREFIX_PATH="%Qt6_DIR%"
+      - name: Build Windows app
+        shell: cmd
+        run: cmake --build _Build/windows --target launcher --parallel
+      - name: Install Windows app
+        shell: cmd
+        run: cmake --install _Build/windows --prefix _Build/windows/install
+      - name: Confirm cache code is in the executable
+        shell: pwsh
+        run: |
+          @'
+          from pathlib import Path
+          exe = Path('_Build/windows/install/kyty_emulator.exe').read_bytes()
+          assert b'Vulkan pipeline cache: initialized empty' in exe
+          assert b'Vulkan pipeline cache: disabled (dirty build)' not in exe
+          print('Vulkan pipeline cache initialization compiled into executable')
+          '@ | python -
+      - name: Upload Windows x64 test build
+        uses: actions/upload-artifact@v4
+        with:
+          name: DemonSouls-B32-CACHE-TEST-Windows-x64-${{ github.run_number }}
+          path: _Build/windows/install/**
+          if-no-files-found: error
