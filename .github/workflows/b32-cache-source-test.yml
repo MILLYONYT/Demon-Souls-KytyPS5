@@ -77,6 +77,7 @@ jobs:
             -DKYTY_RELEASE_TAG=B32-CACHE-TEST-${{ github.sha }} ^
             -DCMAKE_C_COMPILER=clang-cl ^
             -DCMAKE_CXX_COMPILER=clang-cl ^
+            -DCMAKE_CXX_FLAGS=/DNOMINMAX ^
             -DCMAKE_PREFIX_PATH="%Qt6_DIR%"
       - name: Build Windows app
         shell: cmd
