@@ -126,6 +126,7 @@ jobs:
 
   macos:
     name: Build KytyPS5 (macOS)
+    if: github.ref != 'refs/heads/demons-souls-b32-cache-test'
     needs: metadata
     runs-on: macos-15
 
@@ -272,6 +273,7 @@ jobs:
 
   linux:
     name: Build KytyPS5 (Linux)
+    if: github.ref != 'refs/heads/demons-souls-b32-cache-test'
     needs: metadata
     runs-on: ubuntu-24.04
 
