@@ -1,8 +1,8 @@
-name: Demon Souls Build 32 unmapped upload Windows test
+name: Demon Souls Build 32 quiet command logs Windows test
 
 on:
   push:
-    branches: [best32-unmapped-upload-test]
+    branches: [best32-quiet-command-logs-test]
     paths:
       - .github/workflows/b32-cache-source-test.yml
       - patches/enable-vulkan-cache.patch
@@ -94,11 +94,11 @@ jobs:
           assert b'Build32 GPU thread profile:' in exe
           assert b'BufferCache: unmapped guest upload' in exe
           assert b'AJM ATRAC9 initialized:' not in exe
-          print('Vulkan cache and frame profiler compiled into executable')
+          print('Vulkan cache, frame profiler, and quiet command logging compiled into executable')
           '@ | python -
       - name: Upload Windows x64 test build
         uses: actions/upload-artifact@v4
         with:
-          name: DemonSouls-B32-UNMAPPED-UPLOAD-Windows-x64-${{ github.run_number }}
+          name: DemonSouls-B32-QUIET-COMMANDS-Windows-x64-${{ github.run_number }}
           path: _Build/windows/install/**
           if-no-files-found: error
