@@ -1,8 +1,8 @@
-name: Demon Souls Build 32 frame timing Windows test
+name: Demon Souls Build 32 GPU thread breakdown Windows test
 
 on:
   push:
-    branches: [best32-steady-frame-profile-test]
+    branches: [best32-gpu-thread-breakdown-test]
     paths:
       - .github/workflows/b32-cache-source-test.yml
       - patches/enable-vulkan-cache.patch
@@ -97,6 +97,6 @@ jobs:
       - name: Upload Windows x64 test build
         uses: actions/upload-artifact@v4
         with:
-          name: DemonSouls-B32-FRAME-PROFILE-Windows-x64-${{ github.run_number }}
+          name: DemonSouls-B32-GPU-BREAKDOWN-Windows-x64-${{ github.run_number }}
           path: _Build/windows/install/**
           if-no-files-found: error
