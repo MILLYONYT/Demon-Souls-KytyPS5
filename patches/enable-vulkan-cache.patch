@@ -97,6 +97,44 @@ index f7b512f..3deb1fa 100644
  		LogMemoryBudget();
  		return false;
  	}
+diff --git a/src/graphics/shader/recompiler/ir/passes/ResourceMaterialization.cpp b/src/graphics/shader/recompiler/ir/passes/ResourceMaterialization.cpp
+index bf1c28c..d398b24 100644
+--- a/src/graphics/shader/recompiler/ir/passes/ResourceMaterialization.cpp
++++ b/src/graphics/shader/recompiler/ir/passes/ResourceMaterialization.cpp
+@@ -1,11 +1,13 @@
+ #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
+ 
+ #include "common/assert.h"
++#include "common/logging/log.h"
+ #include "graphics/guest_gpu/gpu_format.h"
+ #include "graphics/shader/recompiler/ir/ShaderIR.h"
+ #include "graphics/shader/shaderBindings.h"
+ 
+ #include <algorithm>
++#include <atomic>
+ #include <array>
+ #include <bit>
+ #include <cstdio>
+@@ -622,6 +624,19 @@ static bool MaterializeSnapshot(const ResourcePlan& program, const SrtRuntime& r
+ 			clean_runtime.read_memory = runtime.read_specialization_memory;
+ 			std::vector<DescriptorValue> tables;
+ 			if (!EvaluateDescriptorSources(program, requests, clean_runtime, tables)) {
++				if (program.stage == ShaderType::Compute &&
++				    program.shader_hash == 0x05021f35c669b111ull) {
++					// During reload this table can be unavailable while the guest rebuilds
++					// its heap. Match the inactive-source null-image path for this shader;
++					// the next dispatch will read the table again.
++					static std::atomic_bool logged_unavailable_table {false};
++					if (!logged_unavailable_table.exchange(true, std::memory_order_relaxed)) {
++						LOGF("SRT indirect image table unavailable: shader=0x%016llx image=%u; using null image\n",
++						     static_cast<unsigned long long>(program.shader_hash), image_index);
++					}
++					next.images[image_index].dword_count = 8u;
++				continue;
++				}
+ 				return fail("an indirect image table source did not evaluate");
+ 			}
+ 			IndirectImage table;
 diff --git a/src/graphics/shader/recompiler/ir/passes/SrtWalker.cpp b/src/graphics/shader/recompiler/ir/passes/SrtWalker.cpp
 index 2aedc25..593caae 100644
 --- a/src/graphics/shader/recompiler/ir/passes/SrtWalker.cpp
