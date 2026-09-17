@@ -1,5 +1,5 @@
 diff --git a/src/graphics/guest_gpu/graphicsRun.cpp b/src/graphics/guest_gpu/graphicsRun.cpp
-index cca1005..f4f6dfd 100644
+index cca1005..870e6e9 100644
 --- a/src/graphics/guest_gpu/graphicsRun.cpp
 +++ b/src/graphics/guest_gpu/graphicsRun.cpp
 @@ -23,7 +23,9 @@
@@ -12,7 +12,7 @@ index cca1005..f4f6dfd 100644
  #include <cstring>
  #include <deque>
  #include <memory>
-@@ -39,6 +41,10 @@ static thread_local Pm4Execution*     g_current_execution = nullptr;
+@@ -39,6 +41,17 @@ static thread_local Pm4Execution*     g_current_execution = nullptr;
  static thread_local bool              g_gpu_mutex_owned   = false;
  static thread_local bool              g_gpu_thread        = false;
  static thread_local GuestGpu*         g_gpu_state         = nullptr;
@@ -20,10 +20,17 @@ index cca1005..f4f6dfd 100644
 +// Only the GPU worker writes these; report their totals with the existing 2s profile.
 +static thread_local std::array<double, 3> g_gpu_phase_ms {};
 +#endif
++#if defined(KYTY_B32_PM4_SAMPLE_PROFILE)
++// 256 PM4 handlers plus the fast draw-indirect run at slot 256.
++static thread_local std::array<uint64_t, 257> g_pm4_sample_ns {};
++static thread_local std::array<uint64_t, 257> g_pm4_sample_count {};
++static thread_local std::array<uint64_t, 257> g_pm4_call_count {};
++static thread_local uint64_t g_pm4_sample_index = 0;
++#endif
  
  struct DrawIndirectArgs {
  	uint32_t vertex_count_per_instance;
-@@ -470,6 +476,21 @@ void GuestGpu::ThreadRun(void* data) {
+@@ -470,6 +483,21 @@ void GuestGpu::ThreadRun(void* data) {
  	KYTY_PROFILER_THREAD("Thread_Gpu");
  	g_gpu_thread = true;
  	g_gpu_state  = gpu;
@@ -45,7 +52,7 @@ index cca1005..f4f6dfd 100644
  
  	for (;;) {
  		Submission                   submission;
-@@ -540,7 +561,47 @@ void GuestGpu::ThreadRun(void* data) {
+@@ -540,7 +568,69 @@ void GuestGpu::ThreadRun(void* data) {
  		}
  
  		EXIT_IF(!has_submission);
@@ -82,6 +89,28 @@ index cca1005..f4f6dfd 100644
 +				     g_gpu_phase_ms[0], g_gpu_phase_ms[1], g_gpu_phase_ms[2]);
 +				g_gpu_phase_ms.fill(0);
 +#endif
++#if defined(KYTY_B32_PM4_SAMPLE_PROFILE)
++				std::array<bool, 257> reported {};
++				for (unsigned rank = 0; rank < 5; ++rank) {
++					unsigned top = 257;
++					for (unsigned op = 0; op < g_pm4_sample_ns.size(); ++op) {
++						if (!reported[op] &&
++						    (top == 257 || g_pm4_sample_ns[op] > g_pm4_sample_ns[top])) {
++							top = op;
++						}
++					}
++					if (top == 257 || g_pm4_sample_count[top] == 0) break;
++					reported[top] = true;
++					LOGF("Build32 PM4 sample: op=%u sampled_ms=%.2f samples=%llu calls=%llu "
++					     "(one in 16 calls; op=256 is draw run)\n", top,
++					     static_cast<double>(g_pm4_sample_ns[top]) / 1000000.0,
++					     static_cast<unsigned long long>(g_pm4_sample_count[top]),
++					     static_cast<unsigned long long>(g_pm4_call_count[top]));
++				}
++				g_pm4_sample_ns.fill(0);
++				g_pm4_sample_count.fill(0);
++				g_pm4_call_count.fill(0);
++#endif
 +				profile_start = now;
 +				process_ms = 0;
 +				slices = blocked_slices = 0;
@@ -93,7 +122,7 @@ index cca1005..f4f6dfd 100644
  
  		Common::LockGuard lock(gpu->m_queue_mutex);
  		if (!complete) {
-@@ -578,6 +639,37 @@ bool GuestGpu::Process(Submission& submission) {
+@@ -578,6 +668,37 @@ bool GuestGpu::Process(Submission& submission) {
  
  	cp.BufferInit();
  	bool complete = true;
@@ -131,7 +160,7 @@ index cca1005..f4f6dfd 100644
  
  	switch (submission.type) {
  		case SubmissionType::Graphics: {
-@@ -587,14 +679,14 @@ bool GuestGpu::Process(Submission& submission) {
+@@ -587,14 +708,14 @@ bool GuestGpu::Process(Submission& submission) {
  				bool round_progress = false;
  				if (!submission.constant_complete) {
  					submission.constant_complete =
@@ -148,7 +177,7 @@ index cca1005..f4f6dfd 100644
  					    Pm4ProcessResult::Complete;
  					round_progress |= submission.command_execution.MadeProgress();
  				}
-@@ -606,11 +698,11 @@ bool GuestGpu::Process(Submission& submission) {
+@@ -606,11 +727,11 @@ bool GuestGpu::Process(Submission& submission) {
  			}
  			if (progressed) {
  				if (complete) {
@@ -163,7 +192,7 @@ index cca1005..f4f6dfd 100644
  			}
  			break;
  		}
-@@ -628,20 +720,20 @@ bool GuestGpu::Process(Submission& submission) {
+@@ -628,20 +749,20 @@ bool GuestGpu::Process(Submission& submission) {
  			if (first_slice) {
  				GraphicsDbgDumpDcb("cc", num_dw, buffer);
  			}
@@ -189,7 +218,52 @@ index cca1005..f4f6dfd 100644
  			cp.PrepareCpuFlip(submission.flip_request_id);
  			break;
  	}
-@@ -877,10 +969,12 @@ void CommandProcessor::DrawIndex(DrawIndexArgs args) {
+@@ -767,7 +888,21 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution, size_t stop_depth) {
+ 		auto handler = g_cp_op_func[opcode];
+ 		if (opcode != Pm4::IT_DRAW_INDEX_INDIRECT) m_draw_run_skip = 0;
+ 		if (packet_header == 0xc0032500u && !GraphicsRunDebugDumpEnabled()) {
++#if defined(KYTY_B32_PM4_SAMPLE_PROFILE)
++			++g_pm4_call_count[256];
++			const bool sample_draw = (++g_pm4_sample_index & 15u) == 0;
++			const auto draw_start = sample_draw ? std::chrono::steady_clock::now()
++			                                    : std::chrono::steady_clock::time_point {};
++#endif
+ 			const auto consumed = TryDrawIndirectRun({packet, remaining_dw});
++#if defined(KYTY_B32_PM4_SAMPLE_PROFILE)
++			if (sample_draw) {
++				g_pm4_sample_ns[256] += static_cast<uint64_t>(
++				    std::chrono::duration_cast<std::chrono::nanoseconds>(
++				        std::chrono::steady_clock::now() - draw_start).count());
++				++g_pm4_sample_count[256];
++			}
++#endif
+ 			if (consumed) {
+ 				execution.m_buffer_stack[buffer_index].offset_dw += consumed;
+ 				execution.m_made_progress = true;
+@@ -792,8 +927,22 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution, size_t stop_depth) {
+ 			     total_dw - remaining_dw, packet_header);
+ 		}
+ 
++#if defined(KYTY_B32_PM4_SAMPLE_PROFILE)
++		++g_pm4_call_count[opcode];
++		const bool sample_handler = (++g_pm4_sample_index & 15u) == 0;
++		const auto handler_start = sample_handler ? std::chrono::steady_clock::now()
++		                                          : std::chrono::steady_clock::time_point {};
++#endif
+ 		const auto packet_dw =
+ 		    handler(*this, packet_header & ~1u, packet + 1, remaining_dw, total_dw) + 1;
++#if defined(KYTY_B32_PM4_SAMPLE_PROFILE)
++		if (sample_handler) {
++			g_pm4_sample_ns[opcode] += static_cast<uint64_t>(
++			    std::chrono::duration_cast<std::chrono::nanoseconds>(
++			        std::chrono::steady_clock::now() - handler_start).count());
++			++g_pm4_sample_count[opcode];
++		}
++#endif
+ 		EXIT_IF(packet_dw > remaining_dw);
+ 		if (execution.m_suspended) {
+ 			if (execution.m_buffer_stack.size() > buffer_index + 1) {
+@@ -877,10 +1026,12 @@ void CommandProcessor::DrawIndex(DrawIndexArgs args) {
  	if (args.instance_count == 0) {
  		args.instance_count = m_num_instances;
  	}
