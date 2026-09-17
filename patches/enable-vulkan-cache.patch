@@ -294,7 +294,7 @@ index f7b512f..3deb1fa 100644
  		return false;
  	}
 diff --git a/src/graphics/shader/recompiler/ShaderRecompiler.cpp b/src/graphics/shader/recompiler/ShaderRecompiler.cpp
-index 4aa50e0..9d46f9d 100644
+index 4aa50e0..4c7bb07 100644
 --- a/src/graphics/shader/recompiler/ShaderRecompiler.cpp
 +++ b/src/graphics/shader/recompiler/ShaderRecompiler.cpp
 @@ -21,8 +21,10 @@
@@ -308,7 +308,7 @@ index 4aa50e0..9d46f9d 100644
  #include <span>
  #include <utility>
  
-@@ -502,6 +504,56 @@ Decoder::Program DecodeFusedProgram(std::span<const uint32_t> front, std::span<c
+@@ -502,6 +504,70 @@ Decoder::Program DecodeFusedProgram(std::span<const uint32_t> front, std::span<c
  
  } // namespace
  
@@ -322,11 +322,14 @@ index 4aa50e0..9d46f9d 100644
 +	CFG::Graph graph;
 +	bool dispatcher_fallback = false;
 +	std::string dispatcher_reason;
++	size_t estimated_bytes = 0;
 +};
 +
 +std::mutex g_compute_frontend_mutex;
 +std::deque<CachedComputeFrontend> g_compute_frontends;
 +constexpr size_t MaxCachedComputeFrontends = 64;
++constexpr size_t MaxCachedComputeFrontendBytes = 96ull * 1024 * 1024;
++size_t g_compute_frontend_bytes = 0;
 +
 +bool FindCachedComputeFrontend(std::span<const uint32_t> code, uint64_t hash,
 +                               Decoder::Program& decoded, CFG::Graph& graph,
@@ -350,22 +353,33 @@ index 4aa50e0..9d46f9d 100644
 +void RememberComputeFrontend(std::span<const uint32_t> code, uint64_t hash,
 +                             const Decoder::Program& decoded, const CFG::Graph& graph,
 +                             bool dispatcher_fallback, const std::string& dispatcher_reason) {
-+	if (code.size() > 8192) {
++	if (code.size() > 16384) {
++		return;
++	}
++	// Conservatively account for nested CFG vectors as well as instruction storage.
++	const size_t estimated_bytes = code.size() * sizeof(uint32_t) +
++	    decoded.instructions.size() * sizeof(Decoder::Instruction) +
++	    graph.blocks.size() * sizeof(CFG::BasicBlock) * 4;
++	if (estimated_bytes > MaxCachedComputeFrontendBytes) {
 +		return;
 +	}
 +	std::lock_guard lock(g_compute_frontend_mutex);
-+	if (g_compute_frontends.size() == MaxCachedComputeFrontends) {
++	while (!g_compute_frontends.empty() &&
++	       (g_compute_frontends.size() >= MaxCachedComputeFrontends ||
++	        g_compute_frontend_bytes > MaxCachedComputeFrontendBytes - estimated_bytes)) {
++		g_compute_frontend_bytes -= g_compute_frontends.front().estimated_bytes;
 +		g_compute_frontends.pop_front();
 +	}
 +	g_compute_frontends.push_back({hash, {code.begin(), code.end()}, decoded.instructions,
-+	                               graph, dispatcher_fallback, dispatcher_reason});
++	                               graph, dispatcher_fallback, dispatcher_reason, estimated_bytes});
++	g_compute_frontend_bytes += estimated_bytes;
 +}
 +} // namespace
 +
  TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOptions& options) {
  	if (code.empty()) {
  		EXIT("shader recompiler input is empty\n");
-@@ -524,11 +576,19 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
+@@ -524,11 +590,19 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
  	     static_cast<uint64_t>(code.size()));
  
  	Decoder::Program decoded;
@@ -389,7 +403,7 @@ index 4aa50e0..9d46f9d 100644
  	}
  	LOGF("%s phase end: stage=%s hash=0x%016" PRIx64 " decode instructions=%" PRIu64
  	     " elapsed_ms=%" PRIu64 "\n",
-@@ -545,15 +605,16 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
+@@ -545,15 +619,16 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
  
  	LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " CFG BuildGraph\n", GetDumpLabel(options),
  	     StageName(options.stage), options.shader_hash);
@@ -410,10 +424,54 @@ index 4aa50e0..9d46f9d 100644
  		dispatcher_fallback = true;
  		dispatcher_reason   = cfg.unsupported_reason;
  		LogDispatcherFallback(options, cfg, "build", dispatcher_reason);
-@@ -662,6 +723,10 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
+@@ -630,11 +705,21 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
+ 	     " elapsed_ms=%" PRIu64 "\n",
+ 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
+ 	     static_cast<uint64_t>(ir.blocks.size()), phase_ms());
++	const auto slow_pass = [&](const char* name, uint64_t begin_ms) {
++		const auto elapsed = phase_ms() - begin_ms;
++		if (options.stage == ShaderType::Compute && elapsed >= 16) {
++			LOGF("%s slow IR pass: hash=0x%016" PRIx64 " name=%s elapsed_ms=%" PRIu64 "\n",
++			     GetDumpLabel(options), options.shader_hash, name, elapsed);
++		}
++	};
++	auto pass_start = phase_ms();
+ 	IR::RewriteToSsa(ir.blocks);
+ 	IR::ConstantPropagationPass(ir.blocks);
+ 	IR::ResolveControlFlowIdentities(ir);
+ 	IR::RemoveIdentities(ir.blocks);
+ 	IR::EliminateDeadCode(ir.blocks);
++	slow_pass("ssa+basic-opts", pass_start);
++	pass_start = phase_ms();
+ 	const auto read_lane_stats = IR::EliminateReadLane(ir, ir.wave_size);
+ 	if (read_lane_stats.rewritten_reads != 0) {
+ 		LOGF("%s read-lane elimination: reads=%" PRIu32 "\n", GetDumpLabel(options),
+@@ -644,6 +729,8 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
+ 		IR::RemoveIdentities(ir.blocks);
+ 		IR::EliminateDeadCode(ir.blocks);
  	}
++	slow_pass("read-lane", pass_start);
++	pass_start = phase_ms();
+ 	const auto waterfalls = IR::RewriteWaterfallDescriptors(ir);
+ 	if (waterfalls != 0) {
+ 		LOGF("%s waterfall descriptor de-scalarization: stage=%s hash=0x%016" PRIx64
+@@ -654,14 +741,23 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
+ 		IR::RemoveIdentities(ir.blocks);
+ 		IR::EliminateDeadCode(ir.blocks);
+ 	}
++	slow_pass("waterfall", pass_start);
++	pass_start = phase_ms();
+ 	IR::BuildSrtPlan(ir);
+ 	IR::EliminateDeadCode(ir.blocks);
++	slow_pass("srt-plan", pass_start);
+ 	if (options.dump_ir && options.early_dump) {
+ 		LOGF("%s native IR before resource tracking:\n%s", GetDumpLabel(options),
+ 		     IR::ProgramToString(ir).c_str());
+ 	}
++	pass_start = phase_ms();
  	IR::TrackResources(ir);
  	IR::EliminateDeadCode(ir.blocks);
++	slow_pass("resource-tracking", pass_start);
 +	if (cache_eligible && !frontend_hit && phase_ms() >= 16) {
 +		RememberComputeFrontend(code, options.shader_hash, decoded, cfg,
 +		                        dispatcher_fallback, dispatcher_reason);
