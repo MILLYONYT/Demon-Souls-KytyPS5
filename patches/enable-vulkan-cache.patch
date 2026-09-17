@@ -47,7 +47,7 @@ index f373595..c75086b 100644
  	std::unordered_set<ImageId>                       m_download_images;
  	std::map<uint64_t, MetaDataInfo>                  m_surface_metas;
 diff --git a/src/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp b/src/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp
-index 83cabcd..559c569 100644
+index 83cabcd..61e84d6 100644
 --- a/src/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp
 +++ b/src/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp
 @@ -100,8 +100,23 @@ void PipelineCacheLog(fmt::format_string<Args...> format, Args&&... args) {
@@ -94,7 +94,38 @@ index 83cabcd..559c569 100644
  }
  
  void ReportMaterialization(const char* label, ShaderType stage, uint64_t hash,
-@@ -486,11 +508,6 @@ void PipelineCache::InitializeDriverCache() {
+@@ -279,8 +301,15 @@ struct PipelineCache::ProgramCache {
+ 			case ShaderType::Compute: stage_name = "cs"; break;
+ 			default: EXIT("invalid pipeline shader stage\n");
+ 		}
++		const auto compile_start = std::chrono::steady_clock::now();
+ 		auto result = ShaderRecompiler::CompileProgram(std::move(translated), options,
+ 		                                               specialization, push_data_start_dword);
++		const auto compile_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
++		    std::chrono::steady_clock::now() - compile_start).count();
++		if (compile_ms >= 16) {
++			PipelineCacheLog("Build32 stall: shader compile stage={} hash=0x{:016x} ms={}",
++			                 stage_name, options.shader_hash, compile_ms);
++		}
+ 		DumpShaderOriginal(stage_name, options.shader_hash, params.code, result.decoded_dump);
+ 		if (!ValidateShaderSpirv(options.dump_label, options.shader_hash, result.spirv)) {
+ 			DumpShaderSpirv(stage_name, options.shader_hash, result.spirv);
+@@ -403,7 +432,14 @@ struct PipelineCache::ProgramCache {
+ 		} else if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
+ 			options.wave_size = input_info.wave_size;
+ 		}
++		const auto translate_start = std::chrono::steady_clock::now();
+ 		auto translated = ShaderRecompiler::TranslateProgram(params.code, options);
++		const auto translate_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
++		    std::chrono::steady_clock::now() - translate_start).count();
++		if (translate_ms >= 16) {
++			PipelineCacheLog("Build32 stall: shader translate stage={} hash=0x{:016x} ms={}",
++			                 static_cast<uint32_t>(stage), params.hash, translate_ms);
++		}
+ 		if (entry == programs.end()) {
+ 			auto resource_plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
+ 			ReportMaterialization(label, stage, params.hash, report,
+@@ -486,11 +522,6 @@ void PipelineCache::InitializeDriverCache() {
  		PipelineCacheLog("Vulkan pipeline cache: disabled (unknown git revision)");
  		return;
  	}
@@ -106,7 +137,7 @@ index 83cabcd..559c569 100644
  	m_driver_cache_path     = std::filesystem::path("_PipelineCache") / (title_id + ".bin");
  	const auto path         = Common::PathToString(m_driver_cache_path);
  	const bool cache_exists = Common::File::IsFileExisting(m_driver_cache_path);
-@@ -559,6 +576,25 @@ void PipelineCache::InitializeDriverCache() {
+@@ -559,6 +590,30 @@ void PipelineCache::InitializeDriverCache() {
  
  void PipelineCache::Save() {
  	Common::LockGuard lock(m_mutex);
@@ -126,13 +157,18 @@ index 83cabcd..559c569 100644
 +	m_new_pipelines_since_checkpoint = 0;
 +	m_last_driver_cache_checkpoint = now;
 +	SaveDriverCacheLocked(false);
++	const auto checkpoint_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
++	    std::chrono::steady_clock::now() - now).count();
++	if (checkpoint_ms >= 16) {
++		PipelineCacheLog("Build32 stall: cache checkpoint ms={}", checkpoint_ms);
++	}
 +}
 +
 +void PipelineCache::SaveDriverCacheLocked(bool final) {
  	if (m_driver_cache == nullptr) {
  		return;
  	}
-@@ -612,8 +648,10 @@ void PipelineCache::Save() {
+@@ -612,8 +667,10 @@ void PipelineCache::Save() {
  	}
  	PipelineCacheLog("Vulkan pipeline cache: saved {} bytes to {}", payload.size(),
  	                 Common::PathToString(m_driver_cache_path));
@@ -145,7 +181,24 @@ index 83cabcd..559c569 100644
  }
  
  PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
-@@ -850,6 +888,7 @@ PipelineCache::Pipeline& PipelineCache::CreateGraphicsPipeline(
+@@ -840,9 +897,16 @@ PipelineCache::Pipeline& PipelineCache::CreateGraphicsPipeline(
+ 
+ 	auto cached = std::make_unique<Pipeline>();
+ 	LogPipelineTrace("CreatePipelineInternal begin", vs_id, ps_id);
++	const auto pipeline_start = std::chrono::steady_clock::now();
+ 	CreatePipelineInternal(m_graphics, *cached, rendering, key.vertex_input, vs_input_info,
+ 	                       vertex_program, ps_input_info, pixel_program, static_params,
+ 	                       m_driver_cache);
++	const auto pipeline_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
++	    std::chrono::steady_clock::now() - pipeline_start).count();
++	if (pipeline_ms >= 16) {
++		PipelineCacheLog("Build32 stall: graphics pipeline vs={} ps={} ms={}",
++		                 vs_id, ps_id, pipeline_ms);
++	}
+ 	LogPipelineTrace("CreatePipelineInternal done", vs_id, ps_id);
+ 
+ 	EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr);
+@@ -850,6 +914,7 @@ PipelineCache::Pipeline& PipelineCache::CreateGraphicsPipeline(
  
  	auto [iter, inserted] = m_graphics_pipelines.emplace(std::move(key), std::move(cached));
  	EXIT_IF(!inserted);
@@ -153,7 +206,21 @@ index 83cabcd..559c569 100644
  
  	return *iter->second;
  }
-@@ -880,6 +919,7 @@ PipelineCache::CreateComputePipeline(const ShaderComputeInputInfo& input_info,
+@@ -873,13 +938,21 @@ PipelineCache::CreateComputePipeline(const ShaderComputeInputInfo& input_info,
+ 	}
+ 
+ 	auto cached = std::make_unique<Pipeline>();
++	const auto pipeline_start = std::chrono::steady_clock::now();
+ 	CreatePipelineInternal(m_graphics, *cached, input_info, compute_program.module, m_driver_cache);
++	const auto pipeline_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
++	    std::chrono::steady_clock::now() - pipeline_start).count();
++	if (pipeline_ms >= 16) {
++		PipelineCacheLog("Build32 stall: compute pipeline shader={} ms={}",
++		                 compute_program.id, pipeline_ms);
++	}
+ 
+ 	EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr);
+ 	EXIT_NOT_IMPLEMENTED(cached->pipeline_layout == nullptr);
  
  	auto [iter, inserted] = m_compute_pipelines.emplace(compute_program.id, std::move(cached));
  	EXIT_IF(!inserted);
