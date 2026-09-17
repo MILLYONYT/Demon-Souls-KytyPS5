@@ -1,5 +1,5 @@
 diff --git a/src/graphics/guest_gpu/graphicsRun.cpp b/src/graphics/guest_gpu/graphicsRun.cpp
-index cca1005..c879ca1 100644
+index cca1005..f4f6dfd 100644
 --- a/src/graphics/guest_gpu/graphicsRun.cpp
 +++ b/src/graphics/guest_gpu/graphicsRun.cpp
 @@ -23,7 +23,9 @@
@@ -12,7 +12,18 @@ index cca1005..c879ca1 100644
  #include <cstring>
  #include <deque>
  #include <memory>
-@@ -470,6 +472,21 @@ void GuestGpu::ThreadRun(void* data) {
+@@ -39,6 +41,10 @@ static thread_local Pm4Execution*     g_current_execution = nullptr;
+ static thread_local bool              g_gpu_mutex_owned   = false;
+ static thread_local bool              g_gpu_thread        = false;
+ static thread_local GuestGpu*         g_gpu_state         = nullptr;
++#if defined(KYTY_B32_PHASE_PROFILE)
++// Only the GPU worker writes these; report their totals with the existing 2s profile.
++static thread_local std::array<double, 3> g_gpu_phase_ms {};
++#endif
+ 
+ struct DrawIndirectArgs {
+ 	uint32_t vertex_count_per_instance;
+@@ -470,6 +476,21 @@ void GuestGpu::ThreadRun(void* data) {
  	KYTY_PROFILER_THREAD("Thread_Gpu");
  	g_gpu_thread = true;
  	g_gpu_state  = gpu;
@@ -34,7 +45,7 @@ index cca1005..c879ca1 100644
  
  	for (;;) {
  		Submission                   submission;
-@@ -540,7 +557,41 @@ void GuestGpu::ThreadRun(void* data) {
+@@ -540,7 +561,47 @@ void GuestGpu::ThreadRun(void* data) {
  		}
  
  		EXIT_IF(!has_submission);
@@ -65,6 +76,12 @@ index cca1005..c879ca1 100644
 +				     static_cast<unsigned long long>(type_slices[0]),
 +				     static_cast<unsigned long long>(type_slices[1]),
 +				     static_cast<unsigned long long>(type_slices[2]), max_slice_ms);
++#if defined(KYTY_B32_PHASE_PROFILE)
++				LOGF("Build32 GPU phase profile: pm4_ms=%.1f flush_ms=%.1f gc_ms=%.1f "
++				     "(CPU wall time per 2s window)\n",
++				     g_gpu_phase_ms[0], g_gpu_phase_ms[1], g_gpu_phase_ms[2]);
++				g_gpu_phase_ms.fill(0);
++#endif
 +				profile_start = now;
 +				process_ms = 0;
 +				slices = blocked_slices = 0;
@@ -76,7 +93,103 @@ index cca1005..c879ca1 100644
  
  		Common::LockGuard lock(gpu->m_queue_mutex);
  		if (!complete) {
-@@ -877,10 +928,12 @@ void CommandProcessor::DrawIndex(DrawIndexArgs args) {
+@@ -578,6 +639,37 @@ bool GuestGpu::Process(Submission& submission) {
+ 
+ 	cp.BufferInit();
+ 	bool complete = true;
++	const auto run_pm4 = [&](Pm4Execution& execution, std::span<const uint32_t> commands) {
++#if defined(KYTY_B32_PHASE_PROFILE)
++		const auto start = std::chrono::steady_clock::now();
++#endif
++		const auto result = cp.Process(execution, commands);
++#if defined(KYTY_B32_PHASE_PROFILE)
++		g_gpu_phase_ms[0] += std::chrono::duration<double, std::milli>(
++		    std::chrono::steady_clock::now() - start).count();
++#endif
++		return result;
++	};
++	const auto run_gc = [&] {
++#if defined(KYTY_B32_PHASE_PROFILE)
++		const auto start = std::chrono::steady_clock::now();
++#endif
++		m_renderer.GetGpuResources().RunGarbageCollector();
++#if defined(KYTY_B32_PHASE_PROFILE)
++		g_gpu_phase_ms[2] += std::chrono::duration<double, std::milli>(
++		    std::chrono::steady_clock::now() - start).count();
++#endif
++	};
++	const auto flush = [&] {
++#if defined(KYTY_B32_PHASE_PROFILE)
++		const auto start = std::chrono::steady_clock::now();
++#endif
++		cp.BufferFlush();
++#if defined(KYTY_B32_PHASE_PROFILE)
++		g_gpu_phase_ms[1] += std::chrono::duration<double, std::milli>(
++		    std::chrono::steady_clock::now() - start).count();
++#endif
++	};
+ 
+ 	switch (submission.type) {
+ 		case SubmissionType::Graphics: {
+@@ -587,14 +679,14 @@ bool GuestGpu::Process(Submission& submission) {
+ 				bool round_progress = false;
+ 				if (!submission.constant_complete) {
+ 					submission.constant_complete =
+-					    cp.Process(submission.constant_execution, submission.constant_commands) ==
++					    run_pm4(submission.constant_execution, submission.constant_commands) ==
+ 					    Pm4ProcessResult::Complete;
+ 					round_progress |= submission.constant_execution.MadeProgress();
+ 				}
+ 				cp.SetCeComplete(submission.constant_complete);
+ 				if (!submission.command_complete) {
+ 					submission.command_complete =
+-					    cp.Process(submission.command_execution, submission.commands) ==
++					    run_pm4(submission.command_execution, submission.commands) ==
+ 					    Pm4ProcessResult::Complete;
+ 					round_progress |= submission.command_execution.MadeProgress();
+ 				}
+@@ -606,11 +698,11 @@ bool GuestGpu::Process(Submission& submission) {
+ 			}
+ 			if (progressed) {
+ 				if (complete) {
+-					m_renderer.GetGpuResources().RunGarbageCollector();
++					run_gc();
+ 				}
+-				cp.BufferFlush();
++				flush();
+ 			} else if (complete) {
+-				m_renderer.GetGpuResources().RunGarbageCollector();
++				run_gc();
+ 			}
+ 			break;
+ 		}
+@@ -628,20 +720,20 @@ bool GuestGpu::Process(Submission& submission) {
+ 			if (first_slice) {
+ 				GraphicsDbgDumpDcb("cc", num_dw, buffer);
+ 			}
+-			complete = cp.Process(submission.command_execution, submission.commands) ==
++			complete = run_pm4(submission.command_execution, submission.commands) ==
+ 			           Pm4ProcessResult::Complete;
+ 			if (submission.command_execution.MadeProgress()) {
+ 				if (complete) {
+-					m_renderer.GetGpuResources().RunGarbageCollector();
++					run_gc();
+ 				}
+-				cp.BufferFlush();
++				flush();
+ 			} else if (complete) {
+-				m_renderer.GetGpuResources().RunGarbageCollector();
++				run_gc();
+ 			}
+ 			break;
+ 		}
+ 		case SubmissionType::FlipPreparation:
+-			m_renderer.GetGpuResources().RunGarbageCollector();
++			run_gc();
+ 			cp.PrepareCpuFlip(submission.flip_request_id);
+ 			break;
+ 	}
+@@ -877,10 +969,12 @@ void CommandProcessor::DrawIndex(DrawIndexArgs args) {
  	if (args.instance_count == 0) {
  		args.instance_count = m_num_instances;
  	}
