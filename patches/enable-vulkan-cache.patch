@@ -744,3 +744,143 @@ index c00421d..44e19a8 100644
  	const auto all   = AllBlockIds(count);
  
  	for (auto& block: graph.blocks) {
+diff --git a/src/graphics/guest_gpu/graphicsRun.cpp b/src/graphics/guest_gpu/graphicsRun.cpp
+index cca1005..d359734 100644
+--- a/src/graphics/guest_gpu/graphicsRun.cpp
++++ b/src/graphics/guest_gpu/graphicsRun.cpp
+@@ -23,7 +23,9 @@
+ #include <algorithm>
+ #include <array>
+ #include <atomic>
++#include <chrono>
+ #include <cstdio>
++#include <cstdlib>
+ #include <cstring>
+ #include <deque>
+ #include <memory>
+@@ -470,6 +472,18 @@ void GuestGpu::ThreadRun(void* data) {
+ 	KYTY_PROFILER_THREAD("Thread_Gpu");
+ 	g_gpu_thread = true;
+ 	g_gpu_state  = gpu;
++	static const bool frame_profile = [] {
++#if defined(KYTY_B32_FRAME_PROFILE)
++		return true;
++#else
++		const char* value = std::getenv("KYTY_B32_FRAME_PROFILE");
++		return value != nullptr && value[0] == '1' && value[1] == '\0';
++#endif
++	}();
++	using Clock = std::chrono::steady_clock;
++	auto profile_start = Clock::now();
++	double process_ms = 0;
++	uint64_t slices = 0, blocked_slices = 0;
+ 
+ 	for (;;) {
+ 		Submission                   submission;
+@@ -540,7 +554,24 @@ void GuestGpu::ThreadRun(void* data) {
+ 		}
+ 
+ 		EXIT_IF(!has_submission);
++		const auto slice_start = frame_profile ? Clock::now() : Clock::time_point {};
+ 		const bool complete = gpu->Process(submission);
++		if (frame_profile) {
++			const auto now = Clock::now();
++			process_ms += std::chrono::duration<double, std::milli>(now - slice_start).count();
++			++slices;
++			blocked_slices += !complete;
++			const auto window_ms = std::chrono::duration<double, std::milli>(now - profile_start).count();
++			if (window_ms >= 2000.0) {
++				LOGF("Build32 GPU thread profile: window_ms=%.0f process_ms=%.1f slices=%llu "
++				     "blocked_slices=%llu (CPU wall time; includes shader compilation)\n",
++				     window_ms, process_ms, static_cast<unsigned long long>(slices),
++				     static_cast<unsigned long long>(blocked_slices));
++				profile_start = now;
++				process_ms = 0;
++				slices = blocked_slices = 0;
++			}
++		}
+ 
+ 		Common::LockGuard lock(gpu->m_queue_mutex);
+ 		if (!complete) {
+diff --git a/src/graphics/presentation/window/swapchain.cpp b/src/graphics/presentation/window/swapchain.cpp
+index 166d772..87e2be9 100644
+--- a/src/graphics/presentation/window/swapchain.cpp
++++ b/src/graphics/presentation/window/swapchain.cpp
+@@ -14,6 +14,8 @@
+ #include "graphics/presentation/window/windowInternal.h"
+ 
+ #include <algorithm>
++#include <chrono>
++#include <cstdlib>
+ #include <deque>
+ #include <limits>
+ #include <memory>
+@@ -765,12 +767,28 @@ RenderContext& Presenter::Renderer() const noexcept {
+ 
+ void Presenter::Present(Frame& frame, bool reuse) {
+ 	KYTY_PROFILER_FUNCTION();
++	// CPU-side frame timings; the Vulkan work may still be running after Present returns.
++	static const bool frame_profile = [] {
++#if defined(KYTY_B32_FRAME_PROFILE)
++		return true;
++#else
++		const char* value = std::getenv("KYTY_B32_FRAME_PROFILE");
++		return value != nullptr && value[0] == '1' && value[1] == '\0';
++#endif
++	}();
++	using Clock = std::chrono::steady_clock;
++	static Clock::time_point last_frame;
++	static uint64_t frames = 0;
++	static uint64_t reused_frames = 0;
++	static double interval_ms = 0, acquire_ms = 0, record_ms = 0, present_ms = 0;
++	const auto start = frame_profile ? Clock::now() : Clock::time_point {};
+ 	m_impl->frames.ValidateForPresent(&frame, reuse);
+ 
+ 	const auto overlay_visual = GetSystemOverlayVisualState();
+ 	auto&      swapchain  = m_impl->swapchain;
+ 	for (uint32_t attempt = 0; attempt < 2; attempt++) {
+ 		auto status = swapchain.AcquireNextImage();
++		const auto acquired = frame_profile ? Clock::now() : Clock::time_point {};
+ 		if (status != Swapchain::Status::Success) {
+ 			m_impl->RecoverSwapchain(status);
+ 			continue;
+@@ -783,7 +801,9 @@ void Presenter::Present(Frame& frame, bool reuse) {
+ 			swapchain.RecordPresentCommands(command, frame.image, draw_system_overlay);
+ 			frame.present_tick = swapchain.Submit(m_impl->present_scheduler);
+ 		}
++		const auto submitted = frame_profile ? Clock::now() : Clock::time_point {};
+ 		status = swapchain.Present();
++		const auto presented = frame_profile ? Clock::now() : Clock::time_point {};
+ 		if (status != Swapchain::Status::Success) {
+ 			m_impl->RecoverSwapchain(status);
+ 			continue;
+@@ -793,6 +813,29 @@ void Presenter::Present(Frame& frame, bool reuse) {
+ 		                                         std::memory_order_release);
+ 		m_impl->window.UpdateTitle();
+ 		m_impl->frames.Release(&frame, true);
++		if (frame_profile) {
++			const auto elapsed = [](Clock::time_point a, Clock::time_point b) {
++				return std::chrono::duration<double, std::milli>(b - a).count();
++			};
++			if (last_frame != Clock::time_point {}) {
++				interval_ms += elapsed(last_frame, start);
++				acquire_ms += elapsed(start, acquired);
++				record_ms += elapsed(acquired, submitted);
++				present_ms += elapsed(submitted, presented);
++				reused_frames += reuse;
++				if (++frames == 120) {
++					LOGF("Build32 frame profile: frames=%llu reused=%llu interval_ms=%.2f acquire_ms=%.2f "
++					     "record_submit_ms=%.2f present_ms=%.2f (CPU wall time averages)\n",
++					     static_cast<unsigned long long>(frames),
++					     static_cast<unsigned long long>(reused_frames), interval_ms / frames,
++					     acquire_ms / frames, record_ms / frames, present_ms / frames);
++					frames = 0;
++					reused_frames = 0;
++					interval_ms = acquire_ms = record_ms = present_ms = 0;
++				}
++			}
++			last_frame = start;
++		}
+ 		return;
+ 	}
+ 	LOGF("Vulkan presentation retry exhausted; dropping frame\n");
