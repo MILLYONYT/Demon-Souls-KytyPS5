@@ -180,7 +180,7 @@ index bf1c28c..d398b24 100644
  			}
  			IndirectImage table;
 diff --git a/src/graphics/shader/recompiler/ir/passes/SrtWalker.cpp b/src/graphics/shader/recompiler/ir/passes/SrtWalker.cpp
-index 2aedc25..593caae 100644
+index 2aedc25..6a24d1b 100644
 --- a/src/graphics/shader/recompiler/ir/passes/SrtWalker.cpp
 +++ b/src/graphics/shader/recompiler/ir/passes/SrtWalker.cpp
 @@ -1,11 +1,18 @@
@@ -226,14 +226,15 @@ index 2aedc25..593caae 100644
  			return false;
  		}
  		DescriptorValue value;
-@@ -1197,7 +1210,30 @@ bool EvaluateRuntimeSourcesImpl(const ResourcePlan& program, std::span<const uin
+@@ -1197,7 +1210,31 @@ bool EvaluateRuntimeSourcesImpl(const ResourcePlan& program, std::span<const uin
  		if (!evaluate_flat || active[source_index]) {
  			for (uint32_t index = 0; index < source->dword_count; index++) {
  				if (!evaluator.Evaluate(source->dwords[index], value.dwords[index])) {
 -					return false;
 +					const bool reload_shader = evaluate_flat &&
 +					    ((program.stage == ShaderType::Pixel &&
-+					      program.shader_hash == 0x06f5c0838a0b409bull) ||
++					      (program.shader_hash == 0x06f5c0838a0b409bull ||
++					      program.shader_hash == 0xe1f1578df1050d8bull)) ||
 +					     (program.stage == ShaderType::Compute &&
 +					      program.shader_hash == 0x05021f35c669b111ull));
 +					static std::atomic_bool logged_pixel {false};
@@ -258,7 +259,7 @@ index 2aedc25..593caae 100644
  				}
  			}
  		}
-@@ -1210,10 +1246,32 @@ bool EvaluateRuntimeSourcesImpl(const ResourcePlan& program, std::span<const uin
+@@ -1210,10 +1247,33 @@ bool EvaluateRuntimeSourcesImpl(const ResourcePlan& program, std::span<const uin
  			const bool clean    = read.flat_offset < clean_flat_slots.size() &&
  			                      clean_flat_slots[read.flat_offset] != 0u;
  			auto&      selected = clean ? clean_evaluator : evaluator;
@@ -270,7 +271,8 @@ index 2aedc25..593caae 100644
 +			if (!selected.Evaluate(read.value, flattened[read.flat_offset])) {
 +				const bool reload_shader =
 +				    (program.stage == ShaderType::Pixel &&
-+				     program.shader_hash == 0x06f5c0838a0b409bull) ||
++				     (program.shader_hash == 0x06f5c0838a0b409bull ||
++				     program.shader_hash == 0xe1f1578df1050d8bull)) ||
 +				    (program.stage == ShaderType::Compute &&
 +				     program.shader_hash == 0x05021f35c669b111ull);
 +				static std::atomic_bool logged_pixel {false};
@@ -293,14 +295,15 @@ index 2aedc25..593caae 100644
  		}
  	}
  	results = std::move(evaluated);
-@@ -1279,6 +1337,15 @@ static std::shared_ptr<LinearSrtPlan> BuildControlledLinearSrt(const ResourcePla
+@@ -1279,6 +1339,16 @@ static std::shared_ptr<LinearSrtPlan> BuildControlledLinearSrt(const ResourcePla
  void BuildLinearSrtPlan(ResourcePlan& program) {
      program.linear_srt.reset();
  #if defined(__x86_64__) || defined(_M_X64)
-+    // Diagnose the two reload failures with the checked evaluator rather than
++    // Diagnose the reload failures with the checked evaluator rather than
 +    // executing the linear plan. Keep all other shaders on the fast path.
 +    const bool reload_pixel = program.stage == ShaderType::Pixel &&
-+                              program.shader_hash == 0x06f5c0838a0b409bull;
++                              (program.shader_hash == 0x06f5c0838a0b409bull ||
++                              program.shader_hash == 0xe1f1578df1050d8bull);
 +    const bool reload_compute = program.stage == ShaderType::Compute &&
 +                                program.shader_hash == 0x05021f35c669b111ull;
 +    if (reload_pixel || reload_compute) {
