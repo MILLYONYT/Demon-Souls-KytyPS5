@@ -1,8 +1,8 @@
-name: Demon Souls Build 32 GPU thread breakdown Windows test
+name: Demon Souls Build 32 quiet logging and backing Windows test
 
 on:
   push:
-    branches: [best32-gpu-thread-breakdown-test]
+    branches: [best32-quiet-logs-backing-test]
     paths:
       - .github/workflows/b32-cache-source-test.yml
       - patches/enable-vulkan-cache.patch
@@ -74,7 +74,7 @@ jobs:
             -DKYTY_RELEASE_TAG=B32-CRASH-TEST-${{ github.sha }} ^
             -DCMAKE_C_COMPILER=clang-cl ^
             -DCMAKE_CXX_COMPILER=clang-cl ^
-            "-DCMAKE_CXX_FLAGS=/DNOMINMAX /EHsc /DKYTY_B32_FRAME_PROFILE" ^
+            "-DCMAKE_CXX_FLAGS=/DNOMINMAX /EHsc /DKYTY_B32_FRAME_PROFILE /DKYTY_B32_QUIET_HOT_LOGS" ^
             -DCMAKE_PREFIX_PATH="%Qt6_DIR%"
       - name: Build Windows app
         shell: cmd
@@ -92,11 +92,13 @@ jobs:
           assert b'Vulkan pipeline cache: disabled (dirty build)' not in exe
           assert b'Build32 frame profile:' in exe
           assert b'Build32 GPU thread profile:' in exe
+          assert b'BufferCache: unreadable guest buffer upload' in exe
+          assert b'AJM ATRAC9 initialized:' not in exe
           print('Vulkan cache and frame profiler compiled into executable')
           '@ | python -
       - name: Upload Windows x64 test build
         uses: actions/upload-artifact@v4
         with:
-          name: DemonSouls-B32-GPU-BREAKDOWN-Windows-x64-${{ github.run_number }}
+          name: DemonSouls-B32-QUIET-BACKING-Windows-x64-${{ github.run_number }}
           path: _Build/windows/install/**
           if-no-files-found: error
