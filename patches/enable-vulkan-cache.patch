@@ -98,7 +98,7 @@ index f7b512f..3deb1fa 100644
  		return false;
  	}
 diff --git a/src/graphics/shader/recompiler/ir/passes/SrtWalker.cpp b/src/graphics/shader/recompiler/ir/passes/SrtWalker.cpp
-index 2aedc25..ed25f7a 100644
+index 2aedc25..d246fe7 100644
 --- a/src/graphics/shader/recompiler/ir/passes/SrtWalker.cpp
 +++ b/src/graphics/shader/recompiler/ir/passes/SrtWalker.cpp
 @@ -1,7 +1,12 @@
@@ -114,16 +114,40 @@ index 2aedc25..ed25f7a 100644
  #include "graphics/shader/recompiler/ir/ShaderIR.h"
  
  #include <algorithm>
-@@ -1197,6 +1202,8 @@ bool EvaluateRuntimeSourcesImpl(const ResourcePlan& program, std::span<const uin
+@@ -1197,7 +1202,21 @@ bool EvaluateRuntimeSourcesImpl(const ResourcePlan& program, std::span<const uin
  		if (!evaluate_flat || active[source_index]) {
  			for (uint32_t index = 0; index < source->dword_count; index++) {
  				if (!evaluator.Evaluate(source->dwords[index], value.dwords[index])) {
-+					LOGF("SRT descriptor evaluation failed: shader=0x%016llx source=%u word=%u\n",
-+					     static_cast<unsigned long long>(program.shader_hash), source_index, index);
- 					return false;
+-					return false;
++					const bool reload_shader = evaluate_flat &&
++					    ((program.stage == ShaderType::Pixel &&
++					      program.shader_hash == 0x06f5c0838a0b409bull) ||
++					     (program.stage == ShaderType::Compute &&
++					      program.shader_hash == 0x05021f35c669b111ull));
++					LOGF("SRT descriptor evaluation failed: shader=0x%016llx source=%u word=%u%s\n",
++					     static_cast<unsigned long long>(program.shader_hash), source_index, index,
++					     reload_shader ? "; using null descriptor" : "");
++					if (!reload_shader) {
++						return false;
++					}
++					// On reload an unavailable descriptor cannot be used safely. Bind the
++					// existing null resource until the game supplies a readable one.
++					value.dwords.fill(0);
++					break;
  				}
  			}
-@@ -1279,6 +1286,15 @@ static std::shared_ptr<LinearSrtPlan> BuildControlledLinearSrt(const ResourcePla
+ 		}
+@@ -1212,6 +1231,9 @@ bool EvaluateRuntimeSourcesImpl(const ResourcePlan& program, std::span<const uin
+ 			auto&      selected = clean ? clean_evaluator : evaluator;
+ 			if (read.flat_offset >= flattened.size() ||
+ 			    !selected.Evaluate(read.value, flattened[read.flat_offset])) {
++				LOGF("SRT flat read failed: shader=0x%016llx slot=%u clean=%u\n",
++				     static_cast<unsigned long long>(program.shader_hash), read.flat_offset,
++				     clean ? 1u : 0u);
+ 				return false;
+ 			}
+ 		}
+@@ -1279,6 +1301,15 @@ static std::shared_ptr<LinearSrtPlan> BuildControlledLinearSrt(const ResourcePla
  void BuildLinearSrtPlan(ResourcePlan& program) {
      program.linear_srt.reset();
  #if defined(__x86_64__) || defined(_M_X64)
