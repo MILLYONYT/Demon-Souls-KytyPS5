@@ -1,5 +1,207 @@
+diff --git a/src/graphics/guest_gpu/graphicsRun.cpp b/src/graphics/guest_gpu/graphicsRun.cpp
+index cca1005..c879ca1 100644
+--- a/src/graphics/guest_gpu/graphicsRun.cpp
++++ b/src/graphics/guest_gpu/graphicsRun.cpp
+@@ -23,7 +23,9 @@
+ #include <algorithm>
+ #include <array>
+ #include <atomic>
++#include <chrono>
+ #include <cstdio>
++#include <cstdlib>
+ #include <cstring>
+ #include <deque>
+ #include <memory>
+@@ -470,6 +472,21 @@ void GuestGpu::ThreadRun(void* data) {
+ 	KYTY_PROFILER_THREAD("Thread_Gpu");
+ 	g_gpu_thread = true;
+ 	g_gpu_state  = gpu;
++	static const bool frame_profile = [] {
++#if defined(KYTY_B32_FRAME_PROFILE)
++		return true;
++#else
++		const char* value = std::getenv("KYTY_B32_FRAME_PROFILE");
++		return value != nullptr && value[0] == '1' && value[1] == '\0';
++#endif
++	}();
++	using Clock = std::chrono::steady_clock;
++	auto profile_start = Clock::now();
++	double process_ms = 0;
++	uint64_t slices = 0, blocked_slices = 0;
++	std::array<double, 3> type_ms {};
++	std::array<uint64_t, 3> type_slices {};
++	double blocked_ms = 0, max_slice_ms = 0;
+ 
+ 	for (;;) {
+ 		Submission                   submission;
+@@ -540,7 +557,41 @@ void GuestGpu::ThreadRun(void* data) {
+ 		}
+ 
+ 		EXIT_IF(!has_submission);
++		const auto slice_start = frame_profile ? Clock::now() : Clock::time_point {};
+ 		const bool complete = gpu->Process(submission);
++		if (frame_profile) {
++			const auto now = Clock::now();
++			const auto slice_ms = std::chrono::duration<double, std::milli>(now - slice_start).count();
++			process_ms += slice_ms;
++			max_slice_ms = std::max(max_slice_ms, slice_ms);
++			const auto type_index = submission.type == SubmissionType::Graphics ? 0u
++			                      : submission.type == SubmissionType::Compute  ? 1u
++			                                                                    : 2u;
++			type_ms[type_index] += slice_ms;
++			++type_slices[type_index];
++			++slices;
++			blocked_slices += !complete;
++			if (!complete) blocked_ms += slice_ms;
++			const auto window_ms = std::chrono::duration<double, std::milli>(now - profile_start).count();
++			if (window_ms >= 2000.0) {
++				LOGF("Build32 GPU thread profile: window_ms=%.0f process_ms=%.1f slices=%llu "
++				     "blocked_slices=%llu blocked_ms=%.1f graphics_ms=%.1f compute_ms=%.1f "
++				     "flip_ms=%.1f graphics_slices=%llu compute_slices=%llu flip_slices=%llu "
++				     "max_slice_ms=%.1f (CPU wall time; includes shader compilation)\n",
++				     window_ms, process_ms, static_cast<unsigned long long>(slices),
++				     static_cast<unsigned long long>(blocked_slices), blocked_ms,
++				     type_ms[0], type_ms[1], type_ms[2],
++				     static_cast<unsigned long long>(type_slices[0]),
++				     static_cast<unsigned long long>(type_slices[1]),
++				     static_cast<unsigned long long>(type_slices[2]), max_slice_ms);
++				profile_start = now;
++				process_ms = 0;
++				slices = blocked_slices = 0;
++				blocked_ms = max_slice_ms = 0;
++				type_ms.fill(0);
++				type_slices.fill(0);
++			}
++		}
+ 
+ 		Common::LockGuard lock(gpu->m_queue_mutex);
+ 		if (!complete) {
+@@ -877,10 +928,12 @@ void CommandProcessor::DrawIndex(DrawIndexArgs args) {
+ 	if (args.instance_count == 0) {
+ 		args.instance_count = m_num_instances;
+ 	}
++#if !defined(KYTY_B32_QUIET_HOT_LOGS)
+ 	if (args.base_vertex != 0 || args.first_instance != 0) {
+ 		LOGF("\t draw indexed offsets: base_vertex = %" PRId32 ", first_instance = %" PRIu32 "\n",
+ 		     args.base_vertex, args.first_instance);
+ 	}
++#endif
+ 	m_renderer.GetRenderExecutor().DrawIndex(m_submit_id, CurrentBuffer(), args);
+ }
+ 
+diff --git a/src/graphics/host_gpu/renderer/cache/bufferCache.cpp b/src/graphics/host_gpu/renderer/cache/bufferCache.cpp
+index f1864a7..308cae4 100644
+--- a/src/graphics/host_gpu/renderer/cache/bufferCache.cpp
++++ b/src/graphics/host_gpu/renderer/cache/bufferCache.cpp
+@@ -13,6 +13,7 @@
+ #include "kernel/memory.h"
+ 
+ #include <algorithm>
++#include <atomic>
+ #include <cinttypes>
+ #include <cstring>
+ #include <memory>
+@@ -488,12 +489,26 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
+ 	if (copies.empty()) {
+ 		return nullptr;
+ 	}
++	const auto read_guest = [](uint64_t address, uint8_t* destination, uint64_t size) {
++		if (Libs::LibKernel::Memory::TryReadBacking(address, destination, size) ||
++		    Libs::LibKernel::Memory::TryReadPrtBacking(address, destination, size)) {
++			return;
++		}
++		// The guest backing may disappear between dirty-range collection and upload.
++		// Do not touch the protected guest pointer from inside the tracker callback.
++		std::memset(destination, 0, static_cast<size_t>(size));
++		static std::atomic<uint32_t> warnings {0};
++		if (warnings.fetch_add(1, std::memory_order_relaxed) < 16) {
++			LOGF("BufferCache: unmapped guest upload at 0x%016" PRIx64
++			     " size=0x%016" PRIx64 "; using zero data\n", address, size);
++		}
++	};
+ 
+ 	auto [mapped, base_offset] = m_staging_buffer.Map(total_size, 4);
+ 	if (mapped != nullptr) {
+ 		for (auto& copy: copies) {
+ 			const auto address = buffer.CpuAddress() + copy.dstOffset;
+-			std::memcpy(mapped + copy.srcOffset, reinterpret_cast<const void*>(address), copy.size);
++			read_guest(address, mapped + copy.srcOffset, copy.size);
+ 			copy.srcOffset += base_offset;
+ 		}
+ 		m_staging_buffer.Commit();
+@@ -504,8 +519,7 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
+ 	                                         vk::BufferUsageFlagBits::eTransferSrc, total_size);
+ 	for (const auto& copy: copies) {
+ 		const auto address = buffer.CpuAddress() + copy.dstOffset;
+-		std::memcpy(temporary->Mapped().data() + copy.srcOffset,
+-		            reinterpret_cast<const void*>(address), copy.size);
++		read_guest(address, temporary->Mapped().data() + copy.srcOffset, copy.size);
+ 	}
+ 	temporary->Flush(0, total_size);
+ 	const auto handle = temporary->Handle();
+@@ -671,8 +685,9 @@ bool BufferCache::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
+ 	return m_memory_tracker.IsRegionCpuModified(vaddr, size);
+ }
+ 
+-void BufferCache::RunGarbageCollector() {
+-	const auto tick = m_gc_tick++;
++void BufferCache::RunGarbageCollector(uint64_t elapsed_submissions) {
++	const auto tick = m_gc_tick;
++	m_gc_tick += elapsed_submissions;
+ 	if (m_graphics.CanReportMemoryUsage()) {
+ 		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
+ 	}
+diff --git a/src/graphics/host_gpu/renderer/cache/bufferCache.h b/src/graphics/host_gpu/renderer/cache/bufferCache.h
+index cc9e511..1268029 100644
+--- a/src/graphics/host_gpu/renderer/cache/bufferCache.h
++++ b/src/graphics/host_gpu/renderer/cache/bufferCache.h
+@@ -80,7 +80,7 @@ public:
+ 	[[nodiscard]] uint64_t RegistrationEpoch() const { return m_registration_epoch; }
+ 	void CollectMappedRegisteredRanges(const RangeSet& mapped, std::vector<RangeSet::Range>& ranges) const;
+ 
+-	void               RunGarbageCollector();
++	void               RunGarbageCollector(uint64_t elapsed_submissions = 1);
+ 
+ private:
+ 	friend struct BufferCacheTestAccess;
+diff --git a/src/graphics/host_gpu/renderer/cache/gpuResourceManager.cpp b/src/graphics/host_gpu/renderer/cache/gpuResourceManager.cpp
+index 017042a..1a95c1e 100644
+--- a/src/graphics/host_gpu/renderer/cache/gpuResourceManager.cpp
++++ b/src/graphics/host_gpu/renderer/cache/gpuResourceManager.cpp
+@@ -176,8 +176,19 @@ void GpuResourceManager::RunGarbageCollector() {
+ 		m_buffer_cache.ProcessFaultBuffer();
+ 	}
+ 	m_texture_cache.ProcessDownloadImages();
++#if defined(KYTY_B32_BATCH_RESOURCE_GC)
++	// A full device-memory query and two cache sweeps per GPU submission are costly.
++	// Keep fault and download handling immediate; sweep at most 16 submissions later.
++	if (++m_gc_submissions < 16) {
++		return;
++	}
++	m_gc_submissions = 0;
++	m_texture_cache.RunGarbageCollector(16);
++	m_buffer_cache.RunGarbageCollector(16);
++#else
+ 	m_texture_cache.RunGarbageCollector();
+ 	m_buffer_cache.RunGarbageCollector();
++#endif
+ }
+ 
+ } // namespace Libs::Graphics
+diff --git a/src/graphics/host_gpu/renderer/cache/gpuResourceManager.h b/src/graphics/host_gpu/renderer/cache/gpuResourceManager.h
+index e182166..72956cb 100644
+--- a/src/graphics/host_gpu/renderer/cache/gpuResourceManager.h
++++ b/src/graphics/host_gpu/renderer/cache/gpuResourceManager.h
+@@ -59,6 +59,7 @@ private:
+ 	GuestGpu*                 m_gpu = nullptr;
+ 	std::atomic<uint64_t> m_preparation_alias_epoch {uint64_t{1} << 32};
+ 	bool                      m_fault_process_pending = false;
++	uint32_t                  m_gc_submissions = 0;
+ };
+ 
+ } // namespace Libs::Graphics
 diff --git a/src/graphics/host_gpu/renderer/cache/textureCache.cpp b/src/graphics/host_gpu/renderer/cache/textureCache.cpp
-index 18d5b4b..0166f1f 100644
+index 18d5b4b..463c25d 100644
 --- a/src/graphics/host_gpu/renderer/cache/textureCache.cpp
 +++ b/src/graphics/host_gpu/renderer/cache/textureCache.cpp
 @@ -518,22 +518,26 @@ TextureCache::ImageIds TextureCache::FindImagesInRegion(uint64_t address, uint64
@@ -33,10 +235,32 @@ index 18d5b4b..0166f1f 100644
  	return id;
  }
  
+@@ -2129,9 +2133,10 @@ void TextureCache::UnmapMemory(uint64_t address, uint64_t size) {
+ 	}
+ }
+ 
+-void TextureCache::RunGarbageCollector() {
++void TextureCache::RunGarbageCollector(uint64_t elapsed_submissions) {
+ 	std::scoped_lock lock {m_lock};
+-	const uint64_t   tick = m_gc_tick++;
++	const uint64_t   tick = m_gc_tick;
++	m_gc_tick += elapsed_submissions;
+ 	if (m_graphics.CanReportMemoryUsage()) {
+ 		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
+ 	}
 diff --git a/src/graphics/host_gpu/renderer/cache/textureCache.h b/src/graphics/host_gpu/renderer/cache/textureCache.h
-index f373595..c75086b 100644
+index f373595..c6ffbbc 100644
 --- a/src/graphics/host_gpu/renderer/cache/textureCache.h
 +++ b/src/graphics/host_gpu/renderer/cache/textureCache.h
+@@ -74,7 +74,7 @@ public:
+ 
+ 	void UnmapMemory(uint64_t address, uint64_t size);
+ 	void ProcessDownloadImages();
+-	void RunGarbageCollector();
++	void RunGarbageCollector(uint64_t elapsed_submissions = 1);
+ 
+ private:
+ 	enum class TransferDirection { Upload, Download };
 @@ -168,7 +168,7 @@ private:
  	BufferCache&                                      m_buffer_cache;
  	Common::SlotVector<Image>                         m_slot_images;
@@ -258,6 +482,34 @@ index 6fa19e7..e517c2e 100644
  };
  
  void LogPipelineTrace(const char* phase, uint64_t vertex_program_id, uint64_t pixel_program_id);
+diff --git a/src/graphics/host_gpu/renderer/sync.cpp b/src/graphics/host_gpu/renderer/sync.cpp
+index db3003c..c5669fb 100644
+--- a/src/graphics/host_gpu/renderer/sync.cpp
++++ b/src/graphics/host_gpu/renderer/sync.cpp
+@@ -117,9 +117,11 @@ void WriteAtEndOfPipeClockCounter(uint64_t submit_id, CommandBuffer& buffer, uin
+ 	RecordEndOfPipeWrite(submit_id, buffer, reinterpret_cast<uint64_t>(dst_gpu_addr), 0,
+ 	                     EndOfPipeWriteSize::Qword, EndOfPipeWriteAction::Write);
+ 
++#if !defined(KYTY_B32_QUIET_HOT_LOGS)
+ 	LOGF_COLOR(Log::Color::BrightGreen,
+ 	           "EndOfPipe Signal!!! [0x%016" PRIx64 "] <- Clock: 0x%016" PRIx64 "\n",
+ 	           reinterpret_cast<uint64_t>(dst_gpu_addr), value);
++#endif
+ }
+ 
+ void WriteAtEndOfPipeClockCounterWithWriteBack(uint64_t submit_id, CommandBuffer& buffer,
+@@ -127,9 +129,11 @@ void WriteAtEndOfPipeClockCounterWithWriteBack(uint64_t submit_id, CommandBuffer
+ 	RecordEndOfPipeWrite(submit_id, buffer, reinterpret_cast<uint64_t>(dst_gpu_addr), 0,
+ 	                     EndOfPipeWriteSize::Qword, EndOfPipeWriteAction::WriteBack);
+ 
++#if !defined(KYTY_B32_QUIET_HOT_LOGS)
+ 	LOGF_COLOR(Log::Color::BrightGreen,
+ 	           "EndOfPipe Signal!!! [0x%016" PRIx64 "] <- Clock: 0x%016" PRIx64 "\n",
+ 	           reinterpret_cast<uint64_t>(dst_gpu_addr), value);
++#endif
+ }
+ 
+ void WriteAtEndOfPipeWithWriteBack64(uint64_t submit_id, CommandBuffer& buffer,
 diff --git a/src/graphics/host_gpu/vma.cpp b/src/graphics/host_gpu/vma.cpp
 index f7b512f..3deb1fa 100644
 --- a/src/graphics/host_gpu/vma.cpp
@@ -293,6 +545,88 @@ index f7b512f..3deb1fa 100644
  		LogMemoryBudget();
  		return false;
  	}
+diff --git a/src/graphics/presentation/window/swapchain.cpp b/src/graphics/presentation/window/swapchain.cpp
+index 166d772..87e2be9 100644
+--- a/src/graphics/presentation/window/swapchain.cpp
++++ b/src/graphics/presentation/window/swapchain.cpp
+@@ -14,6 +14,8 @@
+ #include "graphics/presentation/window/windowInternal.h"
+ 
+ #include <algorithm>
++#include <chrono>
++#include <cstdlib>
+ #include <deque>
+ #include <limits>
+ #include <memory>
+@@ -765,12 +767,28 @@ RenderContext& Presenter::Renderer() const noexcept {
+ 
+ void Presenter::Present(Frame& frame, bool reuse) {
+ 	KYTY_PROFILER_FUNCTION();
++	// CPU-side frame timings; the Vulkan work may still be running after Present returns.
++	static const bool frame_profile = [] {
++#if defined(KYTY_B32_FRAME_PROFILE)
++		return true;
++#else
++		const char* value = std::getenv("KYTY_B32_FRAME_PROFILE");
++		return value != nullptr && value[0] == '1' && value[1] == '\0';
++#endif
++	}();
++	using Clock = std::chrono::steady_clock;
++	static Clock::time_point last_frame;
++	static uint64_t frames = 0;
++	static uint64_t reused_frames = 0;
++	static double interval_ms = 0, acquire_ms = 0, record_ms = 0, present_ms = 0;
++	const auto start = frame_profile ? Clock::now() : Clock::time_point {};
+ 	m_impl->frames.ValidateForPresent(&frame, reuse);
+ 
+ 	const auto overlay_visual = GetSystemOverlayVisualState();
+ 	auto&      swapchain  = m_impl->swapchain;
+ 	for (uint32_t attempt = 0; attempt < 2; attempt++) {
+ 		auto status = swapchain.AcquireNextImage();
++		const auto acquired = frame_profile ? Clock::now() : Clock::time_point {};
+ 		if (status != Swapchain::Status::Success) {
+ 			m_impl->RecoverSwapchain(status);
+ 			continue;
+@@ -783,7 +801,9 @@ void Presenter::Present(Frame& frame, bool reuse) {
+ 			swapchain.RecordPresentCommands(command, frame.image, draw_system_overlay);
+ 			frame.present_tick = swapchain.Submit(m_impl->present_scheduler);
+ 		}
++		const auto submitted = frame_profile ? Clock::now() : Clock::time_point {};
+ 		status = swapchain.Present();
++		const auto presented = frame_profile ? Clock::now() : Clock::time_point {};
+ 		if (status != Swapchain::Status::Success) {
+ 			m_impl->RecoverSwapchain(status);
+ 			continue;
+@@ -793,6 +813,29 @@ void Presenter::Present(Frame& frame, bool reuse) {
+ 		                                         std::memory_order_release);
+ 		m_impl->window.UpdateTitle();
+ 		m_impl->frames.Release(&frame, true);
++		if (frame_profile) {
++			const auto elapsed = [](Clock::time_point a, Clock::time_point b) {
++				return std::chrono::duration<double, std::milli>(b - a).count();
++			};
++			if (last_frame != Clock::time_point {}) {
++				interval_ms += elapsed(last_frame, start);
++				acquire_ms += elapsed(start, acquired);
++				record_ms += elapsed(acquired, submitted);
++				present_ms += elapsed(submitted, presented);
++				reused_frames += reuse;
++				if (++frames == 120) {
++					LOGF("Build32 frame profile: frames=%llu reused=%llu interval_ms=%.2f acquire_ms=%.2f "
++					     "record_submit_ms=%.2f present_ms=%.2f (CPU wall time averages)\n",
++					     static_cast<unsigned long long>(frames),
++					     static_cast<unsigned long long>(reused_frames), interval_ms / frames,
++					     acquire_ms / frames, record_ms / frames, present_ms / frames);
++					frames = 0;
++					reused_frames = 0;
++					interval_ms = acquire_ms = record_ms = present_ms = 0;
++				}
++			}
++			last_frame = start;
++		}
+ 		return;
+ 	}
+ 	LOGF("Vulkan presentation retry exhausted; dropping frame\n");
 diff --git a/src/graphics/shader/recompiler/ShaderRecompiler.cpp b/src/graphics/shader/recompiler/ShaderRecompiler.cpp
 index 4aa50e0..4c7bb07 100644
 --- a/src/graphics/shader/recompiler/ShaderRecompiler.cpp
@@ -479,6 +813,100 @@ index 4aa50e0..4c7bb07 100644
  	TranslateResult result;
  	result.program = std::move(ir);
  	if (options.dump_ir) {
+diff --git a/src/graphics/shader/recompiler/frontend/cfg/ShaderCFG.cpp b/src/graphics/shader/recompiler/frontend/cfg/ShaderCFG.cpp
+index c00421d..44e19a8 100644
+--- a/src/graphics/shader/recompiler/frontend/cfg/ShaderCFG.cpp
++++ b/src/graphics/shader/recompiler/frontend/cfg/ShaderCFG.cpp
+@@ -3,6 +3,7 @@
+ #include "common/assert.h"
+ 
+ #include <algorithm>
++#include <bit>
+ #include <fmt/format.h>
+ #include <iterator>
+ #include <map>
+@@ -719,8 +720,70 @@ void PruneUnreachableBlocks(Graph& graph) {
+ 	RebuildPredecessors(graph);
+ }
+ 
++// Repeated CFG rewrites recompute dominance many times. Large graphs use
++// compact bitsets for the fixed-point intersections, then publish the same
++// sorted block-id vectors expected by the rest of the structurizer.
++void ComputeLargeDominatorSets(Graph& graph, bool post) {
++	const auto count = static_cast<uint32_t>(graph.blocks.size());
++	const auto words = (count + 63u) / 64u;
++	std::vector<uint64_t> all(words, UINT64_MAX);
++	if (count % 64u != 0) {
++		all.back() = (uint64_t {1} << (count % 64u)) - 1u;
++	}
++	std::vector<std::vector<uint64_t>> sets(count, all);
++	for (const auto& block: graph.blocks) {
++		const bool root = post ? block.successors.empty() : block.id == graph.entry_block;
++		if (root) {
++			std::fill(sets[block.id].begin(), sets[block.id].end(), 0);
++			sets[block.id][block.id / 64u] |= uint64_t {1} << (block.id % 64u);
++		}
++	}
++	std::vector<uint64_t> next(words);
++	bool changed = true;
++	while (changed) {
++		changed = false;
++		for (const auto& block: graph.blocks) {
++			if (!post && block.id == graph.entry_block) {
++				continue;
++			}
++			const auto& neighbours = post ? block.successors : block.predecessors;
++			if (neighbours.empty()) {
++				std::fill(next.begin(), next.end(), 0);
++			} else {
++				std::copy(sets[neighbours.front()].begin(), sets[neighbours.front()].end(),
++				          next.begin());
++				for (size_t i = 1; i < neighbours.size(); ++i) {
++					for (size_t word = 0; word < words; ++word) {
++						next[word] &= sets[neighbours[i]][word];
++					}
++				}
++			}
++			next[block.id / 64u] |= uint64_t {1} << (block.id % 64u);
++			if (next != sets[block.id]) {
++				std::copy(next.begin(), next.end(), sets[block.id].begin());
++				changed = true;
++			}
++		}
++	}
++	for (auto& block: graph.blocks) {
++		auto& ids = post ? block.post_dominators : block.dominators;
++		ids.clear();
++		for (size_t word = 0; word < words; ++word) {
++			auto bits = sets[block.id][word];
++			while (bits != 0) {
++				ids.push_back(static_cast<uint32_t>(word * 64u + std::countr_zero(bits)));
++				bits &= bits - 1u;
++			}
++		}
++	}
++}
++
+ void ComputeDominators(Graph& graph) {
+ 	const auto count = static_cast<uint32_t>(graph.blocks.size());
++	if (count >= 128) {
++		ComputeLargeDominatorSets(graph, false);
++		return;
++	}
+ 	const auto all   = AllBlockIds(count);
+ 
+ 	for (auto& block: graph.blocks) {
+@@ -755,6 +818,10 @@ void ComputeDominators(Graph& graph) {
+ 
+ void ComputePostDominators(Graph& graph) {
+ 	const auto count = static_cast<uint32_t>(graph.blocks.size());
++	if (count >= 128) {
++		ComputeLargeDominatorSets(graph, true);
++		return;
++	}
+ 	const auto all   = AllBlockIds(count);
+ 
+ 	for (auto& block: graph.blocks) {
 diff --git a/src/graphics/shader/recompiler/ir/passes/ResourceMaterialization.cpp b/src/graphics/shader/recompiler/ir/passes/ResourceMaterialization.cpp
 index bf1c28c..d398b24 100644
 --- a/src/graphics/shader/recompiler/ir/passes/ResourceMaterialization.cpp
@@ -650,481 +1078,6 @@ index 2aedc25..6a24d1b 100644
      auto compiled=std::make_shared<LinearSrtPlan>();
      if (LinearSrtCompiler(program,*compiled).Build()) program.linear_srt=std::move(compiled);
      else program.linear_srt=BuildControlledLinearSrt(program);
-diff --git a/src/graphics/shader/recompiler/frontend/cfg/ShaderCFG.cpp b/src/graphics/shader/recompiler/frontend/cfg/ShaderCFG.cpp
-index c00421d..44e19a8 100644
---- a/src/graphics/shader/recompiler/frontend/cfg/ShaderCFG.cpp
-+++ b/src/graphics/shader/recompiler/frontend/cfg/ShaderCFG.cpp
-@@ -3,6 +3,7 @@
- #include "common/assert.h"
- 
- #include <algorithm>
-+#include <bit>
- #include <fmt/format.h>
- #include <iterator>
- #include <map>
-@@ -719,8 +720,70 @@ void PruneUnreachableBlocks(Graph& graph) {
- 	RebuildPredecessors(graph);
- }
- 
-+// Repeated CFG rewrites recompute dominance many times. Large graphs use
-+// compact bitsets for the fixed-point intersections, then publish the same
-+// sorted block-id vectors expected by the rest of the structurizer.
-+void ComputeLargeDominatorSets(Graph& graph, bool post) {
-+	const auto count = static_cast<uint32_t>(graph.blocks.size());
-+	const auto words = (count + 63u) / 64u;
-+	std::vector<uint64_t> all(words, UINT64_MAX);
-+	if (count % 64u != 0) {
-+		all.back() = (uint64_t {1} << (count % 64u)) - 1u;
-+	}
-+	std::vector<std::vector<uint64_t>> sets(count, all);
-+	for (const auto& block: graph.blocks) {
-+		const bool root = post ? block.successors.empty() : block.id == graph.entry_block;
-+		if (root) {
-+			std::fill(sets[block.id].begin(), sets[block.id].end(), 0);
-+			sets[block.id][block.id / 64u] |= uint64_t {1} << (block.id % 64u);
-+		}
-+	}
-+	std::vector<uint64_t> next(words);
-+	bool changed = true;
-+	while (changed) {
-+		changed = false;
-+		for (const auto& block: graph.blocks) {
-+			if (!post && block.id == graph.entry_block) {
-+				continue;
-+			}
-+			const auto& neighbours = post ? block.successors : block.predecessors;
-+			if (neighbours.empty()) {
-+				std::fill(next.begin(), next.end(), 0);
-+			} else {
-+				std::copy(sets[neighbours.front()].begin(), sets[neighbours.front()].end(),
-+				          next.begin());
-+				for (size_t i = 1; i < neighbours.size(); ++i) {
-+					for (size_t word = 0; word < words; ++word) {
-+						next[word] &= sets[neighbours[i]][word];
-+					}
-+				}
-+			}
-+			next[block.id / 64u] |= uint64_t {1} << (block.id % 64u);
-+			if (next != sets[block.id]) {
-+				std::copy(next.begin(), next.end(), sets[block.id].begin());
-+				changed = true;
-+			}
-+		}
-+	}
-+	for (auto& block: graph.blocks) {
-+		auto& ids = post ? block.post_dominators : block.dominators;
-+		ids.clear();
-+		for (size_t word = 0; word < words; ++word) {
-+			auto bits = sets[block.id][word];
-+			while (bits != 0) {
-+				ids.push_back(static_cast<uint32_t>(word * 64u + std::countr_zero(bits)));
-+				bits &= bits - 1u;
-+			}
-+		}
-+	}
-+}
-+
- void ComputeDominators(Graph& graph) {
- 	const auto count = static_cast<uint32_t>(graph.blocks.size());
-+	if (count >= 128) {
-+		ComputeLargeDominatorSets(graph, false);
-+		return;
-+	}
- 	const auto all   = AllBlockIds(count);
- 
- 	for (auto& block: graph.blocks) {
-@@ -755,6 +818,10 @@ void ComputeDominators(Graph& graph) {
- 
- void ComputePostDominators(Graph& graph) {
- 	const auto count = static_cast<uint32_t>(graph.blocks.size());
-+	if (count >= 128) {
-+		ComputeLargeDominatorSets(graph, true);
-+		return;
-+	}
- 	const auto all   = AllBlockIds(count);
- 
- 	for (auto& block: graph.blocks) {
-diff --git a/src/graphics/guest_gpu/graphicsRun.cpp b/src/graphics/guest_gpu/graphicsRun.cpp
-index cca1005..d359734 100644
---- a/src/graphics/guest_gpu/graphicsRun.cpp
-+++ b/src/graphics/guest_gpu/graphicsRun.cpp
-@@ -23,7 +23,9 @@
- #include <algorithm>
- #include <array>
- #include <atomic>
-+#include <chrono>
- #include <cstdio>
-+#include <cstdlib>
- #include <cstring>
- #include <deque>
- #include <memory>
-@@ -470,6 +472,18 @@ void GuestGpu::ThreadRun(void* data) {
- 	KYTY_PROFILER_THREAD("Thread_Gpu");
- 	g_gpu_thread = true;
- 	g_gpu_state  = gpu;
-+	static const bool frame_profile = [] {
-+#if defined(KYTY_B32_FRAME_PROFILE)
-+		return true;
-+#else
-+		const char* value = std::getenv("KYTY_B32_FRAME_PROFILE");
-+		return value != nullptr && value[0] == '1' && value[1] == '\0';
-+#endif
-+	}();
-+	using Clock = std::chrono::steady_clock;
-+	auto profile_start = Clock::now();
-+	double process_ms = 0;
-+	uint64_t slices = 0, blocked_slices = 0;
- 
- 	for (;;) {
- 		Submission                   submission;
-@@ -540,7 +554,24 @@ void GuestGpu::ThreadRun(void* data) {
- 		}
- 
- 		EXIT_IF(!has_submission);
-+		const auto slice_start = frame_profile ? Clock::now() : Clock::time_point {};
- 		const bool complete = gpu->Process(submission);
-+		if (frame_profile) {
-+			const auto now = Clock::now();
-+			process_ms += std::chrono::duration<double, std::milli>(now - slice_start).count();
-+			++slices;
-+			blocked_slices += !complete;
-+			const auto window_ms = std::chrono::duration<double, std::milli>(now - profile_start).count();
-+			if (window_ms >= 2000.0) {
-+				LOGF("Build32 GPU thread profile: window_ms=%.0f process_ms=%.1f slices=%llu "
-+				     "blocked_slices=%llu (CPU wall time; includes shader compilation)\n",
-+				     window_ms, process_ms, static_cast<unsigned long long>(slices),
-+				     static_cast<unsigned long long>(blocked_slices));
-+				profile_start = now;
-+				process_ms = 0;
-+				slices = blocked_slices = 0;
-+			}
-+		}
- 
- 		Common::LockGuard lock(gpu->m_queue_mutex);
- 		if (!complete) {
-diff --git a/src/graphics/presentation/window/swapchain.cpp b/src/graphics/presentation/window/swapchain.cpp
-index 166d772..87e2be9 100644
---- a/src/graphics/presentation/window/swapchain.cpp
-+++ b/src/graphics/presentation/window/swapchain.cpp
-@@ -14,6 +14,8 @@
- #include "graphics/presentation/window/windowInternal.h"
- 
- #include <algorithm>
-+#include <chrono>
-+#include <cstdlib>
- #include <deque>
- #include <limits>
- #include <memory>
-@@ -765,12 +767,28 @@ RenderContext& Presenter::Renderer() const noexcept {
- 
- void Presenter::Present(Frame& frame, bool reuse) {
- 	KYTY_PROFILER_FUNCTION();
-+	// CPU-side frame timings; the Vulkan work may still be running after Present returns.
-+	static const bool frame_profile = [] {
-+#if defined(KYTY_B32_FRAME_PROFILE)
-+		return true;
-+#else
-+		const char* value = std::getenv("KYTY_B32_FRAME_PROFILE");
-+		return value != nullptr && value[0] == '1' && value[1] == '\0';
-+#endif
-+	}();
-+	using Clock = std::chrono::steady_clock;
-+	static Clock::time_point last_frame;
-+	static uint64_t frames = 0;
-+	static uint64_t reused_frames = 0;
-+	static double interval_ms = 0, acquire_ms = 0, record_ms = 0, present_ms = 0;
-+	const auto start = frame_profile ? Clock::now() : Clock::time_point {};
- 	m_impl->frames.ValidateForPresent(&frame, reuse);
- 
- 	const auto overlay_visual = GetSystemOverlayVisualState();
- 	auto&      swapchain  = m_impl->swapchain;
- 	for (uint32_t attempt = 0; attempt < 2; attempt++) {
- 		auto status = swapchain.AcquireNextImage();
-+		const auto acquired = frame_profile ? Clock::now() : Clock::time_point {};
- 		if (status != Swapchain::Status::Success) {
- 			m_impl->RecoverSwapchain(status);
- 			continue;
-@@ -783,7 +801,9 @@ void Presenter::Present(Frame& frame, bool reuse) {
- 			swapchain.RecordPresentCommands(command, frame.image, draw_system_overlay);
- 			frame.present_tick = swapchain.Submit(m_impl->present_scheduler);
- 		}
-+		const auto submitted = frame_profile ? Clock::now() : Clock::time_point {};
- 		status = swapchain.Present();
-+		const auto presented = frame_profile ? Clock::now() : Clock::time_point {};
- 		if (status != Swapchain::Status::Success) {
- 			m_impl->RecoverSwapchain(status);
- 			continue;
-@@ -793,6 +813,29 @@ void Presenter::Present(Frame& frame, bool reuse) {
- 		                                         std::memory_order_release);
- 		m_impl->window.UpdateTitle();
- 		m_impl->frames.Release(&frame, true);
-+		if (frame_profile) {
-+			const auto elapsed = [](Clock::time_point a, Clock::time_point b) {
-+				return std::chrono::duration<double, std::milli>(b - a).count();
-+			};
-+			if (last_frame != Clock::time_point {}) {
-+				interval_ms += elapsed(last_frame, start);
-+				acquire_ms += elapsed(start, acquired);
-+				record_ms += elapsed(acquired, submitted);
-+				present_ms += elapsed(submitted, presented);
-+				reused_frames += reuse;
-+				if (++frames == 120) {
-+					LOGF("Build32 frame profile: frames=%llu reused=%llu interval_ms=%.2f acquire_ms=%.2f "
-+					     "record_submit_ms=%.2f present_ms=%.2f (CPU wall time averages)\n",
-+					     static_cast<unsigned long long>(frames),
-+					     static_cast<unsigned long long>(reused_frames), interval_ms / frames,
-+					     acquire_ms / frames, record_ms / frames, present_ms / frames);
-+					frames = 0;
-+					reused_frames = 0;
-+					interval_ms = acquire_ms = record_ms = present_ms = 0;
-+				}
-+			}
-+			last_frame = start;
-+		}
- 		return;
- 	}
- 	LOGF("Vulkan presentation retry exhausted; dropping frame\n");
-diff --git a/src/graphics/guest_gpu/graphicsRun.cpp b/src/graphics/guest_gpu/graphicsRun.cpp
-index d359734..fbfa41b 100644
---- a/src/graphics/guest_gpu/graphicsRun.cpp
-+++ b/src/graphics/guest_gpu/graphicsRun.cpp
-@@ -484,6 +484,9 @@ void GuestGpu::ThreadRun(void* data) {
- 	auto profile_start = Clock::now();
- 	double process_ms = 0;
- 	uint64_t slices = 0, blocked_slices = 0;
-+	std::array<double, 3> type_ms {};
-+	std::array<uint64_t, 3> type_slices {};
-+	double blocked_ms = 0, max_slice_ms = 0;
- 
- 	for (;;) {
- 		Submission                   submission;
-@@ -558,18 +561,35 @@ void GuestGpu::ThreadRun(void* data) {
- 		const bool complete = gpu->Process(submission);
- 		if (frame_profile) {
- 			const auto now = Clock::now();
--			process_ms += std::chrono::duration<double, std::milli>(now - slice_start).count();
-+			const auto slice_ms = std::chrono::duration<double, std::milli>(now - slice_start).count();
-+			process_ms += slice_ms;
-+			max_slice_ms = std::max(max_slice_ms, slice_ms);
-+			const auto type_index = submission.type == SubmissionType::Graphics ? 0u
-+			                      : submission.type == SubmissionType::Compute  ? 1u
-+			                                                                    : 2u;
-+			type_ms[type_index] += slice_ms;
-+			++type_slices[type_index];
- 			++slices;
- 			blocked_slices += !complete;
-+			if (!complete) blocked_ms += slice_ms;
- 			const auto window_ms = std::chrono::duration<double, std::milli>(now - profile_start).count();
- 			if (window_ms >= 2000.0) {
- 				LOGF("Build32 GPU thread profile: window_ms=%.0f process_ms=%.1f slices=%llu "
--				     "blocked_slices=%llu (CPU wall time; includes shader compilation)\n",
-+				     "blocked_slices=%llu blocked_ms=%.1f graphics_ms=%.1f compute_ms=%.1f "
-+				     "flip_ms=%.1f graphics_slices=%llu compute_slices=%llu flip_slices=%llu "
-+				     "max_slice_ms=%.1f (CPU wall time; includes shader compilation)\n",
- 				     window_ms, process_ms, static_cast<unsigned long long>(slices),
--				     static_cast<unsigned long long>(blocked_slices));
-+				     static_cast<unsigned long long>(blocked_slices), blocked_ms,
-+				     type_ms[0], type_ms[1], type_ms[2],
-+				     static_cast<unsigned long long>(type_slices[0]),
-+				     static_cast<unsigned long long>(type_slices[1]),
-+				     static_cast<unsigned long long>(type_slices[2]), max_slice_ms);
- 				profile_start = now;
- 				process_ms = 0;
- 				slices = blocked_slices = 0;
-+				blocked_ms = max_slice_ms = 0;
-+				type_ms.fill(0);
-+				type_slices.fill(0);
- 			}
- 		}
- 
-diff --git a/src/graphics/guest_gpu/graphicsRun.cpp b/src/graphics/guest_gpu/graphicsRun.cpp
-index fbfa41b..c879ca1 100644
---- a/src/graphics/guest_gpu/graphicsRun.cpp
-+++ b/src/graphics/guest_gpu/graphicsRun.cpp
-@@ -928,10 +928,12 @@ void CommandProcessor::DrawIndex(DrawIndexArgs args) {
- 	if (args.instance_count == 0) {
- 		args.instance_count = m_num_instances;
- 	}
-+#if !defined(KYTY_B32_QUIET_HOT_LOGS)
- 	if (args.base_vertex != 0 || args.first_instance != 0) {
- 		LOGF("\t draw indexed offsets: base_vertex = %" PRId32 ", first_instance = %" PRIu32 "\n",
- 		     args.base_vertex, args.first_instance);
- 	}
-+#endif
- 	m_renderer.GetRenderExecutor().DrawIndex(m_submit_id, CurrentBuffer(), args);
- }
- 
-diff --git a/src/graphics/host_gpu/renderer/cache/bufferCache.cpp b/src/graphics/host_gpu/renderer/cache/bufferCache.cpp
-index f1864a7..a134dd5 100644
---- a/src/graphics/host_gpu/renderer/cache/bufferCache.cpp
-+++ b/src/graphics/host_gpu/renderer/cache/bufferCache.cpp
-@@ -493,7 +493,13 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
- 	if (mapped != nullptr) {
- 		for (auto& copy: copies) {
- 			const auto address = buffer.CpuAddress() + copy.dstOffset;
--			std::memcpy(mapped + copy.srcOffset, reinterpret_cast<const void*>(address), copy.size);
-+			if (!Libs::LibKernel::Memory::TryReadBacking(address, mapped + copy.srcOffset,
-+			                                              copy.size) &&
-+			    !Libs::LibKernel::Memory::TryReadPrtBacking(address, mapped + copy.srcOffset,
-+			                                                 copy.size)) {
-+				EXIT("BufferCache: unreadable guest buffer upload at 0x%016" PRIx64
-+				     " size=0x%016" PRIx64 "\n", address, static_cast<uint64_t>(copy.size));
-+			}
- 			copy.srcOffset += base_offset;
- 		}
- 		m_staging_buffer.Commit();
-@@ -504,8 +510,13 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
- 	                                         vk::BufferUsageFlagBits::eTransferSrc, total_size);
- 	for (const auto& copy: copies) {
- 		const auto address = buffer.CpuAddress() + copy.dstOffset;
--		std::memcpy(temporary->Mapped().data() + copy.srcOffset,
--		            reinterpret_cast<const void*>(address), copy.size);
-+		if (!Libs::LibKernel::Memory::TryReadBacking(
-+		        address, temporary->Mapped().data() + copy.srcOffset, copy.size) &&
-+		    !Libs::LibKernel::Memory::TryReadPrtBacking(
-+		        address, temporary->Mapped().data() + copy.srcOffset, copy.size)) {
-+			EXIT("BufferCache: unreadable guest buffer upload at 0x%016" PRIx64
-+			     " size=0x%016" PRIx64 "\n", address, static_cast<uint64_t>(copy.size));
-+		}
- 	}
- 	temporary->Flush(0, total_size);
- 	const auto handle = temporary->Handle();
-diff --git a/src/libs/ajm.cpp b/src/libs/ajm.cpp
-index e132ed0..d26f4e0 100644
---- a/src/libs/ajm.cpp
-+++ b/src/libs/ajm.cpp
-@@ -1195,12 +1195,14 @@ int KYTY_SYSV_ABI AjmBatchJobRunSplit(AjmBatchInfo* info, uint32_t instance, uin
- 	(void)AjmGetInstanceFormat(instance, nullptr, &decoder, &gapless);
- 	AjmWriteSideband(flags, sideband_output, sideband_output_size, decoder, gapless, decode_result);
- 
-+#if !defined(KYTY_B32_QUIET_HOT_LOGS)
- 	LOGF("\t instance = 0x%08" PRIx32 ", flags = 0x%016" PRIx64 ", input_buffers = 0x%016" PRIx64
- 	     ", input_num = 0x%016" PRIx64 ", output_buffers = 0x%016" PRIx64
- 	     ", output_num = 0x%016" PRIx64 "\n",
- 	     instance, flags, reinterpret_cast<uint64_t>(input_buffers),
- 	     static_cast<uint64_t>(input_buffers_num), reinterpret_cast<uint64_t>(output_buffers),
- 	     static_cast<uint64_t>(output_buffers_num));
-+#endif
- 	return AjmAppendJob(info, 16 * (input_buffers_num + output_buffers_num) + 32, "run-split");
- }
- 
-diff --git a/src/libs/ajm/atrac9_decoder.h b/src/libs/ajm/atrac9_decoder.h
-index b6aab05..b72d442 100644
---- a/src/libs/ajm/atrac9_decoder.h
-+++ b/src/libs/ajm/atrac9_decoder.h
-@@ -303,10 +303,12 @@ private:
- 		          static_cast<uint32_t>(m_codec_info.samplingRate), m_sample_encoding);
- 		m_pcm_buffer.assign(FrameOutputBytes(), 0);
- 
-+#if !defined(KYTY_B32_QUIET_HOT_LOGS)
- 		LOGF("AJM ATRAC9 initialized: %d Hz, %d ch, frame_samples=%d, superframe=%d bytes/%d "
- 		     "frames\n",
- 		     m_codec_info.samplingRate, m_codec_info.channels, m_codec_info.frameSamples,
- 		     m_codec_info.superframeSize, m_codec_info.framesInSuperframe);
-+#endif
- 
- 		return true;
- 	}
-@@ -493,8 +495,10 @@ private:
- 					gapless_decode.skip_samples  = static_cast<uint16_t>(std::min<uint32_t>(
- 					    AjmReadLe32(input + payload + 4), std::numeric_limits<uint16_t>::max()));
- 					gapless->Set(gapless_decode, true);
-+#if !defined(KYTY_B32_QUIET_HOT_LOGS)
- 					LOGF("AJM ATRAC9 gapless: total=%" PRIu32 ", skip=%" PRIu16 "\n",
- 					     gapless_decode.total_samples, gapless_decode.skip_samples);
-+#endif
- 				}
- 			} else if (AjmFourCcEquals(chunk, 'd', 'a', 't', 'a')) {
- 				*data_offset                  = payload;
-diff --git a/src/graphics/host_gpu/renderer/cache/bufferCache.cpp b/src/graphics/host_gpu/renderer/cache/bufferCache.cpp
-index a134dd5..17338d7 100644
---- a/src/graphics/host_gpu/renderer/cache/bufferCache.cpp
-+++ b/src/graphics/host_gpu/renderer/cache/bufferCache.cpp
-@@ -13,6 +13,7 @@
- #include "kernel/memory.h"
- 
- #include <algorithm>
-+#include <atomic>
- #include <cinttypes>
- #include <cstring>
- #include <memory>
-@@ -488,18 +489,26 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
- 	if (copies.empty()) {
- 		return nullptr;
- 	}
-+	const auto read_guest = [](uint64_t address, uint8_t* destination, uint64_t size) {
-+		if (Libs::LibKernel::Memory::TryReadBacking(address, destination, size) ||
-+		    Libs::LibKernel::Memory::TryReadPrtBacking(address, destination, size)) {
-+			return;
-+		}
-+		// The guest backing may disappear between dirty-range collection and upload.
-+		// Do not touch the protected guest pointer from inside the tracker callback.
-+		std::memset(destination, 0, static_cast<size_t>(size));
-+		static std::atomic<uint32_t> warnings {0};
-+		if (warnings.fetch_add(1, std::memory_order_relaxed) < 16) {
-+			LOGF("BufferCache: unmapped guest upload at 0x%016" PRIx64
-+			     " size=0x%016" PRIx64 "; using zero data\n", address, size);
-+		}
-+	};
- 
- 	auto [mapped, base_offset] = m_staging_buffer.Map(total_size, 4);
- 	if (mapped != nullptr) {
- 		for (auto& copy: copies) {
- 			const auto address = buffer.CpuAddress() + copy.dstOffset;
--			if (!Libs::LibKernel::Memory::TryReadBacking(address, mapped + copy.srcOffset,
--			                                              copy.size) &&
--			    !Libs::LibKernel::Memory::TryReadPrtBacking(address, mapped + copy.srcOffset,
--			                                                 copy.size)) {
--				EXIT("BufferCache: unreadable guest buffer upload at 0x%016" PRIx64
--				     " size=0x%016" PRIx64 "\n", address, static_cast<uint64_t>(copy.size));
--			}
-+			read_guest(address, mapped + copy.srcOffset, copy.size);
- 			copy.srcOffset += base_offset;
- 		}
- 		m_staging_buffer.Commit();
-@@ -510,13 +519,7 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
- 	                                         vk::BufferUsageFlagBits::eTransferSrc, total_size);
- 	for (const auto& copy: copies) {
- 		const auto address = buffer.CpuAddress() + copy.dstOffset;
--		if (!Libs::LibKernel::Memory::TryReadBacking(
--		        address, temporary->Mapped().data() + copy.srcOffset, copy.size) &&
--		    !Libs::LibKernel::Memory::TryReadPrtBacking(
--		        address, temporary->Mapped().data() + copy.srcOffset, copy.size)) {
--			EXIT("BufferCache: unreadable guest buffer upload at 0x%016" PRIx64
--			     " size=0x%016" PRIx64 "\n", address, static_cast<uint64_t>(copy.size));
--		}
-+		read_guest(address, temporary->Mapped().data() + copy.srcOffset, copy.size);
- 	}
- 	temporary->Flush(0, total_size);
- 	const auto handle = temporary->Handle();
-diff --git a/src/graphics/host_gpu/renderer/sync.cpp b/src/graphics/host_gpu/renderer/sync.cpp
-index db3003c..c5669fb 100644
---- a/src/graphics/host_gpu/renderer/sync.cpp
-+++ b/src/graphics/host_gpu/renderer/sync.cpp
-@@ -117,9 +117,11 @@ void WriteAtEndOfPipeClockCounter(uint64_t submit_id, CommandBuffer& buffer, uin
- 	RecordEndOfPipeWrite(submit_id, buffer, reinterpret_cast<uint64_t>(dst_gpu_addr), 0,
- 	                     EndOfPipeWriteSize::Qword, EndOfPipeWriteAction::Write);
- 
-+#if !defined(KYTY_B32_QUIET_HOT_LOGS)
- 	LOGF_COLOR(Log::Color::BrightGreen,
- 	           "EndOfPipe Signal!!! [0x%016" PRIx64 "] <- Clock: 0x%016" PRIx64 "\n",
- 	           reinterpret_cast<uint64_t>(dst_gpu_addr), value);
-+#endif
- }
- 
- void WriteAtEndOfPipeClockCounterWithWriteBack(uint64_t submit_id, CommandBuffer& buffer,
-@@ -127,9 +129,11 @@ void WriteAtEndOfPipeClockCounterWithWriteBack(uint64_t submit_id, CommandBuffer
- 	RecordEndOfPipeWrite(submit_id, buffer, reinterpret_cast<uint64_t>(dst_gpu_addr), 0,
- 	                     EndOfPipeWriteSize::Qword, EndOfPipeWriteAction::WriteBack);
- 
-+#if !defined(KYTY_B32_QUIET_HOT_LOGS)
- 	LOGF_COLOR(Log::Color::BrightGreen,
- 	           "EndOfPipe Signal!!! [0x%016" PRIx64 "] <- Clock: 0x%016" PRIx64 "\n",
- 	           reinterpret_cast<uint64_t>(dst_gpu_addr), value);
-+#endif
- }
- 
- void WriteAtEndOfPipeWithWriteBack64(uint64_t submit_id, CommandBuffer& buffer,
 diff --git a/src/libs/agc.cpp b/src/libs/agc.cpp
 index 0111f02..6c3c1b5 100644
 --- a/src/libs/agc.cpp
@@ -2478,6 +2431,53 @@ index 0111f02..6c3c1b5 100644
  
  	return static_cast<int>(0x8a6c9018u);
  }
+diff --git a/src/libs/ajm.cpp b/src/libs/ajm.cpp
+index e132ed0..d26f4e0 100644
+--- a/src/libs/ajm.cpp
++++ b/src/libs/ajm.cpp
+@@ -1195,12 +1195,14 @@ int KYTY_SYSV_ABI AjmBatchJobRunSplit(AjmBatchInfo* info, uint32_t instance, uin
+ 	(void)AjmGetInstanceFormat(instance, nullptr, &decoder, &gapless);
+ 	AjmWriteSideband(flags, sideband_output, sideband_output_size, decoder, gapless, decode_result);
+ 
++#if !defined(KYTY_B32_QUIET_HOT_LOGS)
+ 	LOGF("\t instance = 0x%08" PRIx32 ", flags = 0x%016" PRIx64 ", input_buffers = 0x%016" PRIx64
+ 	     ", input_num = 0x%016" PRIx64 ", output_buffers = 0x%016" PRIx64
+ 	     ", output_num = 0x%016" PRIx64 "\n",
+ 	     instance, flags, reinterpret_cast<uint64_t>(input_buffers),
+ 	     static_cast<uint64_t>(input_buffers_num), reinterpret_cast<uint64_t>(output_buffers),
+ 	     static_cast<uint64_t>(output_buffers_num));
++#endif
+ 	return AjmAppendJob(info, 16 * (input_buffers_num + output_buffers_num) + 32, "run-split");
+ }
+ 
+diff --git a/src/libs/ajm/atrac9_decoder.h b/src/libs/ajm/atrac9_decoder.h
+index b6aab05..b72d442 100644
+--- a/src/libs/ajm/atrac9_decoder.h
++++ b/src/libs/ajm/atrac9_decoder.h
+@@ -303,10 +303,12 @@ private:
+ 		          static_cast<uint32_t>(m_codec_info.samplingRate), m_sample_encoding);
+ 		m_pcm_buffer.assign(FrameOutputBytes(), 0);
+ 
++#if !defined(KYTY_B32_QUIET_HOT_LOGS)
+ 		LOGF("AJM ATRAC9 initialized: %d Hz, %d ch, frame_samples=%d, superframe=%d bytes/%d "
+ 		     "frames\n",
+ 		     m_codec_info.samplingRate, m_codec_info.channels, m_codec_info.frameSamples,
+ 		     m_codec_info.superframeSize, m_codec_info.framesInSuperframe);
++#endif
+ 
+ 		return true;
+ 	}
+@@ -493,8 +495,10 @@ private:
+ 					gapless_decode.skip_samples  = static_cast<uint16_t>(std::min<uint32_t>(
+ 					    AjmReadLe32(input + payload + 4), std::numeric_limits<uint16_t>::max()));
+ 					gapless->Set(gapless_decode, true);
++#if !defined(KYTY_B32_QUIET_HOT_LOGS)
+ 					LOGF("AJM ATRAC9 gapless: total=%" PRIu32 ", skip=%" PRIu16 "\n",
+ 					     gapless_decode.total_samples, gapless_decode.skip_samples);
++#endif
+ 				}
+ 			} else if (AjmFourCcEquals(chunk, 'd', 'a', 't', 'a')) {
+ 				*data_offset                  = payload;
 diff --git a/src/libs/libPlayGo.cpp b/src/libs/libPlayGo.cpp
 index 94f0093..9ee53e3 100644
 --- a/src/libs/libPlayGo.cpp
