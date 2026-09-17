@@ -884,3 +884,56 @@ index 166d772..87e2be9 100644
  		return;
  	}
  	LOGF("Vulkan presentation retry exhausted; dropping frame\n");
+diff --git a/src/graphics/guest_gpu/graphicsRun.cpp b/src/graphics/guest_gpu/graphicsRun.cpp
+index d359734..fbfa41b 100644
+--- a/src/graphics/guest_gpu/graphicsRun.cpp
++++ b/src/graphics/guest_gpu/graphicsRun.cpp
+@@ -484,6 +484,9 @@ void GuestGpu::ThreadRun(void* data) {
+ 	auto profile_start = Clock::now();
+ 	double process_ms = 0;
+ 	uint64_t slices = 0, blocked_slices = 0;
++	std::array<double, 3> type_ms {};
++	std::array<uint64_t, 3> type_slices {};
++	double blocked_ms = 0, max_slice_ms = 0;
+ 
+ 	for (;;) {
+ 		Submission                   submission;
+@@ -558,18 +561,35 @@ void GuestGpu::ThreadRun(void* data) {
+ 		const bool complete = gpu->Process(submission);
+ 		if (frame_profile) {
+ 			const auto now = Clock::now();
+-			process_ms += std::chrono::duration<double, std::milli>(now - slice_start).count();
++			const auto slice_ms = std::chrono::duration<double, std::milli>(now - slice_start).count();
++			process_ms += slice_ms;
++			max_slice_ms = std::max(max_slice_ms, slice_ms);
++			const auto type_index = submission.type == SubmissionType::Graphics ? 0u
++			                      : submission.type == SubmissionType::Compute  ? 1u
++			                                                                    : 2u;
++			type_ms[type_index] += slice_ms;
++			++type_slices[type_index];
+ 			++slices;
+ 			blocked_slices += !complete;
++			if (!complete) blocked_ms += slice_ms;
+ 			const auto window_ms = std::chrono::duration<double, std::milli>(now - profile_start).count();
+ 			if (window_ms >= 2000.0) {
+ 				LOGF("Build32 GPU thread profile: window_ms=%.0f process_ms=%.1f slices=%llu "
+-				     "blocked_slices=%llu (CPU wall time; includes shader compilation)\n",
++				     "blocked_slices=%llu blocked_ms=%.1f graphics_ms=%.1f compute_ms=%.1f "
++				     "flip_ms=%.1f graphics_slices=%llu compute_slices=%llu flip_slices=%llu "
++				     "max_slice_ms=%.1f (CPU wall time; includes shader compilation)\n",
+ 				     window_ms, process_ms, static_cast<unsigned long long>(slices),
+-				     static_cast<unsigned long long>(blocked_slices));
++				     static_cast<unsigned long long>(blocked_slices), blocked_ms,
++				     type_ms[0], type_ms[1], type_ms[2],
++				     static_cast<unsigned long long>(type_slices[0]),
++				     static_cast<unsigned long long>(type_slices[1]),
++				     static_cast<unsigned long long>(type_slices[2]), max_slice_ms);
+ 				profile_start = now;
+ 				process_ms = 0;
+ 				slices = blocked_slices = 0;
++				blocked_ms = max_slice_ms = 0;
++				type_ms.fill(0);
++				type_slices.fill(0);
+ 			}
+ 		}
+ 
