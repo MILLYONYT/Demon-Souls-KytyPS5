@@ -47,7 +47,7 @@ index f373595..c75086b 100644
  	std::unordered_set<ImageId>                       m_download_images;
  	std::map<uint64_t, MetaDataInfo>                  m_surface_metas;
 diff --git a/src/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp b/src/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp
-index 83cabcd..a04fc82 100644
+index 83cabcd..559c569 100644
 --- a/src/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp
 +++ b/src/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp
 @@ -100,8 +100,23 @@ void PipelineCacheLog(fmt::format_string<Args...> format, Args&&... args) {
@@ -106,6 +106,91 @@ index 83cabcd..a04fc82 100644
  	m_driver_cache_path     = std::filesystem::path("_PipelineCache") / (title_id + ".bin");
  	const auto path         = Common::PathToString(m_driver_cache_path);
  	const bool cache_exists = Common::File::IsFileExisting(m_driver_cache_path);
+@@ -559,6 +576,25 @@ void PipelineCache::InitializeDriverCache() {
+ 
+ void PipelineCache::Save() {
+ 	Common::LockGuard lock(m_mutex);
++	SaveDriverCacheLocked(true);
++}
++
++void PipelineCache::CheckpointDriverCacheLocked() {
++	if (m_driver_cache == nullptr || ++m_new_pipelines_since_checkpoint < 16) {
++		return;
++	}
++	const auto now = std::chrono::steady_clock::now();
++	if (now - m_last_driver_cache_checkpoint < std::chrono::seconds(90)) {
++		return;
++	}
++	// A cache snapshot can stall the renderer. Limit snapshots to active periods
++	// with new pipelines and leave the in-memory cache available for this session.
++	m_new_pipelines_since_checkpoint = 0;
++	m_last_driver_cache_checkpoint = now;
++	SaveDriverCacheLocked(false);
++}
++
++void PipelineCache::SaveDriverCacheLocked(bool final) {
+ 	if (m_driver_cache == nullptr) {
+ 		return;
+ 	}
+@@ -612,8 +648,10 @@ void PipelineCache::Save() {
+ 	}
+ 	PipelineCacheLog("Vulkan pipeline cache: saved {} bytes to {}", payload.size(),
+ 	                 Common::PathToString(m_driver_cache_path));
+-	m_graphics.device.destroyPipelineCache(m_driver_cache, nullptr);
+-	m_driver_cache = nullptr;
++	if (final) {
++		m_graphics.device.destroyPipelineCache(m_driver_cache, nullptr);
++		m_driver_cache = nullptr;
++	}
+ }
+ 
+ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
+@@ -850,6 +888,7 @@ PipelineCache::Pipeline& PipelineCache::CreateGraphicsPipeline(
+ 
+ 	auto [iter, inserted] = m_graphics_pipelines.emplace(std::move(key), std::move(cached));
+ 	EXIT_IF(!inserted);
++	CheckpointDriverCacheLocked();
+ 
+ 	return *iter->second;
+ }
+@@ -880,6 +919,7 @@ PipelineCache::CreateComputePipeline(const ShaderComputeInputInfo& input_info,
+ 
+ 	auto [iter, inserted] = m_compute_pipelines.emplace(compute_program.id, std::move(cached));
+ 	EXIT_IF(!inserted);
++	CheckpointDriverCacheLocked();
+ 
+ 	return *iter->second;
+ }
+diff --git a/src/graphics/host_gpu/renderer/pipeline/pipelineCache.h b/src/graphics/host_gpu/renderer/pipeline/pipelineCache.h
+index 6fa19e7..e517c2e 100644
+--- a/src/graphics/host_gpu/renderer/pipeline/pipelineCache.h
++++ b/src/graphics/host_gpu/renderer/pipeline/pipelineCache.h
+@@ -9,6 +9,7 @@
+ #include "graphics/host_gpu/vulkanCommon.h"
+ #include "graphics/shader/shader.h"
+ 
++#include <chrono>
+ #include <cstddef>
+ #include <filesystem>
+ #include <memory>
+@@ -211,12 +212,17 @@ private:
+ 	std::unique_ptr<ProgramCache> m_program_cache;
+ 	vk::PipelineCache             m_driver_cache = nullptr;
+ 	std::filesystem::path         m_driver_cache_path;
++	uint32_t                      m_new_pipelines_since_checkpoint = 0;
++	std::chrono::steady_clock::time_point m_last_driver_cache_checkpoint =
++	    std::chrono::steady_clock::now();
+ 	std::unordered_map<GraphicsPipelineKey, std::unique_ptr<Pipeline>, GraphicsPipelineKeyHash>
+ 	                                                        m_graphics_pipelines;
+ 	std::unordered_map<uint64_t, std::unique_ptr<Pipeline>> m_compute_pipelines;
+ 	Common::Mutex m_mutex;
+ 
+ 	void InitializeDriverCache();
++	void SaveDriverCacheLocked(bool final);
++	void CheckpointDriverCacheLocked();
+ };
+ 
+ void LogPipelineTrace(const char* phase, uint64_t vertex_program_id, uint64_t pixel_program_id);
 diff --git a/src/graphics/host_gpu/vma.cpp b/src/graphics/host_gpu/vma.cpp
 index f7b512f..3deb1fa 100644
 --- a/src/graphics/host_gpu/vma.cpp
