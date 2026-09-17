@@ -98,10 +98,10 @@ index f7b512f..3deb1fa 100644
  		return false;
  	}
 diff --git a/src/graphics/shader/recompiler/ir/passes/SrtWalker.cpp b/src/graphics/shader/recompiler/ir/passes/SrtWalker.cpp
-index 2aedc25..d246fe7 100644
+index 2aedc25..593caae 100644
 --- a/src/graphics/shader/recompiler/ir/passes/SrtWalker.cpp
 +++ b/src/graphics/shader/recompiler/ir/passes/SrtWalker.cpp
-@@ -1,7 +1,12 @@
+@@ -1,11 +1,18 @@
 +#ifndef NOMINMAX
 +#define NOMINMAX
 +#endif
@@ -114,7 +114,37 @@ index 2aedc25..d246fe7 100644
  #include "graphics/shader/recompiler/ir/ShaderIR.h"
  
  #include <algorithm>
-@@ -1197,7 +1202,21 @@ bool EvaluateRuntimeSourcesImpl(const ResourcePlan& program, std::span<const uin
++#include <atomic>
+ #include <cstdlib>
++#include <cstdio>
+ #include <cstring>
+ #include <bit>
+ #include <cmath>
+@@ -1173,10 +1180,14 @@ bool EvaluateRuntimeSourcesImpl(const ResourcePlan& program, std::span<const uin
+                                 std::span<const uint8_t> clean_flat_slots,
+                                 std::vector<uint8_t>& active_sources) {
+ 	if (!program.srt_plan_complete) {
++		LOGF("SRT evaluation missing plan: shader=0x%016llx\n",
++		     static_cast<unsigned long long>(program.shader_hash));
+ 		return false;
+ 	}
+ 	if (std::ranges::any_of(clean_flat_slots, [](uint8_t clean) { return clean != 0u; }) &&
+ 	    runtime.read_specialization_memory == nullptr) {
++		LOGF("SRT evaluation missing specialization reader: shader=0x%016llx\n",
++		     static_cast<unsigned long long>(program.shader_hash));
+ 		return false;
+ 	}
+ 	SrtRuntime clean_runtime  = runtime;
+@@ -1190,6 +1201,8 @@ bool EvaluateRuntimeSourcesImpl(const ResourcePlan& program, std::span<const uin
+ 	for (const auto source_index: sources) {
+ 		const auto* source = Source(program, source_index);
+ 		if (source == nullptr) {
++			LOGF("SRT evaluation missing source: shader=0x%016llx source=%u\n",
++			     static_cast<unsigned long long>(program.shader_hash), source_index);
+ 			return false;
+ 		}
+ 		DescriptorValue value;
+@@ -1197,7 +1210,30 @@ bool EvaluateRuntimeSourcesImpl(const ResourcePlan& program, std::span<const uin
  		if (!evaluate_flat || active[source_index]) {
  			for (uint32_t index = 0; index < source->dword_count; index++) {
  				if (!evaluator.Evaluate(source->dwords[index], value.dwords[index])) {
@@ -124,9 +154,18 @@ index 2aedc25..d246fe7 100644
 +					      program.shader_hash == 0x06f5c0838a0b409bull) ||
 +					     (program.stage == ShaderType::Compute &&
 +					      program.shader_hash == 0x05021f35c669b111ull));
-+					LOGF("SRT descriptor evaluation failed: shader=0x%016llx source=%u word=%u%s\n",
-+					     static_cast<unsigned long long>(program.shader_hash), source_index, index,
-+					     reload_shader ? "; using null descriptor" : "");
++					static std::atomic_bool logged_pixel {false};
++					static std::atomic_bool logged_compute {false};
++					auto& logged = program.stage == ShaderType::Pixel ? logged_pixel : logged_compute;
++					if (!reload_shader || !logged.exchange(true, std::memory_order_relaxed)) {
++						LOGF("SRT descriptor evaluation failed: shader=0x%016llx source=%u word=%u%s\n",
++						     static_cast<unsigned long long>(program.shader_hash), source_index, index,
++						     reload_shader ? "; using null descriptor" : "");
++						std::printf("SRT descriptor evaluation failed: shader=0x%016llx source=%u word=%u%s\n",
++						            static_cast<unsigned long long>(program.shader_hash), source_index, index,
++						            reload_shader ? "; using null descriptor" : "");
++						std::fflush(stdout);
++					}
 +					if (!reload_shader) {
 +						return false;
 +					}
@@ -137,17 +176,42 @@ index 2aedc25..d246fe7 100644
  				}
  			}
  		}
-@@ -1212,6 +1231,9 @@ bool EvaluateRuntimeSourcesImpl(const ResourcePlan& program, std::span<const uin
+@@ -1210,10 +1246,32 @@ bool EvaluateRuntimeSourcesImpl(const ResourcePlan& program, std::span<const uin
+ 			const bool clean    = read.flat_offset < clean_flat_slots.size() &&
+ 			                      clean_flat_slots[read.flat_offset] != 0u;
  			auto&      selected = clean ? clean_evaluator : evaluator;
- 			if (read.flat_offset >= flattened.size() ||
- 			    !selected.Evaluate(read.value, flattened[read.flat_offset])) {
-+				LOGF("SRT flat read failed: shader=0x%016llx slot=%u clean=%u\n",
-+				     static_cast<unsigned long long>(program.shader_hash), read.flat_offset,
-+				     clean ? 1u : 0u);
+-			if (read.flat_offset >= flattened.size() ||
+-			    !selected.Evaluate(read.value, flattened[read.flat_offset])) {
++			if (read.flat_offset >= flattened.size()) {
  				return false;
  			}
++			if (!selected.Evaluate(read.value, flattened[read.flat_offset])) {
++				const bool reload_shader =
++				    (program.stage == ShaderType::Pixel &&
++				     program.shader_hash == 0x06f5c0838a0b409bull) ||
++				    (program.stage == ShaderType::Compute &&
++				     program.shader_hash == 0x05021f35c669b111ull);
++				static std::atomic_bool logged_pixel {false};
++				static std::atomic_bool logged_compute {false};
++				auto& logged = program.stage == ShaderType::Pixel ? logged_pixel : logged_compute;
++				if (!reload_shader || !logged.exchange(true, std::memory_order_relaxed)) {
++					LOGF("SRT flat read failed: shader=0x%016llx slot=%u clean=%u%s\n",
++					     static_cast<unsigned long long>(program.shader_hash), read.flat_offset,
++					     clean ? 1u : 0u, reload_shader ? "; using zero" : "");
++					std::printf("SRT flat read failed: shader=0x%016llx slot=%u clean=%u%s\n",
++					            static_cast<unsigned long long>(program.shader_hash), read.flat_offset,
++					            clean ? 1u : 0u, reload_shader ? "; using zero" : "");
++					std::fflush(stdout);
++				}
++				if (!reload_shader) {
++					return false;
++				}
++				flattened[read.flat_offset] = 0;
++			}
  		}
-@@ -1279,6 +1301,15 @@ static std::shared_ptr<LinearSrtPlan> BuildControlledLinearSrt(const ResourcePla
+ 	}
+ 	results = std::move(evaluated);
+@@ -1279,6 +1337,15 @@ static std::shared_ptr<LinearSrtPlan> BuildControlledLinearSrt(const ResourcePla
  void BuildLinearSrtPlan(ResourcePlan& program) {
      program.linear_srt.reset();
  #if defined(__x86_64__) || defined(_M_X64)
