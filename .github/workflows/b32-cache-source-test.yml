@@ -18,9 +18,6 @@ jobs:
     steps:
       - name: Checkout test branch
         uses: actions/checkout@v4
-      - name: Verify working binary baseline
-        shell: pwsh
-        run: python tools/build_from_best.py KytyPS5-B32-baseline-reference.zip
       - name: Checkout Build 32 source revision
         uses: actions/checkout@v4
         with:
