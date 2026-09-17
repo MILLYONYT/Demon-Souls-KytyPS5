@@ -650,3 +650,97 @@ index 2aedc25..6a24d1b 100644
      auto compiled=std::make_shared<LinearSrtPlan>();
      if (LinearSrtCompiler(program,*compiled).Build()) program.linear_srt=std::move(compiled);
      else program.linear_srt=BuildControlledLinearSrt(program);
+diff --git a/src/graphics/shader/recompiler/frontend/cfg/ShaderCFG.cpp b/src/graphics/shader/recompiler/frontend/cfg/ShaderCFG.cpp
+index c00421d..44e19a8 100644
+--- a/src/graphics/shader/recompiler/frontend/cfg/ShaderCFG.cpp
++++ b/src/graphics/shader/recompiler/frontend/cfg/ShaderCFG.cpp
+@@ -3,6 +3,7 @@
+ #include "common/assert.h"
+ 
+ #include <algorithm>
++#include <bit>
+ #include <fmt/format.h>
+ #include <iterator>
+ #include <map>
+@@ -719,8 +720,70 @@ void PruneUnreachableBlocks(Graph& graph) {
+ 	RebuildPredecessors(graph);
+ }
+ 
++// Repeated CFG rewrites recompute dominance many times. Large graphs use
++// compact bitsets for the fixed-point intersections, then publish the same
++// sorted block-id vectors expected by the rest of the structurizer.
++void ComputeLargeDominatorSets(Graph& graph, bool post) {
++	const auto count = static_cast<uint32_t>(graph.blocks.size());
++	const auto words = (count + 63u) / 64u;
++	std::vector<uint64_t> all(words, UINT64_MAX);
++	if (count % 64u != 0) {
++		all.back() = (uint64_t {1} << (count % 64u)) - 1u;
++	}
++	std::vector<std::vector<uint64_t>> sets(count, all);
++	for (const auto& block: graph.blocks) {
++		const bool root = post ? block.successors.empty() : block.id == graph.entry_block;
++		if (root) {
++			std::fill(sets[block.id].begin(), sets[block.id].end(), 0);
++			sets[block.id][block.id / 64u] |= uint64_t {1} << (block.id % 64u);
++		}
++	}
++	std::vector<uint64_t> next(words);
++	bool changed = true;
++	while (changed) {
++		changed = false;
++		for (const auto& block: graph.blocks) {
++			if (!post && block.id == graph.entry_block) {
++				continue;
++			}
++			const auto& neighbours = post ? block.successors : block.predecessors;
++			if (neighbours.empty()) {
++				std::fill(next.begin(), next.end(), 0);
++			} else {
++				std::copy(sets[neighbours.front()].begin(), sets[neighbours.front()].end(),
++				          next.begin());
++				for (size_t i = 1; i < neighbours.size(); ++i) {
++					for (size_t word = 0; word < words; ++word) {
++						next[word] &= sets[neighbours[i]][word];
++					}
++				}
++			}
++			next[block.id / 64u] |= uint64_t {1} << (block.id % 64u);
++			if (next != sets[block.id]) {
++				std::copy(next.begin(), next.end(), sets[block.id].begin());
++				changed = true;
++			}
++		}
++	}
++	for (auto& block: graph.blocks) {
++		auto& ids = post ? block.post_dominators : block.dominators;
++		ids.clear();
++		for (size_t word = 0; word < words; ++word) {
++			auto bits = sets[block.id][word];
++			while (bits != 0) {
++				ids.push_back(static_cast<uint32_t>(word * 64u + std::countr_zero(bits)));
++				bits &= bits - 1u;
++			}
++		}
++	}
++}
++
+ void ComputeDominators(Graph& graph) {
+ 	const auto count = static_cast<uint32_t>(graph.blocks.size());
++	if (count >= 128) {
++		ComputeLargeDominatorSets(graph, false);
++		return;
++	}
+ 	const auto all   = AllBlockIds(count);
+ 
+ 	for (auto& block: graph.blocks) {
+@@ -755,6 +818,10 @@ void ComputeDominators(Graph& graph) {
+ 
+ void ComputePostDominators(Graph& graph) {
+ 	const auto count = static_cast<uint32_t>(graph.blocks.size());
++	if (count >= 128) {
++		ComputeLargeDominatorSets(graph, true);
++		return;
++	}
+ 	const auto all   = AllBlockIds(count);
+ 
+ 	for (auto& block: graph.blocks) {
