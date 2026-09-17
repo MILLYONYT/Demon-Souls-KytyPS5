@@ -1097,3 +1097,1410 @@ index a134dd5..17338d7 100644
  	}
  	temporary->Flush(0, total_size);
  	const auto handle = temporary->Handle();
+diff --git a/src/graphics/host_gpu/renderer/sync.cpp b/src/graphics/host_gpu/renderer/sync.cpp
+index db3003c..c5669fb 100644
+--- a/src/graphics/host_gpu/renderer/sync.cpp
++++ b/src/graphics/host_gpu/renderer/sync.cpp
+@@ -117,9 +117,11 @@ void WriteAtEndOfPipeClockCounter(uint64_t submit_id, CommandBuffer& buffer, uin
+ 	RecordEndOfPipeWrite(submit_id, buffer, reinterpret_cast<uint64_t>(dst_gpu_addr), 0,
+ 	                     EndOfPipeWriteSize::Qword, EndOfPipeWriteAction::Write);
+ 
++#if !defined(KYTY_B32_QUIET_HOT_LOGS)
+ 	LOGF_COLOR(Log::Color::BrightGreen,
+ 	           "EndOfPipe Signal!!! [0x%016" PRIx64 "] <- Clock: 0x%016" PRIx64 "\n",
+ 	           reinterpret_cast<uint64_t>(dst_gpu_addr), value);
++#endif
+ }
+ 
+ void WriteAtEndOfPipeClockCounterWithWriteBack(uint64_t submit_id, CommandBuffer& buffer,
+@@ -127,9 +129,11 @@ void WriteAtEndOfPipeClockCounterWithWriteBack(uint64_t submit_id, CommandBuffer
+ 	RecordEndOfPipeWrite(submit_id, buffer, reinterpret_cast<uint64_t>(dst_gpu_addr), 0,
+ 	                     EndOfPipeWriteSize::Qword, EndOfPipeWriteAction::WriteBack);
+ 
++#if !defined(KYTY_B32_QUIET_HOT_LOGS)
+ 	LOGF_COLOR(Log::Color::BrightGreen,
+ 	           "EndOfPipe Signal!!! [0x%016" PRIx64 "] <- Clock: 0x%016" PRIx64 "\n",
+ 	           reinterpret_cast<uint64_t>(dst_gpu_addr), value);
++#endif
+ }
+ 
+ void WriteAtEndOfPipeWithWriteBack64(uint64_t submit_id, CommandBuffer& buffer,
+diff --git a/src/libs/agc.cpp b/src/libs/agc.cpp
+index 0111f02..6c3c1b5 100644
+--- a/src/libs/agc.cpp
++++ b/src/libs/agc.cpp
+@@ -44,6 +44,16 @@ namespace Libs::Graphics {
+ 
+ static RenderContext* g_renderer = nullptr;
+ 
++// Keep diagnostics and frame timings, but avoid formatting routine AGC calls
++// on this performance test build. Full command traces remain on other builds.
++#if defined(KYTY_B32_QUIET_HOT_LOGS)
++#define AGC_PRINT_NAME() ((void)0)
++#define AGC_ROUTINE_LOG(...) ((void)0)
++#else
++#define AGC_PRINT_NAME() PRINT_NAME()
++#define AGC_ROUTINE_LOG(...) LOGF(__VA_ARGS__)
++#endif
++
+ template <typename... Args>
+ static void AgcTrace(const char* format, const Args&... args) {
+ 	if (Config::GraphicsDebugDumpEnabled()) {
+@@ -336,7 +346,7 @@ struct Label {
+ };
+ 
+ int KYTY_SYSV_ABI AgcInit(uint32_t* state, uint32_t ver) {
+-	PRINT_NAME();
++	AGC_PRINT_NAME();
+ 
+ 	LOGF("\t state = 0x%016" PRIx64 "\n"
+ 	     "\t ver   = %u\n",
+@@ -352,7 +362,7 @@ int KYTY_SYSV_ABI AgcInit(uint32_t* state, uint32_t ver) {
+ }
+ 
+ void* KYTY_SYSV_ABI AgcGetRegisterDefaults2(uint32_t ver) {
+-	PRINT_NAME();
++	AGC_PRINT_NAME();
+ 
+ 	if (ver > GRAPHICS_REGISTER_DEFAULTS_MAX_VERSION) {
+ 		LOGF_COLOR(Log::Color::Red, "\t unsupported version %u\n", ver);
+@@ -361,7 +371,7 @@ void* KYTY_SYSV_ABI AgcGetRegisterDefaults2(uint32_t ver) {
+ }
+ 
+ void* KYTY_SYSV_ABI AgcGetRegisterDefaults2Internal(uint32_t ver) {
+-	PRINT_NAME();
++	AGC_PRINT_NAME();
+ 
+ 	if (ver > GRAPHICS_REGISTER_DEFAULTS_MAX_VERSION) {
+ 		LOGF_COLOR(Log::Color::Red, "\t unsupported version %u\n", ver);
+@@ -619,7 +629,7 @@ static void patch_shader_register_address(ShaderRegister* regs, uint32_t num_reg
+ }
+ 
+ int KYTY_SYSV_ABI AgcCreateShader(Shader** dst, void* header, const volatile void* code) {
+-	PRINT_NAME();
++	AGC_PRINT_NAME();
+ 
+ 	EXIT_NOT_IMPLEMENTED(dst == nullptr);
+ 	EXIT_NOT_IMPLEMENTED(header == nullptr);
+@@ -688,7 +698,7 @@ int KYTY_SYSV_ABI AgcCreateShader(Shader** dst, void* header, const volatile voi
+ 
+ int KYTY_SYSV_ABI AgcUnknownGetFusedShaderSize(SizeAlign* dst, const Shader* front,
+                                                const Shader* back) {
+-	PRINT_NAME();
++	AGC_PRINT_NAME();
+ 
+ 	LOGF("\t dst   = 0x%016" PRIx64 "\n"
+ 	     "\t front = 0x%016" PRIx64 "\n"
+@@ -822,13 +832,13 @@ static int fuse_shader_halves(Shader* fused_result, const Shader* front,
+ 
+ int KYTY_SYSV_ABI AgcUnknownFuseShaderHalves(Shader* fused_result, const Shader* front,
+                                            const Shader* back, void* scratch_mem) {
+-	PRINT_NAME();
++	AGC_PRINT_NAME();
+ 	return fuse_shader_halves(fused_result, front, back, scratch_mem, true);
+ }
+ 
+ int KYTY_SYSV_ABI AgcUnknownNApJjpKNBl4(Shader* fused_result, const Shader* front,
+                                       const Shader* back, void* scratch_mem) {
+-	PRINT_NAME();
++	AGC_PRINT_NAME();
+ 	return fuse_shader_halves(fused_result, front, back, scratch_mem, false);
+ }
+ 
+@@ -909,7 +919,7 @@ static int reg_indirect_patch_add_registers(uint32_t* cmd, uint32_t num_regs,
+ 
+ int KYTY_SYSV_ABI AgcSetCxRegIndirectPatchSetAddress(uint32_t*                      cmd,
+                                                      const volatile ShaderRegister* regs) {
+-	PRINT_NAME();
++	AGC_PRINT_NAME();
+ 
+ 	AgcTrace("\t cmd  = 0x%016" PRIx64 "\n"
+ 	     "\t regs = 0x%016" PRIx64 "\n",
+@@ -925,7 +935,7 @@ int KYTY_SYSV_ABI AgcSetCxRegIndirectPatchSetAddress(uint32_t*
+ 
+ int KYTY_SYSV_ABI AgcSetShRegIndirectPatchSetAddress(uint32_t*                      cmd,
+                                                      const volatile ShaderRegister* regs) {
+-	PRINT_NAME();
++	AGC_PRINT_NAME();
+ 
+ 	AgcTrace("\t cmd  = 0x%016" PRIx64 "\n"
+ 	     "\t regs = 0x%016" PRIx64 "\n",
+@@ -941,7 +951,7 @@ int KYTY_SYSV_ABI AgcSetShRegIndirectPatchSetAddress(uint32_t*
+ 
+ int KYTY_SYSV_ABI AgcSetUcRegIndirectPatchSetAddress(uint32_t*                      cmd,
+                                                      const volatile ShaderRegister* regs) {
+-	PRINT_NAME();
++	AGC_PRINT_NAME();
+ 
+ 	AgcTrace("\t cmd  = 0x%016" PRIx64 "\n"
+ 	     "\t regs = 0x%016" PRIx64 "\n",
+@@ -956,7 +966,7 @@ int KYTY_SYSV_ABI AgcSetUcRegIndirectPatchSetAddress(uint32_t*
+ }
+ 
+ int KYTY_SYSV_ABI AgcSetCxRegIndirectPatchSetNumRegisters(uint32_t* cmd, uint32_t num_regs) {
+-	PRINT_NAME();
++	AGC_PRINT_NAME();
+ 
+ 	AgcTrace("\t cmd      = 0x%016" PRIx64 "\n"
+ 	     "\t num_regs = %" PRIu32 "\n",
+@@ -968,7 +978,7 @@ int KYTY_SYSV_ABI AgcSetCxRegIndirectPatchSetNumRegisters(uint32_t* cmd, uint32_
+ }
+ 
+ int KYTY_SYSV_ABI AgcSetShRegIndirectPatchSetNumRegisters(uint32_t* cmd, uint32_t num_regs) {
+-	PRINT_NAME();
++	AGC_PRINT_NAME();
+ 
+ 	AgcTrace("\t cmd      = 0x%016" PRIx64 "\n"
+ 	     "\t num_regs = %" PRIu32 "\n",
+@@ -980,7 +990,7 @@ int KYTY_SYSV_ABI AgcSetShRegIndirectPatchSetNumRegisters(uint32_t* cmd, uint32_
+ }
+ 
+ int KYTY_SYSV_ABI AgcSetUcRegIndirectPatchSetNumRegisters(uint32_t* cmd, uint32_t num_regs) {
+-	PRINT_NAME();
++	AGC_PRINT_NAME();
+ 
+ 	AgcTrace("\t cmd      = 0x%016" PRIx64 "\n"
+ 	     "\t num_regs = %" PRIu32 "\n",
+@@ -992,7 +1002,7 @@ int KYTY_SYSV_ABI AgcSetUcRegIndirectPatchSetNumRegisters(uint32_t* cmd, uint32_
+ }
+ 
+ int KYTY_SYSV_ABI AgcSetCxRegIndirectPatchAddRegisters(uint32_t* cmd, uint32_t num_regs) {
+-	PRINT_NAME();
++	AGC_PRINT_NAME();
+ 
+ 	AgcTrace("\t cmd      = 0x%016" PRIx64 "\n"
+ 	     "\t num_regs = %" PRIu32 "\n",
+@@ -1004,7 +1014,7 @@ int KYTY_SYSV_ABI AgcSetCxRegIndirectPatchAddRegisters(uint32_t* cmd, uint32_t n
+ }
+ 
+ int KYTY_SYSV_ABI AgcSetShRegIndirectPatchAddRegisters(uint32_t* cmd, uint32_t num_regs) {
+-	PRINT_NAME();
++	AGC_PRINT_NAME();
+ 
+ 	AgcTrace("\t cmd      = 0x%016" PRIx64 "\n"
+ 	     "\t num_regs = %" PRIu32 "\n",
+@@ -1016,7 +1026,7 @@ int KYTY_SYSV_ABI AgcSetShRegIndirectPatchAddRegisters(uint32_t* cmd, uint32_t n
+ }
+ 
+ int KYTY_SYSV_ABI AgcSetUcRegIndirectPatchAddRegisters(uint32_t* cmd, uint32_t num_regs) {
+-	PRINT_NAME();
++	AGC_PRINT_NAME();
+ 
+ 	AgcTrace("\t cmd      = 0x%016" PRIx64 "\n"
+ 	     "\t num_regs = %" PRIu32 "\n",
+@@ -1047,7 +1057,7 @@ static uint32_t GraphicsPrimitiveTypeToGsOut(uint32_t prim_type) {
+ 
+ int KYTY_SYSV_ABI AgcCreatePrimState(ShaderRegister* cx_regs, ShaderRegister* uc_regs,
+                                      const Shader* hs, const Shader* gs, uint32_t prim_type) {
+-	PRINT_NAME();
++	AGC_PRINT_NAME();
+ 
+ 	AgcTrace("\t cx_regs   = 0x%016" PRIx64 "\n"
+ 	     "\t uc_regs   = 0x%016" PRIx64 "\n"
+@@ -1115,7 +1125,7 @@ int KYTY_SYSV_ABI AgcCreatePrimState(ShaderRegister* cx_regs, ShaderRegister* uc
+ 
+ int KYTY_SYSV_ABI AgcUpdatePrimState(ShaderRegister* cx_regs, ShaderRegister* uc_regs,
+                                      uint32_t prim_type) {
+-	PRINT_NAME();
++	AGC_PRINT_NAME();
+ 
+ 	AgcTrace("\t cx_regs   = 0x%016" PRIx64 "\n"
+ 	     "\t uc_regs   = 0x%016" PRIx64 "\n"
+@@ -1174,7 +1184,7 @@ static GsOccupancyLimits get_gs_occupancy_limits(const Shader* gs, uint32_t vert
+ 
+ int KYTY_SYSV_ABI AgcGetGsOversubscription(ShaderRegister* regs, const Shader* gs, uint32_t budget,
+                                            float factor) {
+-	PRINT_NAME();
++	AGC_PRINT_NAME();
+ 
+ 	constexpr uint32_t FULL_PC_OVERSUBSCRIPTION = 0x7ffu;
+ 	constexpr uint32_t FULL_SH_OVERSUBSCRIPTION = 0x007f0000u;
+@@ -1320,7 +1330,7 @@ static void set_identity_interpolant_registers(ShaderRegister* regs, uint32_t fi
+ 
+ int KYTY_SYSV_ABI AgcCreateInterpolantMapping(ShaderRegister* regs, const Shader* gs,
+                                               const Shader* ps) {
+-	PRINT_NAME();
++	AGC_PRINT_NAME();
+ 
+ 	AgcTrace("\t regs = 0x%016" PRIx64 "\n"
+ 	     "\t gs   = 0x%016" PRIx64 "\n"
+@@ -1376,7 +1386,7 @@ static uint32_t apply_interpolant_final_mask(uint32_t flags, uint32_t source,
+ 
+ int KYTY_SYSV_ABI AgcCreateInterpolantMapping2(ShaderRegister* regs, const Shader* gs,
+                                                const Shader* ps) {
+-	PRINT_NAME();
++	AGC_PRINT_NAME();
+ 
+ 	AgcTrace("\t regs = 0x%016" PRIx64 "\n"
+ 	     "\t gs   = 0x%016" PRIx64 "\n"
+@@ -1451,11 +1461,11 @@ int KYTY_SYSV_ABI AgcCreateInterpolantMapping2(ShaderRegister* regs, const Shade
+ }
+ 
+ int KYTY_SYSV_ABI AgcGetDataPacketPayloadAddress(uint32_t** addr, uint32_t* cmd, int type) {
+-	PRINT_NAME();
++	AGC_PRINT_NAME();
+ 
+ 	static std::atomic<uint32_t> log_count {0};
+ 	if (log_count.fetch_add(1) < 64) {
+-		LOGF("\t addr = 0x%016" PRIx64 "\n"
++		AGC_ROUTINE_LOG("\t addr = 0x%016" PRIx64 "\n"
+ 		     "\t cmd  = 0x%016" PRIx64 "\n"
+ 		     "\t type = %d\n",
+ 		     reinterpret_cast<uint64_t>(addr), reinterpret_cast<uint64_t>(cmd), type);
+@@ -1475,12 +1485,12 @@ int KYTY_SYSV_ABI AgcGetDataPacketPayloadAddress(uint32_t** addr, uint32_t* cmd,
+ }
+ 
+ int KYTY_SYSV_ABI AgcGetDataPacketPayloadRange(MemoryRange* range, uint32_t* cmd, int type) {
+-	PRINT_NAME();
++	AGC_PRINT_NAME();
+ 
+ 	static std::atomic<uint32_t> log_count {0};
+ 	const bool                   should_log = (log_count.fetch_add(1) < 64);
+ 	if (should_log) {
+-		LOGF("\t range = 0x%016" PRIx64 "\n"
++		AGC_ROUTINE_LOG("\t range = 0x%016" PRIx64 "\n"
+ 		     "\t cmd   = 0x%016" PRIx64 "\n"
+ 		     "\t type  = %d\n",
+ 		     reinterpret_cast<uint64_t>(range), reinterpret_cast<uint64_t>(cmd), type);
+@@ -1506,7 +1516,7 @@ int KYTY_SYSV_ABI AgcGetDataPacketPayloadRange(MemoryRange* range, uint32_t* cmd
+ 	}
+ 
+ 	if (should_log) {
+-		LOGF("\t cmd_id = 0x%08" PRIx32 ", len = %" PRIu32 "\n"
++		AGC_ROUTINE_LOG("\t cmd_id = 0x%08" PRIx32 ", len = %" PRIu32 "\n"
+ 		     "\t base   = 0x%016" PRIx64 "\n"
+ 		     "\t size   = 0x%016" PRIx64 "\n",
+ 		     cmd_id, len, reinterpret_cast<uint64_t>(range->m_base), range->m_size);
+@@ -1530,9 +1540,9 @@ int KYTY_SYSV_ABI AgcWriteDataPatchSetAddressOrOffset(uint32_t* cmd, uint64_t ad
+ 
+ int KYTY_SYSV_ABI AgcJumpPatchSetTarget(uint32_t* cmd, const volatile uint32_t* target,
+                                         uint32_t size_in_dwords) {
+-	PRINT_NAME();
++	AGC_PRINT_NAME();
+ 
+-	LOGF("\t cmd            = 0x%016" PRIx64 "\n"
++	AGC_ROUTINE_LOG("\t cmd            = 0x%016" PRIx64 "\n"
+ 	     "\t target         = 0x%016" PRIx64 "\n"
+ 	     "\t size_in_dwords = %" PRIu32 "\n",
+ 	     reinterpret_cast<uint64_t>(cmd), reinterpret_cast<uint64_t>(target), size_in_dwords);
+@@ -1542,7 +1552,7 @@ int KYTY_SYSV_ABI AgcJumpPatchSetTarget(uint32_t* cmd, const volatile uint32_t*
+ 	auto cmd_id = cmd[0];
+ 	auto op     = (cmd_id >> 8u) & 0xffu;
+ 
+-	LOGF("\t cmd_id         = 0x%08" PRIx32 ", op = 0x%02" PRIx32 ", len = %" PRIu32 "\n", cmd_id,
++	AGC_ROUTINE_LOG("\t cmd_id         = 0x%08" PRIx32 ", op = 0x%02" PRIx32 ", len = %" PRIu32 "\n", cmd_id,
+ 	     op, KYTY_PM4_LEN(cmd_id));
+ 
+ 	if (op != Pm4::IT_INDIRECT_BUFFER) {
+@@ -1559,7 +1569,7 @@ int KYTY_SYSV_ABI AgcJumpPatchSetTarget(uint32_t* cmd, const volatile uint32_t*
+ }
+ 
+ int KYTY_SYSV_ABI AgcSuspendPoint() {
+-	PRINT_NAME();
++	AGC_PRINT_NAME();
+ 
+ 	EXIT_IF(g_renderer == nullptr);
+ 	g_renderer->GetGpu().Done();
+@@ -1578,8 +1588,8 @@ int KYTY_SYSV_ABI AgcSuspendPoint() {
+ }
+ 
+ uint32_t* KYTY_SYSV_ABI AgcDcbContextStateOp(CommandBuffer* buf, uint32_t operation) {
+-	PRINT_NAME();
+-	LOGF("\t operation = 0x%08" PRIx32 "\n", operation);
++	AGC_PRINT_NAME();
++	AGC_ROUTINE_LOG("\t operation = 0x%08" PRIx32 "\n", operation);
+ 
+ 	const auto size_dw = context_state_op_size_dw(operation);
+ 	if (buf == nullptr || size_dw == 0) {
+@@ -1631,7 +1641,7 @@ uint32_t* KYTY_SYSV_ABI AgcDcbContextStateOp(CommandBuffer* buf, uint32_t operat
+ }
+ 
+ uint64_t KYTY_SYSV_ABI AgcDcbContextStateOpGetSize(uint32_t operation) {
+-	PRINT_NAME();
++	AGC_PRINT_NAME();
+ 	return static_cast<uint64_t>(context_state_op_size_dw(operation)) * sizeof(uint32_t);
+ }
+ 
+@@ -1654,26 +1664,26 @@ static uint32_t   g_workload_stream_mask = 0;
+ static uint8_t    g_workload_streams[WORKLOAD_STREAM_MAX_ID + 1][WORKLOAD_STREAM_RECORD_SIZE] {};
+ 
+ uint32_t KYTY_SYSV_ABI AgcDriverGetDefaultOwner() {
+-	PRINT_NAME();
++	AGC_PRINT_NAME();
+ 
+ 	return 0x8a6c9018u;
+ }
+ 
+ uint32_t KYTY_SYSV_ABI AgcDriverGetResourceRegistrationMaxNameLength() {
+-	PRINT_NAME();
++	AGC_PRINT_NAME();
+ 
+ 	return 0x8a6c9018u;
+ }
+ 
+ uint32_t KYTY_SYSV_ABI AgcDriverInitResourceRegistration() {
+-	PRINT_NAME();
++	AGC_PRINT_NAME();
+ 
+ 	return 0x8a6c9018u;
+ }
+ 
+ uint32_t KYTY_SYSV_ABI
+ AgcDriverQueryResourceRegistrationUserMemoryRequirements(uint64_t* size_in_bytes) {
+-	PRINT_NAME();
++	AGC_PRINT_NAME();
+ 
+ 	if (size_in_bytes != nullptr) {
+ 		*size_in_bytes = 0;
+@@ -1683,19 +1693,19 @@ AgcDriverQueryResourceRegistrationUserMemoryRequirements(uint64_t* size_in_bytes
+ }
+ 
+ int KYTY_SYSV_ABI AgcDriverRegisterOwner() {
+-	PRINT_NAME();
++	AGC_PRINT_NAME();
+ 
+ 	return static_cast<int>(0x8a6c9018u);
+ }
+ 
+ int KYTY_SYSV_ABI AgcDriverRegisterResource() {
+-	PRINT_NAME();
++	AGC_PRINT_NAME();
+ 
+ 	return static_cast<int>(0x8a6c9018u);
+ }
+ 
+ int KYTY_SYSV_ABI AgcDriverUnregisterOwnerAndResources(uint32_t owner_handle) {
+-	PRINT_NAME();
++	AGC_PRINT_NAME();
+ 
+ 	(void)owner_handle;
+ 
+@@ -1703,15 +1713,15 @@ int KYTY_SYSV_ABI AgcDriverUnregisterOwnerAndResources(uint32_t owner_handle) {
+ }
+ 
+ int KYTY_SYSV_ABI AgcDriverUnregisterResource() {
+-	PRINT_NAME();
++	AGC_PRINT_NAME();
+ 
+ 	return static_cast<int>(0x8a6c9018u);
+ }
+ 
+ int KYTY_SYSV_ABI AgcDriverRegisterWorkloadStream(uint32_t stream_id, const void* stream) {
+-	PRINT_NAME();
++	AGC_PRINT_NAME();
+ 
+-	LOGF("\t stream_id = %" PRIu32 "\n"
++	AGC_ROUTINE_LOG("\t stream_id = %" PRIu32 "\n"
+ 	     "\t stream    = 0x%016" PRIx64 "\n",
+ 	     stream_id, reinterpret_cast<uint64_t>(stream));
+ 
+@@ -1763,11 +1773,11 @@ uint32_t KYTY_SYSV_ABI AgcCbNopGetSize(uint32_t size_in_dwords) {
+ uint32_t* KYTY_SYSV_ABI AgcCbDispatch(CommandBuffer* buf, uint32_t thread_group_x,
+                                       uint32_t thread_group_y, uint32_t thread_group_z,
+                                       uint32_t modifier) {
+-	PRINT_NAME();
++	AGC_PRINT_NAME();
+ 
+ 	static std::atomic<uint32_t> log_count {0};
+ 	if (log_count.fetch_add(1) < 64) {
+-		LOGF("\t thread_group_x = %" PRIu32 "\n"
++		AGC_ROUTINE_LOG("\t thread_group_x = %" PRIu32 "\n"
+ 		     "\t thread_group_y = %" PRIu32 "\n"
+ 		     "\t thread_group_z = %" PRIu32 "\n"
+ 		     "\t modifier       = 0x%08" PRIx32 "\n",
+@@ -1794,7 +1804,7 @@ uint32_t* KYTY_SYSV_ABI AgcCbDispatch(CommandBuffer* buf, uint32_t thread_group_
+ }
+ 
+ uint32_t KYTY_SYSV_ABI AgcCbDispatchGetSize() {
+-	PRINT_NAME();
++	AGC_PRINT_NAME();
+ 
+ 	return 20;
+ }
+@@ -1805,9 +1815,9 @@ uint32_t* KYTY_SYSV_ABI AgcCbBranch(CommandBuffer* buf, uint8_t mode, uint8_t co
+                                     const volatile uint32_t* buffer1, uint32_t size_in_dwords1,
+                                     uint8_t cache_policy2, const volatile uint32_t* buffer2,
+                                     uint32_t size_in_dwords2) {
+-	PRINT_NAME();
++	AGC_PRINT_NAME();
+ 
+-	LOGF("\t mode             = 0x%02" PRIx8 "\n"
++	AGC_ROUTINE_LOG("\t mode             = 0x%02" PRIx8 "\n"
+ 	     "\t compare_function = 0x%02" PRIx8 "\n"
+ 	     "\t compare_addr     = 0x%016" PRIx64 "\n"
+ 	     "\t mask             = 0x%016" PRIx64 "\n"
+@@ -1855,11 +1865,11 @@ uint32_t* KYTY_SYSV_ABI AgcCbBranch(CommandBuffer* buf, uint8_t mode, uint8_t co
+ 
+ uint32_t* KYTY_SYSV_ABI AgcCbSetShRegisterRangeDirect(CommandBuffer* buf, uint32_t offset,
+                                                       const uint32_t* values, uint32_t num_values) {
+-	PRINT_NAME();
++	AGC_PRINT_NAME();
+ 
+ 	static std::atomic<uint32_t> log_count {0};
+ 	if (log_count.fetch_add(1) < 64) {
+-		LOGF("\t buf        = 0x%016" PRIx64 "\n"
++		AGC_ROUTINE_LOG("\t buf        = 0x%016" PRIx64 "\n"
+ 		     "\t offset     = %" PRIx32 "\n"
+ 		     "\t values     = 0x%016" PRIx64 "\n"
+ 		     "\t num_values = %" PRIu32 "\n",
+@@ -1889,9 +1899,9 @@ uint32_t* KYTY_SYSV_ABI AgcCbSetShRegisterRangeDirect(CommandBuffer* buf, uint32
+ }
+ 
+ uint32_t KYTY_SYSV_ABI AgcCbSetShRegisterRangeDirectGetSize(uint32_t num_values) {
+-	PRINT_NAME();
++	AGC_PRINT_NAME();
+ 
+-	LOGF("\t num_values = %" PRIu32 "\n", num_values);
++	AGC_ROUTINE_LOG("\t num_values = %" PRIu32 "\n", num_values);
+ 
+ 	return 4u * num_values + 8u;
+ }
+@@ -1899,7 +1909,7 @@ uint32_t KYTY_SYSV_ABI AgcCbSetShRegisterRangeDirectGetSize(uint32_t num_values)
+ uint32_t* KYTY_SYSV_ABI AgcCbSetShRegistersDirect(CommandBuffer*                 buf,
+                                                   const volatile ShaderRegister* regs,
+                                                   uint32_t                       num_regs) {
+-	PRINT_NAME();
++	AGC_PRINT_NAME();
+ 
+ 	AgcTrace("\t regs     = 0x%016" PRIx64 "\n"
+ 	     "\t num_regs = %" PRIu32 "\n",
+@@ -1966,7 +1976,7 @@ uint32_t* KYTY_SYSV_ABI AgcCbSetShRegistersDirect(CommandBuffer*
+ uint32_t* KYTY_SYSV_ABI AgcCbSetUcRegistersDirect(CommandBuffer*                 buf,
+                                                   const volatile ShaderRegister* regs,
+                                                   uint32_t                       num_regs) {
+-	PRINT_NAME();
++	AGC_PRINT_NAME();
+ 
+ 	AgcTrace("\t regs     = 0x%016" PRIx64 "\n"
+ 	     "\t num_regs = %" PRIu32 "\n",
+@@ -2034,9 +2044,9 @@ uint32_t* KYTY_SYSV_ABI AgcCbSetUcRegistersDirect(CommandBuffer*
+ }
+ 
+ int KYTY_SYSV_ABI AgcDebugRaiseException(uint32_t exception_id) {
+-	PRINT_NAME();
++	AGC_PRINT_NAME();
+ 
+-	LOGF("\t exception_id = 0x%08" PRIx32 "\n", exception_id);
++	AGC_ROUTINE_LOG("\t exception_id = 0x%08" PRIx32 "\n", exception_id);
+ 
+ 	return OK;
+ }
+@@ -2046,11 +2056,11 @@ uint32_t* KYTY_SYSV_ABI AgcCbReleaseMem(CommandBuffer* buf, uint8_t action, uint
+                                         const volatile Label* address, uint8_t data_sel,
+                                         uint64_t data, uint16_t gds_offset, uint16_t gds_size,
+                                         uint8_t interrupt, uint32_t interrupt_ctx_id) {
+-	PRINT_NAME();
++	AGC_PRINT_NAME();
+ 
+ 	static std::atomic<uint32_t> log_count {0};
+ 	if (log_count.fetch_add(1) < 64) {
+-		LOGF("\t action           = 0x%02" PRIx8 "\n"
++		AGC_ROUTINE_LOG("\t action           = 0x%02" PRIx8 "\n"
+ 		     "\t gcr_cntl         = 0x%04" PRIx16 "\n"
+ 		     "\t dst              = %" PRIu8 "\n"
+ 		     "\t cache_policy     = 0x%02" PRIx8 "\n"
+@@ -2112,15 +2122,15 @@ uint32_t* KYTY_SYSV_ABI AgcCbReleaseMem(CommandBuffer* buf, uint8_t action, uint
+ }
+ 
+ uint32_t KYTY_SYSV_ABI AgcCbQueueEndOfPipeActionGetSize() {
+-	PRINT_NAME();
++	AGC_PRINT_NAME();
+ 
+ 	return 32;
+ }
+ 
+ uint32_t* KYTY_SYSV_ABI AgcAcbResetQueue(CommandBuffer* buf, uint32_t op) {
+-	PRINT_NAME();
++	AGC_PRINT_NAME();
+ 
+-	LOGF("\t op    = 0x%08" PRIx32 "\n", op);
++	AGC_ROUTINE_LOG("\t op    = 0x%08" PRIx32 "\n", op);
+ 
+ 	EXIT_NOT_IMPLEMENTED(buf == nullptr);
+ 	EXIT_NOT_IMPLEMENTED((op & ~0x1c2u) != 0);
+@@ -2138,9 +2148,9 @@ uint32_t* KYTY_SYSV_ABI AgcAcbResetQueue(CommandBuffer* buf, uint32_t op) {
+ }
+ 
+ uint32_t* KYTY_SYSV_ABI AgcDcbResetQueue(CommandBuffer* buf, uint32_t op, uint32_t state) {
+-	PRINT_NAME();
++	AGC_PRINT_NAME();
+ 
+-	LOGF("\t op    = 0x%08" PRIx32 "\n"
++	AGC_ROUTINE_LOG("\t op    = 0x%08" PRIx32 "\n"
+ 	     "\t state = 0x%08" PRIx32 "\n",
+ 	     op, state);
+ 
+@@ -2162,9 +2172,9 @@ uint32_t* KYTY_SYSV_ABI AgcDcbResetQueue(CommandBuffer* buf, uint32_t op, uint32
+ uint32_t* KYTY_SYSV_ABI AgcDcbWaitUntilSafeForRendering(CommandBuffer* buf,
+                                                         uint32_t       video_out_handle,
+                                                         uint32_t       display_buffer_index) {
+-	PRINT_NAME();
++	AGC_PRINT_NAME();
+ 
+-	LOGF("\t video_out_handle     = %" PRIu32 "\n"
++	AGC_ROUTINE_LOG("\t video_out_handle     = %" PRIu32 "\n"
+ 	     "\t display_buffer_index = %" PRIu32 "\n",
+ 	     video_out_handle, display_buffer_index);
+ 
+@@ -2190,9 +2200,9 @@ uint32_t* KYTY_SYSV_ABI AgcDcbWaitUntilSafeForRendering(CommandBuffer* buf,
+ uint32_t* KYTY_SYSV_ABI AgcDcbSetWorkloadsActive(CommandBuffer* buf, uint32_t stream_id,
+                                                  const uint32_t* workload_ids,
+                                                  uint32_t        workload_count) {
+-	PRINT_NAME();
++	AGC_PRINT_NAME();
+ 
+-	LOGF("\t stream_id      = %" PRIu32 "\n"
++	AGC_ROUTINE_LOG("\t stream_id      = %" PRIu32 "\n"
+ 	     "\t workload_ids   = 0x%016" PRIx64 "\n"
+ 	     "\t workload_count = %" PRIu32 "\n",
+ 	     stream_id, reinterpret_cast<uint64_t>(workload_ids), workload_count);
+@@ -2243,9 +2253,9 @@ uint32_t* KYTY_SYSV_ABI AgcDcbSetWorkloadsActive(CommandBuffer* buf, uint32_t st
+ 
+ uint32_t* KYTY_SYSV_ABI AgcDcbSetWorkloadComplete(CommandBuffer* buf, uint32_t stream_id,
+                                                   uint32_t workload_id) {
+-	PRINT_NAME();
++	AGC_PRINT_NAME();
+ 
+-	LOGF("\t stream_id   = %" PRIu32 "\n"
++	AGC_ROUTINE_LOG("\t stream_id   = %" PRIu32 "\n"
+ 	     "\t workload_id = %" PRIu32 "\n",
+ 	     stream_id, workload_id);
+ 
+@@ -2282,7 +2292,7 @@ uint32_t* KYTY_SYSV_ABI AgcDcbSetWorkloadComplete(CommandBuffer* buf, uint32_t s
+ }
+ 
+ uint32_t* KYTY_SYSV_ABI AgcDcbSetShRegisterDirect(CommandBuffer* buf, ShaderRegister reg) {
+-	PRINT_NAME();
++	AGC_PRINT_NAME();
+ 
+ 	EXIT_NOT_IMPLEMENTED(buf == nullptr);
+ 
+@@ -2303,7 +2313,7 @@ uint32_t* KYTY_SYSV_ABI AgcDcbSetShRegisterDirect(CommandBuffer* buf, ShaderRegi
+ }
+ 
+ uint32_t* KYTY_SYSV_ABI AgcDcbSetCxRegisterDirect(CommandBuffer* buf, ShaderRegister reg) {
+-	PRINT_NAME();
++	AGC_PRINT_NAME();
+ 
+ 	EXIT_NOT_IMPLEMENTED(buf == nullptr);
+ 
+@@ -2324,13 +2334,13 @@ uint32_t* KYTY_SYSV_ABI AgcDcbSetCxRegisterDirect(CommandBuffer* buf, ShaderRegi
+ }
+ 
+ uint32_t KYTY_SYSV_ABI AgcDcbSetCxRegisterDirectGetSize() {
+-	PRINT_NAME();
++	AGC_PRINT_NAME();
+ 
+ 	return 12;
+ }
+ 
+ uint32_t* KYTY_SYSV_ABI AgcDcbSetUcRegisterDirect(CommandBuffer* buf, ShaderRegister reg) {
+-	PRINT_NAME();
++	AGC_PRINT_NAME();
+ 
+ 	EXIT_NOT_IMPLEMENTED(buf == nullptr);
+ 
+@@ -2353,7 +2363,7 @@ uint32_t* KYTY_SYSV_ABI AgcDcbSetUcRegisterDirect(CommandBuffer* buf, ShaderRegi
+ uint32_t* KYTY_SYSV_ABI AgcDcbSetCxRegistersIndirect(CommandBuffer*                 buf,
+                                                      const volatile ShaderRegister* regs,
+                                                      uint32_t                       num_regs) {
+-	PRINT_NAME();
++	AGC_PRINT_NAME();
+ 
+ 	AgcTrace("\t regs     = 0x%016" PRIx64 "\n"
+ 	     "\t num_regs = %" PRIu32 "\n",
+@@ -2377,7 +2387,7 @@ uint32_t* KYTY_SYSV_ABI AgcDcbSetCxRegistersIndirect(CommandBuffer*
+ uint32_t* KYTY_SYSV_ABI AgcDcbSetShRegistersIndirect(CommandBuffer*                 buf,
+                                                      const volatile ShaderRegister* regs,
+                                                      uint32_t                       num_regs) {
+-	PRINT_NAME();
++	AGC_PRINT_NAME();
+ 
+ 	AgcTrace("\t regs     = 0x%016" PRIx64 "\n"
+ 	     "\t num_regs = %" PRIu32 "\n",
+@@ -2401,7 +2411,7 @@ uint32_t* KYTY_SYSV_ABI AgcDcbSetShRegistersIndirect(CommandBuffer*
+ uint32_t* KYTY_SYSV_ABI AgcDcbSetUcRegistersIndirect(CommandBuffer*                 buf,
+                                                      const volatile ShaderRegister* regs,
+                                                      uint32_t                       num_regs) {
+-	PRINT_NAME();
++	AGC_PRINT_NAME();
+ 
+ 	AgcTrace("\t regs     = 0x%016" PRIx64 "\n"
+ 	     "\t num_regs = %" PRIu32 "\n",
+@@ -2424,7 +2434,7 @@ uint32_t* KYTY_SYSV_ABI AgcDcbSetUcRegistersIndirect(CommandBuffer*
+ 
+ uint32_t* KYTY_SYSV_ABI AgcDcbSetIndexSize(CommandBuffer* buf, uint8_t index_size,
+                                            uint8_t cache_policy) {
+-	PRINT_NAME();
++	AGC_PRINT_NAME();
+ 
+ 	AgcTrace("\t index_size   = 0x%" PRIx8 "\n"
+ 	     "\t cache_policy = 0x%" PRIx8 "\n",
+@@ -2445,7 +2455,7 @@ uint32_t* KYTY_SYSV_ABI AgcDcbSetIndexSize(CommandBuffer* buf, uint8_t index_siz
+ }
+ 
+ uint32_t* KYTY_SYSV_ABI AgcDcbSetIndexBuffer(CommandBuffer* buf, uint64_t index_addr) {
+-	PRINT_NAME();
++	AGC_PRINT_NAME();
+ 
+ 	AgcTrace("\t index_addr = 0x%016" PRIx64 "\n", index_addr);
+ 
+@@ -2466,7 +2476,7 @@ uint32_t* KYTY_SYSV_ABI AgcDcbSetIndexBuffer(CommandBuffer* buf, uint64_t index_
+ }
+ 
+ uint32_t* KYTY_SYSV_ABI AgcDcbSetIndexCount(CommandBuffer* buf, uint32_t index_count) {
+-	PRINT_NAME();
++	AGC_PRINT_NAME();
+ 
+ 	AgcTrace("\t index_count = 0x%" PRIx32 "\n", index_count);
+ 
+@@ -2485,7 +2495,7 @@ uint32_t* KYTY_SYSV_ABI AgcDcbSetIndexCount(CommandBuffer* buf, uint32_t index_c
+ }
+ 
+ uint32_t* KYTY_SYSV_ABI AgcDcbSetNumInstances(CommandBuffer* buf, uint32_t num_instances) {
+-	PRINT_NAME();
++	AGC_PRINT_NAME();
+ 
+ 	AgcTrace("\t num_instances = 0x%" PRIx32 "\n", num_instances);
+ 
+@@ -2508,7 +2518,7 @@ uint32_t* KYTY_SYSV_ABI AgcDcbSetNumInstances(CommandBuffer* buf, uint32_t num_i
+ }
+ 
+ uint32_t KYTY_SYSV_ABI AgcDcbSetNumInstancesGetSize() {
+-	PRINT_NAME();
++	AGC_PRINT_NAME();
+ 
+ 	return 8;
+ }
+@@ -2581,7 +2591,7 @@ static void write_agc_internal_data_packet(uint32_t* cmd, uint32_t tag) {
+ 
+ uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndex(CommandBuffer* buf, uint32_t index_count,
+                                         const volatile void* index_addr, uint64_t modifier) {
+-	PRINT_NAME();
++	AGC_PRINT_NAME();
+ 
+ 	AgcTrace("\t index_count = 0x%" PRIx32 "\n"
+ 	     "\t index_addr  = 0x%016" PRIx64 "\n"
+@@ -2611,7 +2621,7 @@ uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndex(CommandBuffer* buf, uint32_t index_count
+ }
+ 
+ uint32_t KYTY_SYSV_ABI AgcDcbDrawIndexGetSize() {
+-	PRINT_NAME();
++	AGC_PRINT_NAME();
+ 
+ 	return 6u * 4u;
+ }
+@@ -2620,7 +2630,7 @@ uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndexMultiInstanced(CommandBuffer* buf, uint32
+                                                       const volatile void* index_addr,
+                                                       const volatile void* object_ids,
+                                                       uint32_t instance_count, uint64_t modifier) {
+-	PRINT_NAME();
++	AGC_PRINT_NAME();
+ 
+ 	AgcTrace("\t index_count    = 0x%" PRIx32 "\n"
+ 	     "\t index_addr     = 0x%016" PRIx64 "\n"
+@@ -2658,7 +2668,7 @@ uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndexMultiInstanced(CommandBuffer* buf, uint32
+ }
+ 
+ uint32_t KYTY_SYSV_ABI AgcDcbDrawIndexMultiInstancedGetSize() {
+-	PRINT_NAME();
++	AGC_PRINT_NAME();
+ 
+ 	return 9u * 4u;
+ }
+@@ -2666,9 +2676,9 @@ uint32_t KYTY_SYSV_ABI AgcDcbDrawIndexMultiInstancedGetSize() {
+ int KYTY_SYSV_ABI AgcUnknownIkfdtRIqCE(uint32_t* cmd, uint64_t arg1,
+                                        const volatile uint32_t* target, uint32_t size_in_dwords,
+                                        uint64_t arg4, uint64_t arg5) {
+-	PRINT_NAME();
++	AGC_PRINT_NAME();
+ 
+-	LOGF("\t cmd            = 0x%016" PRIx64 "\n"
++	AGC_ROUTINE_LOG("\t cmd            = 0x%016" PRIx64 "\n"
+ 	     "\t arg1           = 0x%016" PRIx64 "\n"
+ 	     "\t target         = 0x%016" PRIx64 "\n"
+ 	     "\t size_in_dwords = %" PRIu32 "\n"
+@@ -2696,7 +2706,7 @@ int KYTY_SYSV_ABI AgcUnknownIkfdtRIqCE(uint32_t* cmd, uint64_t arg1,
+ 
+ uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndexAuto(CommandBuffer* buf, uint32_t index_count,
+                                             uint64_t modifier) {
+-	PRINT_NAME();
++	AGC_PRINT_NAME();
+ 
+ 	AgcTrace("\t index_count = 0x%" PRIx32 "\n"
+ 	     "\t modifier    = 0x%016" PRIx64 "\n",
+@@ -2718,14 +2728,14 @@ uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndexAuto(CommandBuffer* buf, uint32_t index_c
+ }
+ 
+ uint32_t KYTY_SYSV_ABI AgcDcbDrawIndexAutoGetSize() {
+-	PRINT_NAME();
++	AGC_PRINT_NAME();
+ 
+ 	return 3u * 4u;
+ }
+ 
+ uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndexOffset(CommandBuffer* buf, uint32_t index_offset,
+                                               uint32_t index_count, uint64_t modifier) {
+-	PRINT_NAME();
++	AGC_PRINT_NAME();
+ 
+ 	AgcTrace("\t index_offset = 0x%" PRIx32 "\n"
+ 	     "\t index_count  = 0x%" PRIx32 "\n"
+@@ -2750,16 +2760,16 @@ uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndexOffset(CommandBuffer* buf, uint32_t index
+ }
+ 
+ uint32_t KYTY_SYSV_ABI AgcDcbDrawIndexOffsetGetSize() {
+-	PRINT_NAME();
++	AGC_PRINT_NAME();
+ 
+ 	return 5u * 4u;
+ }
+ 
+ uint32_t* KYTY_SYSV_ABI AgcDcbSetBaseIndirectArgs(CommandBuffer* buf, uint32_t shader_type,
+                                                   const volatile void* indirect_base_addr) {
+-	PRINT_NAME();
++	AGC_PRINT_NAME();
+ 
+-	LOGF("\t shader_type        = %" PRIu32 "\n"
++	AGC_ROUTINE_LOG("\t shader_type        = %" PRIu32 "\n"
+ 	     "\t indirect_base_addr = 0x%016" PRIx64 "\n",
+ 	     shader_type, reinterpret_cast<uint64_t>(indirect_base_addr));
+ 
+@@ -2783,7 +2793,7 @@ uint32_t* KYTY_SYSV_ABI AgcDcbSetBaseIndirectArgs(CommandBuffer* buf, uint32_t s
+ 
+ uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndexIndirect(CommandBuffer* buf, uint32_t data_offset_in_bytes,
+                                                 uint64_t modifier) {
+-	PRINT_NAME();
++	AGC_PRINT_NAME();
+ 
+ 	AgcTrace("\t data_offset = 0x%" PRIx32 "\n"
+ 	     "\t modifier    = 0x%016" PRIx64 "\n",
+@@ -2810,7 +2820,7 @@ uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndexIndirect(CommandBuffer* buf, uint32_t dat
+ 
+ uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndirect(CommandBuffer* buf, uint32_t data_offset_in_bytes,
+                                            uint64_t modifier) {
+-	PRINT_NAME();
++	AGC_PRINT_NAME();
+ 
+ 	AgcTrace("\t data_offset = 0x%" PRIx32 "\n"
+ 	     "\t modifier    = 0x%016" PRIx64 "\n",
+@@ -2841,7 +2851,7 @@ uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndirectMulti(CommandBuffer*       buf,
+                                                 uint32_t             max_count_or_count,
+                                                 const volatile void* count_addr,
+                                                 uint32_t stride_in_bytes, uint64_t modifier) {
+-	PRINT_NAME();
++	AGC_PRINT_NAME();
+ 
+ 	AgcTrace("\t data_offset        = 0x%" PRIx32 "\n"
+ 	     "\t count_indirect     = 0x%" PRIx32 "\n"
+@@ -2904,7 +2914,7 @@ uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndexIndirectMulti(CommandBuffer*       buf,
+                                                      uint32_t             max_count_or_count,
+                                                      const volatile void* count_addr,
+                                                      uint32_t stride_in_bytes, uint64_t modifier) {
+-	PRINT_NAME();
++	AGC_PRINT_NAME();
+ 
+ 	AgcTrace("\t data_offset        = 0x%" PRIx32 "\n"
+ 	     "\t count_indirect     = 0x%" PRIx32 "\n"
+@@ -2942,16 +2952,16 @@ uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndexIndirectMulti(CommandBuffer*       buf,
+ }
+ 
+ uint32_t KYTY_SYSV_ABI AgcDcbDrawIndirectGetSize() {
+-	PRINT_NAME();
++	AGC_PRINT_NAME();
+ 
+ 	return 5u * 4u;
+ }
+ 
+ uint32_t* KYTY_SYSV_ABI AgcDcbDispatchIndirect(CommandBuffer* buf, uint32_t data_offset_in_bytes,
+                                                uint32_t flags) {
+-	PRINT_NAME();
++	AGC_PRINT_NAME();
+ 
+-	LOGF("\t data_offset = 0x%" PRIx32 "\n"
++	AGC_ROUTINE_LOG("\t data_offset = 0x%" PRIx32 "\n"
+ 	     "\t flags       = 0x%08" PRIx32 "\n",
+ 	     data_offset_in_bytes, flags);
+ 
+@@ -2971,18 +2981,18 @@ uint32_t* KYTY_SYSV_ABI AgcDcbDispatchIndirect(CommandBuffer* buf, uint32_t data
+ }
+ 
+ uint32_t KYTY_SYSV_ABI AgcDcbDispatchIndirectGetSize() {
+-	PRINT_NAME();
++	AGC_PRINT_NAME();
+ 
+ 	return 3u * 4u;
+ }
+ 
+ uint32_t* KYTY_SYSV_ABI AgcDcbEventWrite(CommandBuffer* buf, uint8_t event_type,
+                                          const volatile void* address) {
+-	PRINT_NAME();
++	AGC_PRINT_NAME();
+ 
+ 	static std::atomic<uint32_t> log_count {0};
+ 	if (log_count.fetch_add(1) < 64) {
+-		LOGF("\t event_type = 0x%02" PRIx8 "\n"
++		AGC_ROUTINE_LOG("\t event_type = 0x%02" PRIx8 "\n"
+ 		     "\t address    = 0x%016" PRIx64 "\n",
+ 		     event_type, reinterpret_cast<uint64_t>(address));
+ 	}
+@@ -3015,7 +3025,7 @@ uint32_t* KYTY_SYSV_ABI AgcDcbEventWrite(CommandBuffer* buf, uint8_t event_type,
+ }
+ 
+ uint64_t KYTY_SYSV_ABI AgcDcbEventWriteGetSize(uint8_t event_type) {
+-	PRINT_NAME();
++	AGC_PRINT_NAME();
+ 
+ 	return (event_type & 0xfeu) == 0x38u ? 16u : 8u;
+ }
+@@ -3041,11 +3051,11 @@ uint32_t* KYTY_SYSV_ABI AgcAcbEventWrite(CommandBuffer* buf, uint8_t event_type,
+ uint32_t* KYTY_SYSV_ABI AgcDcbAcquireMem(CommandBuffer* buf, uint8_t engine, uint32_t cb_db_op,
+                                          uint32_t gcr_cntl, const volatile void* base,
+                                          uint64_t size_bytes, uint32_t poll_cycles) {
+-	PRINT_NAME();
++	AGC_PRINT_NAME();
+ 
+ 	static std::atomic<uint32_t> log_count {0};
+ 	if (log_count.fetch_add(1) < 64) {
+-		LOGF("\t engine      = 0x%02" PRIx8 "\n"
++		AGC_ROUTINE_LOG("\t engine      = 0x%02" PRIx8 "\n"
+ 		     "\t cb_db_op    = 0x%08" PRIx32 "\n"
+ 		     "\t gcr_cntl    = 0x%08" PRIx32 "\n"
+ 		     "\t base        = 0x%016" PRIx64 "\n"
+@@ -3109,7 +3119,7 @@ uint32_t* KYTY_SYSV_ABI AgcDcbAcquireMem(CommandBuffer* buf, uint8_t engine, uin
+ }
+ 
+ uint32_t KYTY_SYSV_ABI AgcDcbAcquireMemGetSize() {
+-	PRINT_NAME();
++	AGC_PRINT_NAME();
+ 
+ 	return 8u * 4u;
+ }
+@@ -3121,16 +3131,16 @@ uint32_t* KYTY_SYSV_ABI AgcAcbAcquireMem(CommandBuffer* buf, uint32_t gcr_cntl,
+ }
+ 
+ uint32_t KYTY_SYSV_ABI AgcAcbAcquireMemGetSize() {
+-	PRINT_NAME();
++	AGC_PRINT_NAME();
+ 
+ 	return AgcDcbAcquireMemGetSize();
+ }
+ 
+ uint32_t* KYTY_SYSV_ABI AgcDcbCondExec(CommandBuffer* buf, const volatile uint32_t* address,
+                                        uint32_t num_dwords) {
+-	PRINT_NAME();
++	AGC_PRINT_NAME();
+ 
+-	LOGF("\t address    = 0x%016" PRIx64 "\n"
++	AGC_ROUTINE_LOG("\t address    = 0x%016" PRIx64 "\n"
+ 	     "\t num_dwords = %" PRIu32 "\n",
+ 	     reinterpret_cast<uint64_t>(address), num_dwords);
+ 
+@@ -3168,7 +3178,7 @@ uint32_t* KYTY_SYSV_ABI AgcDcbCondExec(CommandBuffer* buf, const volatile uint32
+ }
+ 
+ uint32_t KYTY_SYSV_ABI AgcDcbCondExecGetSize() {
+-	PRINT_NAME();
++	AGC_PRINT_NAME();
+ 
+ 	return 20;
+ }
+@@ -3179,7 +3189,7 @@ uint32_t* KYTY_SYSV_ABI AgcAcbCondExec(CommandBuffer* buf, const volatile uint32
+ }
+ 
+ uint32_t KYTY_SYSV_ABI AgcAcbCondExecGetSize() {
+-	PRINT_NAME();
++	AGC_PRINT_NAME();
+ 
+ 	return AgcDcbCondExecGetSize();
+ }
+@@ -3217,7 +3227,7 @@ uint32_t* KYTY_SYSV_ABI AgcAcbWaitRegMem(CommandBuffer* buf, uint8_t size, uint8
+ }
+ 
+ uint64_t KYTY_SYSV_ABI AgcAcbWaitOnAddressGetSize(uint8_t size) {
+-	PRINT_NAME();
++	AGC_PRINT_NAME();
+ 
+ 	return AgcDcbWaitOnAddressGetSize(size);
+ }
+@@ -3294,7 +3304,7 @@ uint32_t* KYTY_SYSV_ABI AgcAcbCopyData(CommandBuffer* buf, uint8_t dst, uint8_t
+ }
+ 
+ uint64_t KYTY_SYSV_ABI AgcAcbCopyDataGetSize() {
+-	PRINT_NAME();
++	AGC_PRINT_NAME();
+ 
+ 	return AgcDcbCopyDataGetSize();
+ }
+@@ -3302,9 +3312,9 @@ uint64_t KYTY_SYSV_ABI AgcAcbCopyDataGetSize() {
+ uint32_t* KYTY_SYSV_ABI AgcAcbDispatchIndirect(CommandBuffer*       buf,
+                                                const volatile void* indirect_args,
+                                                uint32_t             modifier) {
+-	PRINT_NAME();
++	AGC_PRINT_NAME();
+ 
+-	LOGF("\t indirect_args = 0x%016" PRIx64 "\n"
++	AGC_ROUTINE_LOG("\t indirect_args = 0x%016" PRIx64 "\n"
+ 	     "\t modifier      = 0x%08" PRIx32 "\n",
+ 	     reinterpret_cast<uint64_t>(indirect_args), modifier);
+ 
+@@ -3358,7 +3368,7 @@ uint32_t* KYTY_SYSV_ABI AgcAcbWriteData(CommandBuffer* buf, uint8_t dst, uint8_t
+ }
+ 
+ uint32_t* KYTY_SYSV_ABI AgcDcbStallCommandBufferParser(CommandBuffer* buf) {
+-	PRINT_NAME();
++	AGC_PRINT_NAME();
+ 
+ 	EXIT_NOT_IMPLEMENTED(buf == nullptr);
+ 
+@@ -3378,9 +3388,9 @@ uint32_t* KYTY_SYSV_ABI AgcDcbCopyData(CommandBuffer* buf, uint8_t dst, uint8_t
+                                        uint64_t dst_address, uint8_t src, uint8_t src_cache_policy,
+                                        uint64_t src_address_or_immediate, uint8_t item_size,
+                                        uint8_t write_confirm) {
+-	PRINT_NAME();
++	AGC_PRINT_NAME();
+ 
+-	LOGF("\t dst                      = 0x%02" PRIx8 "\n"
++	AGC_ROUTINE_LOG("\t dst                      = 0x%02" PRIx8 "\n"
+ 	     "\t dst_cache_policy         = 0x%02" PRIx8 "\n"
+ 	     "\t dst_address              = 0x%016" PRIx64 "\n"
+ 	     "\t src                      = 0x%02" PRIx8 "\n"
+@@ -3418,7 +3428,7 @@ uint32_t* KYTY_SYSV_ABI AgcDcbCopyData(CommandBuffer* buf, uint8_t dst, uint8_t
+ }
+ 
+ uint64_t KYTY_SYSV_ABI AgcDcbCopyDataGetSize() {
+-	PRINT_NAME();
++	AGC_PRINT_NAME();
+ 
+ 	return 6 * sizeof(uint32_t);
+ }
+@@ -3470,9 +3480,9 @@ uint32_t* KYTY_SYSV_ABI AgcDcbDmaData(CommandBuffer* buf, uint8_t engine, uint8_
+ 
+ uint32_t* KYTY_SYSV_ABI AgcDcbJump(CommandBuffer* buf, uint8_t mode, uint8_t cache_policy,
+                                    const uint32_t* target, uint32_t size_in_dwords) {
+-	PRINT_NAME();
++	AGC_PRINT_NAME();
+ 
+-	LOGF("\t mode           = 0x%02" PRIx8 "\n"
++	AGC_ROUTINE_LOG("\t mode           = 0x%02" PRIx8 "\n"
+ 	     "\t cache_policy   = 0x%02" PRIx8 "\n"
+ 	     "\t target         = 0x%016" PRIx64 "\n"
+ 	     "\t size_in_dwords = %" PRIu32 "\n",
+@@ -3500,21 +3510,21 @@ uint32_t* KYTY_SYSV_ABI AgcDcbJump(CommandBuffer* buf, uint8_t mode, uint8_t cac
+ }
+ 
+ uint32_t KYTY_SYSV_ABI AgcDcbJumpGetSize() {
+-	PRINT_NAME();
++	AGC_PRINT_NAME();
+ 
+ 	return 16;
+ }
+ 
+ uint32_t KYTY_SYSV_ABI AgcDcbRewindGetSize() {
+-	PRINT_NAME();
++	AGC_PRINT_NAME();
+ 
+ 	return 8;
+ }
+ 
+ uint32_t* KYTY_SYSV_ABI AgcDcbRewind(CommandBuffer* buf, uint32_t initial_state) {
+-	PRINT_NAME();
++	AGC_PRINT_NAME();
+ 
+-	LOGF("\t initial_state = 0x%08" PRIx32 "\n", initial_state);
++	AGC_ROUTINE_LOG("\t initial_state = 0x%08" PRIx32 "\n", initial_state);
+ 
+ 	if (buf == nullptr) {
+ 		return nullptr;
+@@ -3535,9 +3545,9 @@ uint32_t* KYTY_SYSV_ABI AgcDcbRewind(CommandBuffer* buf, uint32_t initial_state)
+ uint32_t* KYTY_SYSV_ABI AgcDcbSetPredication(CommandBuffer* buf, uint8_t condition, uint8_t op,
+                                              uint8_t wait_op, const volatile void* address,
+                                              uint32_t count_in_dwords) {
+-	PRINT_NAME();
++	AGC_PRINT_NAME();
+ 
+-	LOGF("\t condition       = 0x%02" PRIx8 "\n"
++	AGC_ROUTINE_LOG("\t condition       = 0x%02" PRIx8 "\n"
+ 	     "\t op              = 0x%02" PRIx8 "\n"
+ 	     "\t wait_op         = 0x%02" PRIx8 "\n"
+ 	     "\t address         = 0x%016" PRIx64 "\n"
+@@ -3570,9 +3580,9 @@ uint32_t* KYTY_SYSV_ABI AgcDcbSetPredication(CommandBuffer* buf, uint8_t conditi
+ 
+ uint32_t* KYTY_SYSV_ABI AgcUnknownKRzWekV120(CommandBuffer* buf, uint32_t arg1, uint32_t arg2,
+                                              uint32_t arg3) {
+-	PRINT_NAME();
++	AGC_PRINT_NAME();
+ 
+-	LOGF("\t argc = 4\n"
++	AGC_ROUTINE_LOG("\t argc = 4\n"
+ 	     "\t arg0 = 0x%016" PRIx64 "\n"
+ 	     "\t arg1 = 0x%08" PRIx32 "\n"
+ 	     "\t arg2 = 0x%08" PRIx32 "\n"
+@@ -3640,13 +3650,13 @@ uint32_t KYTY_SYSV_ABI AgcGetPacketSize(uint32_t* packet) {
+ }
+ 
+ int KYTY_SYSV_ABI AgcSetPacketPredication(uint32_t* packet, uint32_t predication) {
+-	PRINT_NAME();
++	AGC_PRINT_NAME();
+ 
+-	LOGF("\t packet      = 0x%016" PRIx64 "\n"
++	AGC_ROUTINE_LOG("\t packet      = 0x%016" PRIx64 "\n"
+ 	     "\t predication = 0x%08" PRIx32 "\n",
+ 	     reinterpret_cast<uint64_t>(packet), predication);
+ 
+-	LOGF("\t packet0     = 0x%08" PRIx32 ", op = 0x%02" PRIx32 ", r = 0x%02" PRIx32
++	AGC_ROUTINE_LOG("\t packet0     = 0x%08" PRIx32 ", op = 0x%02" PRIx32 ", r = 0x%02" PRIx32
+ 	     ", len = %" PRIu32 "\n",
+ 	     packet[0], (packet[0] >> 8u) & 0xffu, KYTY_PM4_R(packet[0]), AgcGetPacketSize(packet));
+ 
+@@ -3657,9 +3667,9 @@ int KYTY_SYSV_ABI AgcSetPacketPredication(uint32_t* packet, uint32_t predication
+ 
+ int KYTY_SYSV_ABI AgcSetRangePredication(uint32_t* start, const volatile uint32_t* end,
+                                          uint32_t predication) {
+-	PRINT_NAME();
++	AGC_PRINT_NAME();
+ 
+-	LOGF("\t start       = 0x%016" PRIx64 "\n"
++	AGC_ROUTINE_LOG("\t start       = 0x%016" PRIx64 "\n"
+ 	     "\t end         = 0x%016" PRIx64 "\n"
+ 	     "\t predication = 0x%08" PRIx32 "\n",
+ 	     reinterpret_cast<uint64_t>(start), reinterpret_cast<uint64_t>(end), predication);
+@@ -3700,9 +3710,9 @@ int KYTY_SYSV_ABI AgcRewindPatchSetRewindState(uint32_t* cmd, uint8_t state) {
+ }
+ 
+ int KYTY_SYSV_ABI AgcCondExecPatchSetEnd(uint32_t* cmd, const volatile uint32_t* buffer) {
+-	PRINT_NAME();
++	AGC_PRINT_NAME();
+ 
+-	LOGF("\t cmd    = 0x%016" PRIx64 "\n"
++	AGC_ROUTINE_LOG("\t cmd    = 0x%016" PRIx64 "\n"
+ 	     "\t buffer = 0x%016" PRIx64 "\n",
+ 	     reinterpret_cast<uint64_t>(cmd), reinterpret_cast<uint64_t>(buffer));
+ 
+@@ -3732,9 +3742,9 @@ int KYTY_SYSV_ABI AgcCondExecPatchSetEnd(uint32_t* cmd, const volatile uint32_t*
+ 
+ int KYTY_SYSV_ABI AgcCondExecPatchSetCommandAddress(uint32_t*                cmd,
+                                                     const volatile uint32_t* command) {
+-	PRINT_NAME();
++	AGC_PRINT_NAME();
+ 
+-	LOGF("\t cmd     = 0x%016" PRIx64 "\n"
++	AGC_ROUTINE_LOG("\t cmd     = 0x%016" PRIx64 "\n"
+ 	     "\t command = 0x%016" PRIx64 "\n",
+ 	     reinterpret_cast<uint64_t>(cmd), reinterpret_cast<uint64_t>(command));
+ 
+@@ -3758,7 +3768,7 @@ uint32_t* KYTY_SYSV_ABI AgcDcbWriteData(CommandBuffer* buf, uint8_t dst, uint8_t
+                                         uint64_t address_or_offset, const void* data,
+                                         uint32_t num_dwords, uint8_t increment,
+                                         uint8_t write_confirm) {
+-	PRINT_NAME();
++	AGC_PRINT_NAME();
+ 
+ 	AgcTrace("\t dst               = 0x%02" PRIx8 "\n"
+ 	     "\t cache_policy      = 0x%02" PRIx8 "\n"
+@@ -3805,9 +3815,9 @@ uint32_t* KYTY_SYSV_ABI AgcDcbWriteData(CommandBuffer* buf, uint8_t dst, uint8_t
+ }
+ 
+ uint32_t KYTY_SYSV_ABI AgcDcbWriteDataGetSize(uint32_t num_dwords) {
+-	PRINT_NAME();
++	AGC_PRINT_NAME();
+ 
+-	LOGF("\t num_dwords = %" PRIu32 "\n", num_dwords);
++	AGC_ROUTINE_LOG("\t num_dwords = %" PRIu32 "\n", num_dwords);
+ 
+ 	return 4u * num_dwords + 16u;
+ }
+@@ -3817,9 +3827,9 @@ uint32_t* KYTY_SYSV_ABI AgcDcbGetLodStats(CommandBuffer* buf, uint8_t cache_poli
+                                           uint32_t buffer_size_in_bytes, uint32_t reset_count,
+                                           uint8_t force_reset, uint8_t report_and_reset,
+                                           uint32_t reporting_interval_in_100k_clocks) {
+-	PRINT_NAME();
++	AGC_PRINT_NAME();
+ 
+-	LOGF("\t cache_policy                      = 0x%02" PRIx8 "\n"
++	AGC_ROUTINE_LOG("\t cache_policy                      = 0x%02" PRIx8 "\n"
+ 	     "\t buffer                            = 0x%016" PRIx64 "\n"
+ 	     "\t buffer_size_in_bytes              = %" PRIu32 "\n"
+ 	     "\t reset_count                       = %" PRIu32 "\n"
+@@ -3876,9 +3886,9 @@ static uint32_t* get_agc_wait_packet(uint32_t* cmd) {
+ }
+ 
+ int KYTY_SYSV_ABI AgcWaitRegMemPatchAddress(uint32_t* cmd, const volatile void* address) {
+-	PRINT_NAME();
++	AGC_PRINT_NAME();
+ 
+-	LOGF("\t cmd     = 0x%016" PRIx64 "\n"
++	AGC_ROUTINE_LOG("\t cmd     = 0x%016" PRIx64 "\n"
+ 	     "\t address = 0x%016" PRIx64 "\n",
+ 	     reinterpret_cast<uint64_t>(cmd), reinterpret_cast<uint64_t>(address));
+ 
+@@ -3900,9 +3910,9 @@ int KYTY_SYSV_ABI AgcWaitRegMemPatchAddress(uint32_t* cmd, const volatile void*
+ }
+ 
+ int KYTY_SYSV_ABI AgcWaitRegMemPatchReference(uint32_t* cmd, uint64_t reference) {
+-	PRINT_NAME();
++	AGC_PRINT_NAME();
+ 
+-	LOGF("\t cmd       = 0x%016" PRIx64 "\n"
++	AGC_ROUTINE_LOG("\t cmd       = 0x%016" PRIx64 "\n"
+ 	     "\t reference = 0x%016" PRIx64 "\n",
+ 	     reinterpret_cast<uint64_t>(cmd), reference);
+ 
+@@ -3919,11 +3929,11 @@ int KYTY_SYSV_ABI AgcWaitRegMemPatchReference(uint32_t* cmd, uint64_t reference)
+ 
+ int KYTY_SYSV_ABI AgcQueueEndOfPipeActionPatchAddress(uint32_t*             cmd,
+                                                       const volatile Label* address) {
+-	PRINT_NAME();
++	AGC_PRINT_NAME();
+ 
+ 	// Not sure
+ 
+-	LOGF("\t cmd     = 0x%016" PRIx64 "\n"
++	AGC_ROUTINE_LOG("\t cmd     = 0x%016" PRIx64 "\n"
+ 	     "\t address = 0x%016" PRIx64 "\n",
+ 	     reinterpret_cast<uint64_t>(cmd), reinterpret_cast<uint64_t>(address));
+ 
+@@ -3948,9 +3958,9 @@ int KYTY_SYSV_ABI AgcQueueEndOfPipeActionPatchAddress(uint32_t*             cmd,
+ }
+ 
+ int KYTY_SYSV_ABI AgcQueueEndOfPipeActionPatchData(uint32_t* cmd, uint64_t data) {
+-	PRINT_NAME();
++	AGC_PRINT_NAME();
+ 
+-	LOGF("\t cmd  = 0x%016" PRIx64 "\n"
++	AGC_ROUTINE_LOG("\t cmd  = 0x%016" PRIx64 "\n"
+ 	     "\t data = 0x%016" PRIx64 "\n",
+ 	     reinterpret_cast<uint64_t>(cmd), data);
+ 
+@@ -4011,7 +4021,7 @@ uint32_t* KYTY_SYSV_ABI AgcDcbWaitRegMem(CommandBuffer* buf, uint8_t size, uint8
+                                          uint8_t op, uint8_t cache_policy,
+                                          const volatile void* address, uint64_t reference,
+                                          uint64_t mask, uint32_t poll_cycles) {
+-	PRINT_NAME();
++	AGC_PRINT_NAME();
+ 
+ 	AgcTrace("\t size             = 0x%02" PRIx8 "\n"
+ 	     "\t compare_function = 0x%02" PRIx8 "\n"
+@@ -4088,7 +4098,7 @@ uint32_t* KYTY_SYSV_ABI AgcDcbWaitRegMem(CommandBuffer* buf, uint8_t size, uint8
+ }
+ 
+ uint64_t KYTY_SYSV_ABI AgcDcbWaitOnAddressGetSize(uint32_t size) {
+-	PRINT_NAME();
++	AGC_PRINT_NAME();
+ 
+ 	switch (size) {
+ 		case 0: return 14u * 4u;
+@@ -4158,7 +4168,7 @@ uint32_t* KYTY_SYSV_ABI AgcAcbPopMarker(CommandBuffer* buf) {
+ uint32_t* KYTY_SYSV_ABI AgcDcbSetFlip(CommandBuffer* buf, uint32_t video_out_handle,
+                                       int32_t display_buffer_index, uint32_t flip_mode,
+                                       int64_t flip_arg) {
+-	PRINT_NAME();
++	AGC_PRINT_NAME();
+ 
+ 	AgcTrace("\t video_out_handle     = %" PRIu32 "\n"
+ 	     "\t display_buffer_index = %" PRId32 "\n"
+@@ -4207,7 +4217,7 @@ static void submit_dcb(uint32_t* dcb, uint32_t size_in_dwords) {
+ }
+ 
+ int KYTY_SYSV_ABI AgcDriverSubmitDcb(const Packet* packet) {
+-	PRINT_NAME();
++	AGC_PRINT_NAME();
+ 
+ 	EXIT_NOT_IMPLEMENTED(packet == nullptr);
+ 
+@@ -4223,7 +4233,7 @@ int KYTY_SYSV_ABI AgcDriverSubmitDcb(const Packet* packet) {
+ 
+ int KYTY_SYSV_ABI AgcDriverSubmitMultiDcbs(uint32_t* const* dcb_gpu_addrs,
+                                            const uint32_t* dcb_sizes_in_dwords, uint32_t count) {
+-	PRINT_NAME();
++	AGC_PRINT_NAME();
+ 
+ 	AgcTrace("\t count = %" PRIu32 "\n", count);
+ 
+@@ -4255,9 +4265,11 @@ static void submit_acb(uint32_t queue, uint32_t* acb, uint32_t size_in_dwords) {
+ 		return;
+ 	}
+ 
++#if !defined(KYTY_B32_QUIET_HOT_LOGS)
+ 	for (uint32_t i = 0; i < std::min<uint32_t>(size_in_dwords, 8); i++) {
+-		LOGF("\t acb[%u] = 0x%08" PRIx32 "\n", i, acb[i]);
++		AGC_ROUTINE_LOG("\t acb[%u] = 0x%08" PRIx32 "\n", i, acb[i]);
+ 	}
++#endif
+ 
+ 	GraphicsDbgDumpDcb("a", size_in_dwords, acb);
+ 
+@@ -4284,9 +4296,9 @@ static void submit_command_buffer(uint32_t queue, uint32_t* commands, uint32_t s
+ }
+ 
+ int KYTY_SYSV_ABI AgcDriverSubmitCommandBuffer(void* queue_context, const Packet* packet) {
+-	PRINT_NAME();
++	AGC_PRINT_NAME();
+ 
+-	LOGF("\t queue_context = 0x%016" PRIx64 "\n"
++	AGC_ROUTINE_LOG("\t queue_context = 0x%016" PRIx64 "\n"
+ 	     "\t packet        = 0x%016" PRIx64 "\n",
+ 	     reinterpret_cast<uint64_t>(queue_context), reinterpret_cast<uint64_t>(packet));
+ 
+@@ -4295,7 +4307,7 @@ int KYTY_SYSV_ABI AgcDriverSubmitCommandBuffer(void* queue_context, const Packet
+ 	}
+ 
+ 	const uint32_t queue = get_driver_queue(queue_context);
+-	LOGF("\t queue = 0x%08" PRIx32 "\n"
++	AGC_ROUTINE_LOG("\t queue = 0x%08" PRIx32 "\n"
+ 	     "\t addr  = 0x%016" PRIx64 "\n"
+ 	     "\t size  = 0x%08" PRIx32 "\n"
+ 	     "\t flags = 0x%02" PRIx8 "\n",
+@@ -4309,9 +4321,9 @@ int KYTY_SYSV_ABI AgcDriverSubmitMultiCommandBuffers(void*            queue_cont
+                                                      uint32_t* const* command_buffers,
+                                                      const uint32_t*  sizes_in_dwords,
+                                                      uint32_t         count) {
+-	PRINT_NAME();
++	AGC_PRINT_NAME();
+ 
+-	LOGF("\t queue_context = 0x%016" PRIx64 "\n"
++	AGC_ROUTINE_LOG("\t queue_context = 0x%016" PRIx64 "\n"
+ 	     "\t count         = %" PRIu32 "\n",
+ 	     reinterpret_cast<uint64_t>(queue_context), count);
+ 
+@@ -4330,16 +4342,16 @@ int KYTY_SYSV_ABI AgcDriverSubmitMultiCommandBuffers(void*            queue_cont
+ }
+ 
+ int KYTY_SYSV_ABI AgcDriverSubmitAcb(uint32_t queue, const Packet* packet) {
+-	PRINT_NAME();
++	AGC_PRINT_NAME();
+ 
+-	LOGF("\t queue  = 0x%08" PRIx32 "\n"
++	AGC_ROUTINE_LOG("\t queue  = 0x%08" PRIx32 "\n"
+ 	     "\t packet = 0x%016" PRIx64 "\n",
+ 	     queue, reinterpret_cast<uint64_t>(packet));
+ 
+ 	if (packet == nullptr) {
+ 		return OK;
+ 	}
+-	LOGF("\t acb   = 0x%016" PRIx64 "\n"
++	AGC_ROUTINE_LOG("\t acb   = 0x%016" PRIx64 "\n"
+ 	     "\t size  = 0x%08" PRIx32 "\n"
+ 	     "\t flags = 0x%02" PRIx8 "\n",
+ 	     reinterpret_cast<uint64_t>(packet->addr), packet->dw_num, packet->flags);
+@@ -4350,9 +4362,9 @@ int KYTY_SYSV_ABI AgcDriverSubmitAcb(uint32_t queue, const Packet* packet) {
+ 
+ int KYTY_SYSV_ABI AgcDriverSubmitMultiAcbs(uint32_t queue, uint32_t* const* acbs,
+                                            const uint32_t* sizes_in_dwords, uint32_t count) {
+-	PRINT_NAME();
++	AGC_PRINT_NAME();
+ 
+-	LOGF("\t queue = 0x%08" PRIx32 "\n"
++	AGC_ROUTINE_LOG("\t queue = 0x%08" PRIx32 "\n"
+ 	     "\t count = %" PRIu32 "\n",
+ 	     queue, count);
+ 
+@@ -4371,7 +4383,7 @@ int KYTY_SYSV_ABI AgcDriverSubmitMultiAcbs(uint32_t queue, uint32_t* const* acbs
+ }
+ 
+ int KYTY_SYSV_ABI AgcDriverAddEqEvent(LibKernel::EventQueue::KernelEqueue eq, int id, void* udata) {
+-	PRINT_NAME();
++	AGC_PRINT_NAME();
+ 
+ 	if (eq == LibKernel::EventQueue::KERNEL_EQUEUE_INVALID) {
+ 		return LibKernel::KERNEL_ERROR_EBADF;
+@@ -4382,7 +4394,7 @@ int KYTY_SYSV_ABI AgcDriverAddEqEvent(LibKernel::EventQueue::KernelEqueue eq, in
+ }
+ 
+ int KYTY_SYSV_ABI AgcDriverDeleteEqEvent(LibKernel::EventQueue::KernelEqueue eq, int id) {
+-	PRINT_NAME();
++	AGC_PRINT_NAME();
+ 
+ 	if (eq == LibKernel::EventQueue::KERNEL_EQUEUE_INVALID) {
+ 		return LibKernel::KERNEL_ERROR_EBADF;
+@@ -4393,7 +4405,7 @@ int KYTY_SYSV_ABI AgcDriverDeleteEqEvent(LibKernel::EventQueue::KernelEqueue eq,
+ }
+ 
+ int KYTY_SYSV_ABI AgcDriverGetEqEventType(const LibKernel::EventQueue::KernelEvent* ev) {
+-	PRINT_NAME();
++	AGC_PRINT_NAME();
+ 
+ 	if (ev == nullptr) {
+ 		return 0;
+@@ -4407,7 +4419,7 @@ int KYTY_SYSV_ABI AgcDriverGetEqEventType(const LibKernel::EventQueue::KernelEve
+ }
+ 
+ uint32_t KYTY_SYSV_ABI AgcDriverGetEqContextId(const LibKernel::EventQueue::KernelEvent* ev) {
+-	PRINT_NAME();
++	AGC_PRINT_NAME();
+ 
+ 	if (ev == nullptr) {
+ 		return 0;
+@@ -4421,12 +4433,12 @@ uint32_t KYTY_SYSV_ABI AgcDriverGetEqContextId(const LibKernel::EventQueue::Kern
+ }
+ 
+ int KYTY_SYSV_ABI AgcDriverSetTFRing(const volatile void* base, uint32_t size) {
+-	PRINT_NAME();
++	AGC_PRINT_NAME();
+ 
+ 	g_tessellation_driver_state.tf_ring_base = reinterpret_cast<uint64_t>(base);
+ 	g_tessellation_driver_state.tf_ring_size = size;
+ 
+-	LOGF("\t base = 0x%016" PRIx64 "\n"
++	AGC_ROUTINE_LOG("\t base = 0x%016" PRIx64 "\n"
+ 	     "\t size = 0x%08" PRIx32 "\n",
+ 	     g_tessellation_driver_state.tf_ring_base, g_tessellation_driver_state.tf_ring_size);
+ 
+@@ -4434,13 +4446,13 @@ int KYTY_SYSV_ABI AgcDriverSetTFRing(const volatile void* base, uint32_t size) {
+ }
+ 
+ int KYTY_SYSV_ABI AgcDriverSetHsOffchipParam(uint64_t value0, uint64_t value1, uint64_t value2) {
+-	PRINT_NAME();
++	AGC_PRINT_NAME();
+ 
+ 	g_tessellation_driver_state.hs_offchip_value0 = value0;
+ 	g_tessellation_driver_state.hs_offchip_value1 = value1;
+ 	g_tessellation_driver_state.hs_offchip_value2 = value2;
+ 
+-	LOGF("\t value0 = 0x%016" PRIx64 "\n"
++	AGC_ROUTINE_LOG("\t value0 = 0x%016" PRIx64 "\n"
+ 	     "\t value1 = 0x%016" PRIx64 "\n"
+ 	     "\t value2 = 0x%016" PRIx64 "\n",
+ 	     value0, value1, value2);
+@@ -4449,13 +4461,13 @@ int KYTY_SYSV_ABI AgcDriverSetHsOffchipParam(uint64_t value0, uint64_t value1, u
+ }
+ 
+ bool KYTY_SYSV_ABI AgcDriverIsCaptureInProgress() {
+-	PRINT_NAME();
++	AGC_PRINT_NAME();
+ 
+ 	return false;
+ }
+ 
+ int KYTY_SYSV_ABI AgcDriverUnknownU9ueyEhSkF4() {
+-	PRINT_NAME();
++	AGC_PRINT_NAME();
+ 
+ 	return static_cast<int>(0x8a6c9018u);
+ }
+diff --git a/src/libs/libPlayGo.cpp b/src/libs/libPlayGo.cpp
+index 94f0093..9ee53e3 100644
+--- a/src/libs/libPlayGo.cpp
++++ b/src/libs/libPlayGo.cpp
+@@ -142,9 +142,11 @@ int KYTY_SYSV_ABI PlayGoClose(int handle) {
+ 
+ int KYTY_SYSV_ABI PlayGoGetLocus(int handle, const uint16_t* chunk_ids, uint32_t number_of_entries,
+                                  int8_t* out_loci) {
++#if !defined(KYTY_B32_QUIET_HOT_LOGS)
+ 	PRINT_NAME();
+ 
+ 	LOGF("\t handle = %d\n", handle);
++#endif
+ 
+ 	if (auto ret = validate_handle(handle); ret != OK) {
+ 		return ret;
+@@ -158,7 +160,9 @@ int KYTY_SYSV_ABI PlayGoGetLocus(int handle, const uint16_t* chunk_ids, uint32_t
+ 	ensure_chunks_loaded();
+ 
+ 	for (uint32_t i = 0; i < number_of_entries; i++) {
++#if !defined(KYTY_B32_QUIET_HOT_LOGS)
+ 		LOGF("\t chunk_ids[%u] = %" PRIu16 "\n", i, chunk_ids[i]);
++#endif
+ 
+ 		if (is_valid_chunk(chunk_ids[i])) {
+ 			out_loci[i] = PLAYGO_LOCUS_LOCAL_FAST;
