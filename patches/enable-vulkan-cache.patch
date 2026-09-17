@@ -271,7 +271,7 @@ index f373595..c6ffbbc 100644
  	std::unordered_set<ImageId>                       m_download_images;
  	std::map<uint64_t, MetaDataInfo>                  m_surface_metas;
 diff --git a/src/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp b/src/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp
-index 83cabcd..61e84d6 100644
+index 83cabcd..4b513e6 100644
 --- a/src/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp
 +++ b/src/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp
 @@ -100,8 +100,23 @@ void PipelineCacheLog(fmt::format_string<Args...> format, Args&&... args) {
@@ -334,7 +334,26 @@ index 83cabcd..61e84d6 100644
  		DumpShaderOriginal(stage_name, options.shader_hash, params.code, result.decoded_dump);
  		if (!ValidateShaderSpirv(options.dump_label, options.shader_hash, result.spirv)) {
  			DumpShaderSpirv(stage_name, options.shader_hash, result.spirv);
-@@ -403,7 +432,14 @@ struct PipelineCache::ProgramCache {
+@@ -390,6 +419,18 @@ struct PipelineCache::ProgramCache {
+ 		options.back_code      = params.back_code;
+ 		options.dump_ir     = Config::GetShaderLogDirection() != Config::ShaderLogDirection::Silent;
+ 		options.early_dump  = options.dump_ir;
++#if defined(KYTY_B32_FORCE_SILENT_SHADER_DUMPS)
++		// Keep this performance test comparable even if a per-game launcher setting
++		// requests verbose shader IR. Report the effective runtime setting once.
++		static const bool logged_shader_setting = [] {
++			LOGF("Build32 shader diagnostics: requested=%u forced=Silent (performance test)\n",
++			     static_cast<unsigned>(Config::GetShaderLogDirection()));
++			return true;
++		}();
++		(void)logged_shader_setting;
++		options.dump_ir    = false;
++		options.early_dump = false;
++#endif
+ 		options.dump_label  = label;
+ 		options.input_info  = stage_input;
+ 		options.scratch_dwords = input_info.scratch_size_dwords;
+@@ -403,7 +444,14 @@ struct PipelineCache::ProgramCache {
  		} else if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
  			options.wave_size = input_info.wave_size;
  		}
@@ -349,7 +368,7 @@ index 83cabcd..61e84d6 100644
  		if (entry == programs.end()) {
  			auto resource_plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
  			ReportMaterialization(label, stage, params.hash, report,
-@@ -486,11 +522,6 @@ void PipelineCache::InitializeDriverCache() {
+@@ -486,11 +534,6 @@ void PipelineCache::InitializeDriverCache() {
  		PipelineCacheLog("Vulkan pipeline cache: disabled (unknown git revision)");
  		return;
  	}
@@ -361,7 +380,7 @@ index 83cabcd..61e84d6 100644
  	m_driver_cache_path     = std::filesystem::path("_PipelineCache") / (title_id + ".bin");
  	const auto path         = Common::PathToString(m_driver_cache_path);
  	const bool cache_exists = Common::File::IsFileExisting(m_driver_cache_path);
-@@ -559,6 +590,30 @@ void PipelineCache::InitializeDriverCache() {
+@@ -559,6 +602,30 @@ void PipelineCache::InitializeDriverCache() {
  
  void PipelineCache::Save() {
  	Common::LockGuard lock(m_mutex);
@@ -392,7 +411,7 @@ index 83cabcd..61e84d6 100644
  	if (m_driver_cache == nullptr) {
  		return;
  	}
-@@ -612,8 +667,10 @@ void PipelineCache::Save() {
+@@ -612,8 +679,10 @@ void PipelineCache::Save() {
  	}
  	PipelineCacheLog("Vulkan pipeline cache: saved {} bytes to {}", payload.size(),
  	                 Common::PathToString(m_driver_cache_path));
@@ -405,7 +424,7 @@ index 83cabcd..61e84d6 100644
  }
  
  PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
-@@ -840,9 +897,16 @@ PipelineCache::Pipeline& PipelineCache::CreateGraphicsPipeline(
+@@ -840,9 +909,16 @@ PipelineCache::Pipeline& PipelineCache::CreateGraphicsPipeline(
  
  	auto cached = std::make_unique<Pipeline>();
  	LogPipelineTrace("CreatePipelineInternal begin", vs_id, ps_id);
@@ -422,7 +441,7 @@ index 83cabcd..61e84d6 100644
  	LogPipelineTrace("CreatePipelineInternal done", vs_id, ps_id);
  
  	EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr);
-@@ -850,6 +914,7 @@ PipelineCache::Pipeline& PipelineCache::CreateGraphicsPipeline(
+@@ -850,6 +926,7 @@ PipelineCache::Pipeline& PipelineCache::CreateGraphicsPipeline(
  
  	auto [iter, inserted] = m_graphics_pipelines.emplace(std::move(key), std::move(cached));
  	EXIT_IF(!inserted);
@@ -430,7 +449,7 @@ index 83cabcd..61e84d6 100644
  
  	return *iter->second;
  }
-@@ -873,13 +938,21 @@ PipelineCache::CreateComputePipeline(const ShaderComputeInputInfo& input_info,
+@@ -873,13 +950,21 @@ PipelineCache::CreateComputePipeline(const ShaderComputeInputInfo& input_info,
  	}
  
  	auto cached = std::make_unique<Pipeline>();
