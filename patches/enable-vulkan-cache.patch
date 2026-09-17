@@ -937,3 +937,102 @@ index d359734..fbfa41b 100644
  			}
  		}
  
+diff --git a/src/graphics/guest_gpu/graphicsRun.cpp b/src/graphics/guest_gpu/graphicsRun.cpp
+index fbfa41b..c879ca1 100644
+--- a/src/graphics/guest_gpu/graphicsRun.cpp
++++ b/src/graphics/guest_gpu/graphicsRun.cpp
+@@ -928,10 +928,12 @@ void CommandProcessor::DrawIndex(DrawIndexArgs args) {
+ 	if (args.instance_count == 0) {
+ 		args.instance_count = m_num_instances;
+ 	}
++#if !defined(KYTY_B32_QUIET_HOT_LOGS)
+ 	if (args.base_vertex != 0 || args.first_instance != 0) {
+ 		LOGF("\t draw indexed offsets: base_vertex = %" PRId32 ", first_instance = %" PRIu32 "\n",
+ 		     args.base_vertex, args.first_instance);
+ 	}
++#endif
+ 	m_renderer.GetRenderExecutor().DrawIndex(m_submit_id, CurrentBuffer(), args);
+ }
+ 
+diff --git a/src/graphics/host_gpu/renderer/cache/bufferCache.cpp b/src/graphics/host_gpu/renderer/cache/bufferCache.cpp
+index f1864a7..a134dd5 100644
+--- a/src/graphics/host_gpu/renderer/cache/bufferCache.cpp
++++ b/src/graphics/host_gpu/renderer/cache/bufferCache.cpp
+@@ -493,7 +493,13 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
+ 	if (mapped != nullptr) {
+ 		for (auto& copy: copies) {
+ 			const auto address = buffer.CpuAddress() + copy.dstOffset;
+-			std::memcpy(mapped + copy.srcOffset, reinterpret_cast<const void*>(address), copy.size);
++			if (!Libs::LibKernel::Memory::TryReadBacking(address, mapped + copy.srcOffset,
++			                                              copy.size) &&
++			    !Libs::LibKernel::Memory::TryReadPrtBacking(address, mapped + copy.srcOffset,
++			                                                 copy.size)) {
++				EXIT("BufferCache: unreadable guest buffer upload at 0x%016" PRIx64
++				     " size=0x%016" PRIx64 "\n", address, static_cast<uint64_t>(copy.size));
++			}
+ 			copy.srcOffset += base_offset;
+ 		}
+ 		m_staging_buffer.Commit();
+@@ -504,8 +510,13 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
+ 	                                         vk::BufferUsageFlagBits::eTransferSrc, total_size);
+ 	for (const auto& copy: copies) {
+ 		const auto address = buffer.CpuAddress() + copy.dstOffset;
+-		std::memcpy(temporary->Mapped().data() + copy.srcOffset,
+-		            reinterpret_cast<const void*>(address), copy.size);
++		if (!Libs::LibKernel::Memory::TryReadBacking(
++		        address, temporary->Mapped().data() + copy.srcOffset, copy.size) &&
++		    !Libs::LibKernel::Memory::TryReadPrtBacking(
++		        address, temporary->Mapped().data() + copy.srcOffset, copy.size)) {
++			EXIT("BufferCache: unreadable guest buffer upload at 0x%016" PRIx64
++			     " size=0x%016" PRIx64 "\n", address, static_cast<uint64_t>(copy.size));
++		}
+ 	}
+ 	temporary->Flush(0, total_size);
+ 	const auto handle = temporary->Handle();
+diff --git a/src/libs/ajm.cpp b/src/libs/ajm.cpp
+index e132ed0..d26f4e0 100644
+--- a/src/libs/ajm.cpp
++++ b/src/libs/ajm.cpp
+@@ -1195,12 +1195,14 @@ int KYTY_SYSV_ABI AjmBatchJobRunSplit(AjmBatchInfo* info, uint32_t instance, uin
+ 	(void)AjmGetInstanceFormat(instance, nullptr, &decoder, &gapless);
+ 	AjmWriteSideband(flags, sideband_output, sideband_output_size, decoder, gapless, decode_result);
+ 
++#if !defined(KYTY_B32_QUIET_HOT_LOGS)
+ 	LOGF("\t instance = 0x%08" PRIx32 ", flags = 0x%016" PRIx64 ", input_buffers = 0x%016" PRIx64
+ 	     ", input_num = 0x%016" PRIx64 ", output_buffers = 0x%016" PRIx64
+ 	     ", output_num = 0x%016" PRIx64 "\n",
+ 	     instance, flags, reinterpret_cast<uint64_t>(input_buffers),
+ 	     static_cast<uint64_t>(input_buffers_num), reinterpret_cast<uint64_t>(output_buffers),
+ 	     static_cast<uint64_t>(output_buffers_num));
++#endif
+ 	return AjmAppendJob(info, 16 * (input_buffers_num + output_buffers_num) + 32, "run-split");
+ }
+ 
+diff --git a/src/libs/ajm/atrac9_decoder.h b/src/libs/ajm/atrac9_decoder.h
+index b6aab05..b72d442 100644
+--- a/src/libs/ajm/atrac9_decoder.h
++++ b/src/libs/ajm/atrac9_decoder.h
+@@ -303,10 +303,12 @@ private:
+ 		          static_cast<uint32_t>(m_codec_info.samplingRate), m_sample_encoding);
+ 		m_pcm_buffer.assign(FrameOutputBytes(), 0);
+ 
++#if !defined(KYTY_B32_QUIET_HOT_LOGS)
+ 		LOGF("AJM ATRAC9 initialized: %d Hz, %d ch, frame_samples=%d, superframe=%d bytes/%d "
+ 		     "frames\n",
+ 		     m_codec_info.samplingRate, m_codec_info.channels, m_codec_info.frameSamples,
+ 		     m_codec_info.superframeSize, m_codec_info.framesInSuperframe);
++#endif
+ 
+ 		return true;
+ 	}
+@@ -493,8 +495,10 @@ private:
+ 					gapless_decode.skip_samples  = static_cast<uint16_t>(std::min<uint32_t>(
+ 					    AjmReadLe32(input + payload + 4), std::numeric_limits<uint16_t>::max()));
+ 					gapless->Set(gapless_decode, true);
++#if !defined(KYTY_B32_QUIET_HOT_LOGS)
+ 					LOGF("AJM ATRAC9 gapless: total=%" PRIu32 ", skip=%" PRIu16 "\n",
+ 					     gapless_decode.total_samples, gapless_decode.skip_samples);
++#endif
+ 				}
+ 			} else if (AjmFourCcEquals(chunk, 'd', 'a', 't', 'a')) {
+ 				*data_offset                  = payload;
