@@ -1,8 +1,8 @@
-name: Demon Souls Build 32 large CFG speed Windows test
+name: Demon Souls Build 32 frame timing Windows test
 
 on:
   push:
-    branches: [best32-cfg-dominance-bitset-test]
+    branches: [best32-steady-frame-profile-test]
     paths:
       - .github/workflows/b32-cache-source-test.yml
       - patches/enable-vulkan-cache.patch
@@ -74,7 +74,7 @@ jobs:
             -DKYTY_RELEASE_TAG=B32-CRASH-TEST-${{ github.sha }} ^
             -DCMAKE_C_COMPILER=clang-cl ^
             -DCMAKE_CXX_COMPILER=clang-cl ^
-            "-DCMAKE_CXX_FLAGS=/DNOMINMAX /EHsc" ^
+            "-DCMAKE_CXX_FLAGS=/DNOMINMAX /EHsc /DKYTY_B32_FRAME_PROFILE" ^
             -DCMAKE_PREFIX_PATH="%Qt6_DIR%"
       - name: Build Windows app
         shell: cmd
@@ -90,11 +90,13 @@ jobs:
           exe = Path('_Build/windows/install/kyty_emulator.exe').read_bytes()
           assert b'Vulkan pipeline cache: initialized empty' in exe
           assert b'Vulkan pipeline cache: disabled (dirty build)' not in exe
-          print('Vulkan pipeline cache initialization compiled into executable')
+          assert b'Build32 frame profile:' in exe
+          assert b'Build32 GPU thread profile:' in exe
+          print('Vulkan cache and frame profiler compiled into executable')
           '@ | python -
       - name: Upload Windows x64 test build
         uses: actions/upload-artifact@v4
         with:
-          name: DemonSouls-B32-CFG-BITSET-Windows-x64-${{ github.run_number }}
+          name: DemonSouls-B32-FRAME-PROFILE-Windows-x64-${{ github.run_number }}
           path: _Build/windows/install/**
           if-no-files-found: error
