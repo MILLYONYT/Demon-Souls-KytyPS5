@@ -47,10 +47,54 @@ index f373595..c75086b 100644
  	std::unordered_set<ImageId>                       m_download_images;
  	std::map<uint64_t, MetaDataInfo>                  m_surface_metas;
 diff --git a/src/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp b/src/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp
-index 83cabcd..5df595a 100644
+index 83cabcd..a04fc82 100644
 --- a/src/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp
 +++ b/src/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp
-@@ -486,11 +486,6 @@ void PipelineCache::InitializeDriverCache() {
+@@ -100,8 +100,23 @@ void PipelineCacheLog(fmt::format_string<Args...> format, Args&&... args) {
+ }
+ 
+ bool ReadShaderGuestMemory(void*, uint64_t address, uint32_t* value) {
+-	return value != nullptr &&
+-	       Libs::LibKernel::Memory::TryReadGpuCleanBacking(address, value, sizeof(*value));
++	if (value == nullptr) {
++		return false;
++	}
++	if (Libs::LibKernel::Memory::TryReadGpuCleanBacking(address, value, sizeof(*value))) {
++		return true;
++	}
++	// After a reload a descriptor may still belong to a GPU-written buffer.
++	// Drain that owner before failing the clean read; never read stale backing.
++	if (Libs::LibKernel::Memory::SyncGpuCleanBacking(address, sizeof(*value)) &&
++	    Libs::LibKernel::Memory::TryReadGpuCleanBacking(address, value, sizeof(*value))) {
++		return true;
++	}
++	static std::atomic_uint rejected_reads {0};
++	if (rejected_reads.fetch_add(1, std::memory_order_relaxed) < 8) {
++		PipelineCacheLog("Shader clean descriptor read unavailable at 0x{:016x}", address);
++	}
++	return false;
+ }
+ 
+ bool SyncShaderGuestMemory(void*, uint64_t address, uint64_t size) {
+@@ -119,8 +134,15 @@ bool ReadShaderRawGuestMemory(void*, uint64_t address, uint32_t* value) {
+ }
+ 
+ bool ReadShaderMemorySpan(void*, uint64_t address, uint32_t* values, uint32_t count, bool clean) {
+-	return count >= 2 && count <= 16 &&
+-	       Libs::LibKernel::Memory::TryReadGpuShaderSpan(address, values, count * 4u, clean);
++	if (count < 2 || count > 16) {
++		return false;
++	}
++	const auto size = count * 4u;
++	if (Libs::LibKernel::Memory::TryReadGpuShaderSpan(address, values, size, clean)) {
++		return true;
++	}
++	return clean && Libs::LibKernel::Memory::SyncGpuCleanBacking(address, size) &&
++	       Libs::LibKernel::Memory::TryReadGpuShaderSpan(address, values, size, true);
+ }
+ 
+ void ReportMaterialization(const char* label, ShaderType stage, uint64_t hash,
+@@ -486,11 +508,6 @@ void PipelineCache::InitializeDriverCache() {
  		PipelineCacheLog("Vulkan pipeline cache: disabled (unknown git revision)");
  		return;
  	}
