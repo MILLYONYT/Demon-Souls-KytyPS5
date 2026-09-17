@@ -98,10 +98,10 @@ index f7b512f..3deb1fa 100644
  		return false;
  	}
 diff --git a/src/graphics/shader/recompiler/ir/passes/SrtWalker.cpp b/src/graphics/shader/recompiler/ir/passes/SrtWalker.cpp
-index 2aedc25..e54e7f8 100644
+index 2aedc25..d7a48e2 100644
 --- a/src/graphics/shader/recompiler/ir/passes/SrtWalker.cpp
 +++ b/src/graphics/shader/recompiler/ir/passes/SrtWalker.cpp
-@@ -1,3 +1,7 @@
+@@ -1,7 +1,12 @@
 +#ifndef NOMINMAX
 +#define NOMINMAX
 +#endif
@@ -109,3 +109,29 @@ index 2aedc25..e54e7f8 100644
  #include "graphics/shader/recompiler/ir/passes/LinearSrt.h"
  #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
  
+ #include "common/assert.h"
++#include "common/logging/log.h"
+ #include "graphics/shader/recompiler/ir/ShaderIR.h"
+ 
+ #include <algorithm>
+@@ -1197,6 +1202,8 @@ bool EvaluateRuntimeSourcesImpl(const ResourcePlan& program, std::span<const uin
+ 		if (!evaluate_flat || active[source_index]) {
+ 			for (uint32_t index = 0; index < source->dword_count; index++) {
+ 				if (!evaluator.Evaluate(source->dwords[index], value.dwords[index])) {
++					LOGF("SRT descriptor evaluation failed: shader=0x%016llx source=%u word=%u\n",
++					     static_cast<unsigned long long>(program.shader_hash), source_index, index);
+ 					return false;
+ 				}
+ 			}
+@@ -1279,6 +1286,11 @@ static std::shared_ptr<LinearSrtPlan> BuildControlledLinearSrt(const ResourcePla
+ void BuildLinearSrtPlan(ResourcePlan& program) {
+     program.linear_srt.reset();
+ #if defined(__x86_64__) || defined(_M_X64)
++    // Isolate this repeatedly failing Demon's Souls compute shader from the
++    // linear evaluator. The checked interpreter also reports which source fails.
++    if (program.stage == ShaderType::Compute && program.shader_hash == 0x06f5c0838a0b409bull) {
++        return;
++    }
+     auto compiled=std::make_shared<LinearSrtPlan>();
+     if (LinearSrtCompiler(program,*compiled).Build()) program.linear_srt=std::move(compiled);
+     else program.linear_srt=BuildControlledLinearSrt(program);
