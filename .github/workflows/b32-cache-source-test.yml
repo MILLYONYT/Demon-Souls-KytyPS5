@@ -1,8 +1,8 @@
-name: Demon Souls Build 32 crash fixes Windows test
+name: Demon Souls Build 32 reload shared read Windows test
 
 on:
   push:
-    branches: [best32-crash-fixes-test]
+    branches: [best32-reload-shared-read-test]
     paths:
       - .github/workflows/b32-cache-source-test.yml
       - patches/enable-vulkan-cache.patch
