@@ -620,10 +620,10 @@ index f373595..c6ffbbc 100644
  	std::unordered_set<ImageId>                       m_download_images;
  	std::map<uint64_t, MetaDataInfo>                  m_surface_metas;
 diff --git a/src/graphics/host_gpu/renderer/commandScheduler.cpp b/src/graphics/host_gpu/renderer/commandScheduler.cpp
-index 3db1ecc..0e97769 100644
+index 3db1ecc..1e147ed 100644
 --- a/src/graphics/host_gpu/renderer/commandScheduler.cpp
 +++ b/src/graphics/host_gpu/renderer/commandScheduler.cpp
-@@ -96,7 +96,11 @@ bool CommandScheduler::InDeferredOperation() noexcept {
+@@ -96,7 +96,14 @@ bool CommandScheduler::InDeferredOperation() noexcept {
  CommandScheduler::CommandScheduler(RenderContext& context, GraphicContext& graphics)
      : m_master(graphics), m_context(context), m_graphics(graphics),
        m_command_pool(graphics, m_master), m_command(*this),
@@ -632,11 +632,29 @@ index 3db1ecc..0e97769 100644
 +#if defined(KYTY_B32_QUEUE_LAG_PROFILE)
 +	LOGF("Build32 queue lag profile enabled\n");
 +#endif
++#if defined(KYTY_B32_SKIP_EMPTY_PENDING_QUERY)
++	LOGF("Build32 deferred queue: skip empty GPU timeline polls\n");
++#endif
 +}
  
  void CommandScheduler::CompleteDispatch() {
  	// Expose command-processor/GPU overlap without a host fence. Bound the
-@@ -362,6 +366,34 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
+@@ -223,6 +230,14 @@ void CommandScheduler::Wait(uint64_t tick) {
+ }
+ 
+ void CommandScheduler::PopPendingOperations() {
++#if defined(KYTY_B32_SKIP_EMPTY_PENDING_QUERY)
++	// An empty queue has no retired resources to process. Check under the
++	// operation mutex before asking the Vulkan driver for the GPU timeline.
++	{
++		std::lock_guard lock(m_operation_mutex);
++		if (m_pending_operations.empty()) return;
++	}
++#endif
+ 	m_master.Refresh();
+ 	for (;;) {
+ 		PendingOperation operation;
+@@ -362,6 +377,34 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
  	EXIT_IF(m_command.IsInvalid());
  	EXIT_IF(submit.num_wait_semaphores > SubmitInfo::MaxSemaphores ||
  	        submit.num_signal_semaphores >= SubmitInfo::MaxSemaphores);
