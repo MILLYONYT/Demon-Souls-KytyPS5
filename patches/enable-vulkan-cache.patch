@@ -277,7 +277,7 @@ index cca1005..870e6e9 100644
  }
  
 diff --git a/src/graphics/host_gpu/renderer/cache/bufferCache.cpp b/src/graphics/host_gpu/renderer/cache/bufferCache.cpp
-index f1864a7..149b22b 100644
+index f1864a7..b5d920e 100644
 --- a/src/graphics/host_gpu/renderer/cache/bufferCache.cpp
 +++ b/src/graphics/host_gpu/renderer/cache/bufferCache.cpp
 @@ -13,6 +13,8 @@
@@ -326,7 +326,7 @@ index f1864a7..149b22b 100644
  		return NULL_BUFFER_ID;
  	}
  	if (!GuestRange {vaddr, size}.Valid()) {
-@@ -343,10 +374,34 @@ BufferId BufferCache::FindBuffer(uint64_t vaddr, uint64_t size) {
+@@ -343,14 +374,40 @@ BufferId BufferCache::FindBuffer(uint64_t vaddr, uint64_t size) {
  	if (owner != nullptr && *owner) {
  		auto& buffer = m_slot_buffers[*owner];
  		if (buffer.IsInBounds(vaddr, size)) {
@@ -363,7 +363,14 @@ index f1864a7..149b22b 100644
  }
  
  BufferCache::OverlapResult BufferCache::ResolveOverlaps(uint64_t vaddr, uint64_t size) {
-@@ -488,12 +543,26 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
+-	static constexpr int      StreamLeapThreshold = 16;
++	// Reserve ahead after a few repeated extensions; avoid copying the same
++	// growing guest buffer into a fresh Vulkan allocation on every extension.
++	static constexpr int      StreamLeapThreshold = 8;
+ 	static constexpr uint64_t StreamLeapSize      = CACHING_PAGESIZE * 128;
+ 
+ 	auto       begin      = vaddr;
+@@ -488,12 +545,26 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
  	if (copies.empty()) {
  		return nullptr;
  	}
@@ -391,7 +398,7 @@ index f1864a7..149b22b 100644
  			copy.srcOffset += base_offset;
  		}
  		m_staging_buffer.Commit();
-@@ -504,8 +573,7 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
+@@ -504,8 +575,7 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
  	                                         vk::BufferUsageFlagBits::eTransferSrc, total_size);
  	for (const auto& copy: copies) {
  		const auto address = buffer.CpuAddress() + copy.dstOffset;
@@ -401,7 +408,7 @@ index f1864a7..149b22b 100644
  	}
  	temporary->Flush(0, total_size);
  	const auto handle = temporary->Handle();
-@@ -671,8 +739,9 @@ bool BufferCache::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
+@@ -671,8 +741,9 @@ bool BufferCache::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
  	return m_memory_tracker.IsRegionCpuModified(vaddr, size);
  }
  
