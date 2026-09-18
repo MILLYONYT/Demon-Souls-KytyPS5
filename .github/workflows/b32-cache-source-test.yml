@@ -1,8 +1,8 @@
-name: Demon Souls Build 32 fast CPU sets Windows test
+name: Demon Souls Build 32 GPU priority Windows test
 
 on:
   push:
-    branches: [best32-fast-cpuset-test]
+    branches: [best32-gpu-priority-test]
     paths:
       - .github/workflows/b32-cache-source-test.yml
       - patches/enable-vulkan-cache.patch
@@ -71,7 +71,7 @@ jobs:
             -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=ON ^
             -DKYTY_BUILD_ORIGIN=Fork ^
             -DKYTY_BUILD_REPOSITORY=${{ github.repository }} ^
-            -DKYTY_RELEASE_TAG=B32-FAST-CPUSET-${{ github.sha }} ^
+            -DKYTY_RELEASE_TAG=B32-GPU-PRIORITY-${{ github.sha }} ^
             -DCMAKE_C_COMPILER=clang-cl ^
             -DCMAKE_CXX_COMPILER=clang-cl ^
             "-DCMAKE_CXX_FLAGS=/DNOMINMAX /EHsc /DKYTY_B32_FRAME_PROFILE /DKYTY_B32_QUIET_HOT_LOGS /DKYTY_B32_BATCH_RESOURCE_GC /DKYTY_B32_FORCE_SILENT_SHADER_DUMPS /DKYTY_B32_PHASE_PROFILE /DKYTY_B32_PM4_SAMPLE_PROFILE /DKYTY_B32_DISPATCH_STAGE_PROFILE /DKYTY_B32_BUFFER_LOOKUP_PROFILE /DKYTY_B32_INDIRECT_PROFILE /DKYTY_B32_QUEUE_LAG_PROFILE /DKYTY_B32_FAST_CPU_SETS" ^
@@ -98,6 +98,8 @@ jobs:
           assert b'Build32 dispatch outer:' in exe
           assert b'Build32 GPU worker full-speed QoS:' in exe
           assert b'Build32 GPU worker CPU sets:' in exe
+          assert b'Build32 GPU worker priority: requested=highest' in exe
+          assert b'KYTY_B32_GPU_PRIORITY' in exe
           assert b'Build32 binding stages:' in exe
           assert b'Build32 buffer lookup:' in exe
           assert b'Build32 indirect dispatch:' in exe
@@ -110,6 +112,6 @@ jobs:
       - name: Upload Windows x64 test build
         uses: actions/upload-artifact@v4
         with:
-          name: DemonSouls-B32-FAST-CPUSET-Windows-x64-${{ github.run_number }}
+          name: DemonSouls-B32-GPU-PRIORITY-Windows-x64-${{ github.run_number }}
           path: _Build/windows/install/**
           if-no-files-found: error

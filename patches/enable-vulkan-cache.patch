@@ -1,5 +1,5 @@
 diff --git a/src/graphics/guest_gpu/graphicsRun.cpp b/src/graphics/guest_gpu/graphicsRun.cpp
-index cca1005..74a9c88 100644
+index cca1005..64efe41 100644
 --- a/src/graphics/guest_gpu/graphicsRun.cpp
 +++ b/src/graphics/guest_gpu/graphicsRun.cpp
 @@ -23,7 +23,10 @@
@@ -27,7 +27,7 @@ index cca1005..74a9c88 100644
  namespace Libs::Graphics {
  
  static thread_local CommandProcessor* g_current_processor = nullptr;
-@@ -39,6 +49,86 @@ static thread_local Pm4Execution*     g_current_execution = nullptr;
+@@ -39,6 +49,97 @@ static thread_local Pm4Execution*     g_current_execution = nullptr;
  static thread_local bool              g_gpu_mutex_owned   = false;
  static thread_local bool              g_gpu_thread        = false;
  static thread_local GuestGpu*         g_gpu_state         = nullptr;
@@ -37,6 +37,17 @@ index cca1005..74a9c88 100644
 +	if (setting != nullptr && setting[0] == '0' && setting[1] == '\0') {
 +		LOGF("Build32 GPU worker CPU sets: disabled by environment\n");
 +		return;
++	}
++	// The GPU command worker is on the frame's critical path. Raise only this
++	// thread within the normal process priority class; never use real-time mode.
++	const char* priority_setting = std::getenv("KYTY_B32_GPU_PRIORITY");
++	if (priority_setting != nullptr && priority_setting[0] == '0' &&
++	    priority_setting[1] == '\0') {
++		LOGF("Build32 GPU worker priority: disabled by environment\n");
++	} else {
++		const BOOL applied = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
++		LOGF("Build32 GPU worker priority: requested=highest applied=%u current=%d\n",
++		     static_cast<unsigned>(applied != 0), GetThreadPriority(GetCurrentThread()));
 +	}
 +	THREAD_POWER_THROTTLING_STATE qos {};
 +	qos.Version     = THREAD_POWER_THROTTLING_CURRENT_VERSION;
@@ -114,7 +125,7 @@ index cca1005..74a9c88 100644
  
  struct DrawIndirectArgs {
  	uint32_t vertex_count_per_instance;
-@@ -470,6 +560,24 @@ void GuestGpu::ThreadRun(void* data) {
+@@ -470,6 +571,24 @@ void GuestGpu::ThreadRun(void* data) {
  	KYTY_PROFILER_THREAD("Thread_Gpu");
  	g_gpu_thread = true;
  	g_gpu_state  = gpu;
@@ -139,7 +150,7 @@ index cca1005..74a9c88 100644
  
  	for (;;) {
  		Submission                   submission;
-@@ -540,7 +648,69 @@ void GuestGpu::ThreadRun(void* data) {
+@@ -540,7 +659,69 @@ void GuestGpu::ThreadRun(void* data) {
  		}
  
  		EXIT_IF(!has_submission);
@@ -209,7 +220,7 @@ index cca1005..74a9c88 100644
  
  		Common::LockGuard lock(gpu->m_queue_mutex);
  		if (!complete) {
-@@ -578,6 +748,37 @@ bool GuestGpu::Process(Submission& submission) {
+@@ -578,6 +759,37 @@ bool GuestGpu::Process(Submission& submission) {
  
  	cp.BufferInit();
  	bool complete = true;
@@ -247,7 +258,7 @@ index cca1005..74a9c88 100644
  
  	switch (submission.type) {
  		case SubmissionType::Graphics: {
-@@ -587,14 +788,14 @@ bool GuestGpu::Process(Submission& submission) {
+@@ -587,14 +799,14 @@ bool GuestGpu::Process(Submission& submission) {
  				bool round_progress = false;
  				if (!submission.constant_complete) {
  					submission.constant_complete =
@@ -264,7 +275,7 @@ index cca1005..74a9c88 100644
  					    Pm4ProcessResult::Complete;
  					round_progress |= submission.command_execution.MadeProgress();
  				}
-@@ -606,11 +807,11 @@ bool GuestGpu::Process(Submission& submission) {
+@@ -606,11 +818,11 @@ bool GuestGpu::Process(Submission& submission) {
  			}
  			if (progressed) {
  				if (complete) {
@@ -279,7 +290,7 @@ index cca1005..74a9c88 100644
  			}
  			break;
  		}
-@@ -628,20 +829,20 @@ bool GuestGpu::Process(Submission& submission) {
+@@ -628,20 +840,20 @@ bool GuestGpu::Process(Submission& submission) {
  			if (first_slice) {
  				GraphicsDbgDumpDcb("cc", num_dw, buffer);
  			}
@@ -305,7 +316,7 @@ index cca1005..74a9c88 100644
  			cp.PrepareCpuFlip(submission.flip_request_id);
  			break;
  	}
-@@ -767,7 +968,21 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution, size_t stop_depth) {
+@@ -767,7 +979,21 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution, size_t stop_depth) {
  		auto handler = g_cp_op_func[opcode];
  		if (opcode != Pm4::IT_DRAW_INDEX_INDIRECT) m_draw_run_skip = 0;
  		if (packet_header == 0xc0032500u && !GraphicsRunDebugDumpEnabled()) {
@@ -327,7 +338,7 @@ index cca1005..74a9c88 100644
  			if (consumed) {
  				execution.m_buffer_stack[buffer_index].offset_dw += consumed;
  				execution.m_made_progress = true;
-@@ -792,8 +1007,22 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution, size_t stop_depth) {
+@@ -792,8 +1018,22 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution, size_t stop_depth) {
  			     total_dw - remaining_dw, packet_header);
  		}
  
@@ -350,7 +361,7 @@ index cca1005..74a9c88 100644
  		EXIT_IF(packet_dw > remaining_dw);
  		if (execution.m_suspended) {
  			if (execution.m_buffer_stack.size() > buffer_index + 1) {
-@@ -877,10 +1106,12 @@ void CommandProcessor::DrawIndex(DrawIndexArgs args) {
+@@ -877,10 +1117,12 @@ void CommandProcessor::DrawIndex(DrawIndexArgs args) {
  	if (args.instance_count == 0) {
  		args.instance_count = m_num_instances;
  	}
@@ -363,7 +374,7 @@ index cca1005..74a9c88 100644
  	m_renderer.GetRenderExecutor().DrawIndex(m_submit_id, CurrentBuffer(), args);
  }
  
-@@ -1246,16 +1477,62 @@ void CommandProcessor::DispatchIndirectAddress(uint64_t args_addr, uint32_t mode
+@@ -1246,16 +1488,62 @@ void CommandProcessor::DispatchIndirectAddress(uint64_t args_addr, uint32_t mode
  		uint32_t thread_group_x, thread_group_y, thread_group_z;
  	};
  	EXIT_NOT_IMPLEMENTED(args_addr == 0);
@@ -430,7 +441,7 @@ index cca1005..74a9c88 100644
  	if (!Libs::LibKernel::Memory::SyncGpuCleanBacking(args_addr, sizeof(DispatchIndirectArgs))) {
  		static std::atomic<uint32_t> sync_fallback_logs {0};
  		if (sync_fallback_logs.fetch_add(1, std::memory_order_relaxed) < 16) {
-@@ -1264,10 +1541,18 @@ void CommandProcessor::DispatchIndirectAddress(uint64_t args_addr, uint32_t mode
+@@ -1264,10 +1552,18 @@ void CommandProcessor::DispatchIndirectAddress(uint64_t args_addr, uint32_t mode
  			     args_addr);
  		}
  	}
