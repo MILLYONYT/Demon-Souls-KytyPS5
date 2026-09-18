@@ -1,8 +1,8 @@
-name: Demon Souls Build 32 indirect dispatch profile Windows test
+name: Demon Souls Build 32 dispatch batch 64 Windows test
 
 on:
   push:
-    branches: [best32-indirect-stage-test]
+    branches: [best32-dispatch-batch64-test]
     paths:
       - .github/workflows/b32-cache-source-test.yml
       - patches/enable-vulkan-cache.patch
@@ -74,7 +74,7 @@ jobs:
             -DKYTY_RELEASE_TAG=B32-CRASH-TEST-${{ github.sha }} ^
             -DCMAKE_C_COMPILER=clang-cl ^
             -DCMAKE_CXX_COMPILER=clang-cl ^
-            "-DCMAKE_CXX_FLAGS=/DNOMINMAX /EHsc /DKYTY_B32_FRAME_PROFILE /DKYTY_B32_QUIET_HOT_LOGS /DKYTY_B32_BATCH_RESOURCE_GC /DKYTY_B32_FORCE_SILENT_SHADER_DUMPS /DKYTY_B32_PHASE_PROFILE /DKYTY_B32_PM4_SAMPLE_PROFILE /DKYTY_B32_DISPATCH_STAGE_PROFILE /DKYTY_B32_BUFFER_LOOKUP_PROFILE /DKYTY_B32_INDIRECT_PROFILE" ^
+            "-DCMAKE_CXX_FLAGS=/DNOMINMAX /EHsc /DKYTY_B32_FRAME_PROFILE /DKYTY_B32_QUIET_HOT_LOGS /DKYTY_B32_BATCH_RESOURCE_GC /DKYTY_B32_FORCE_SILENT_SHADER_DUMPS /DKYTY_B32_PHASE_PROFILE /DKYTY_B32_PM4_SAMPLE_PROFILE /DKYTY_B32_DISPATCH_STAGE_PROFILE /DKYTY_B32_BUFFER_LOOKUP_PROFILE /DKYTY_B32_INDIRECT_PROFILE /DKYTY_B32_BATCH_DISPATCH_64" ^
             -DCMAKE_PREFIX_PATH="%Qt6_DIR%"
       - name: Build Windows app
         shell: cmd
@@ -98,6 +98,7 @@ jobs:
           assert b'Build32 binding stages:' in exe
           assert b'Build32 buffer lookup:' in exe
           assert b'Build32 indirect dispatch:' in exe
+          assert b'Build32 dispatch batch: 64 commands per submission' in exe
           assert b'Build32 shader diagnostics: requested=' in exe
           assert b'BufferCache: unmapped guest upload' in exe
           assert b'AJM ATRAC9 initialized:' not in exe
@@ -106,6 +107,6 @@ jobs:
       - name: Upload Windows x64 test build
         uses: actions/upload-artifact@v4
         with:
-          name: DemonSouls-B32-INDIRECT-STAGES-Windows-x64-${{ github.run_number }}
+          name: DemonSouls-B32-BATCH64-Windows-x64-${{ github.run_number }}
           path: _Build/windows/install/**
           if-no-files-found: error
