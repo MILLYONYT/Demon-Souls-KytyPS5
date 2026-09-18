@@ -1,5 +1,5 @@
 diff --git a/src/graphics/guest_gpu/graphicsRun.cpp b/src/graphics/guest_gpu/graphicsRun.cpp
-index cca1005..870e6e9 100644
+index cca1005..ab5e513 100644
 --- a/src/graphics/guest_gpu/graphicsRun.cpp
 +++ b/src/graphics/guest_gpu/graphicsRun.cpp
 @@ -23,7 +23,9 @@
@@ -276,6 +276,93 @@ index cca1005..870e6e9 100644
  	m_renderer.GetRenderExecutor().DrawIndex(m_submit_id, CurrentBuffer(), args);
  }
  
+@@ -1246,16 +1397,62 @@ void CommandProcessor::DispatchIndirectAddress(uint64_t args_addr, uint32_t mode
+ 		uint32_t thread_group_x, thread_group_y, thread_group_z;
+ 	};
+ 	EXIT_NOT_IMPLEMENTED(args_addr == 0);
++#if defined(KYTY_B32_INDIRECT_PROFILE)
++	struct IndirectStats {
++		uint32_t calls = 0, gpu_args = 0, host_args = 0, thread_dims = 0;
++		uint32_t gpu_samples = 0, host_samples = 0;
++		double check_ms = 0, sync_ms = 0, read_ms = 0;
++		double gpu_dispatch_ms = 0, host_dispatch_ms = 0;
++	};
++	static thread_local IndirectStats stats;
++	if (stats.calls == 16384) {
++		LOGF("Build32 indirect dispatch: calls=%u gpu_args=%u host_args=%u "
++		     "thread_dims=%u check_ms=%.2f sync_ms=%.2f read_ms=%.2f "
++		     "gpu_dispatch_ms=%.2f host_dispatch_ms=%.2f "
++		     "gpu_samples=%u host_samples=%u (one in 16 calls)\n",
++		     stats.calls, stats.gpu_args, stats.host_args, stats.thread_dims,
++		     stats.check_ms, stats.sync_ms, stats.read_ms,
++		     stats.gpu_dispatch_ms, stats.host_dispatch_ms,
++		     stats.gpu_samples, stats.host_samples);
++		stats = {};
++	}
++	const bool sample = (++stats.calls & 15u) == 0;
++	stats.thread_dims += (mode & 0x20u) != 0;
++	using Clock = std::chrono::steady_clock;
++	auto begin = sample ? Clock::now() : Clock::time_point {};
++	auto elapsed = [&] (double& value) {
++		if (sample) {
++			const auto now = Clock::now();
++			value += std::chrono::duration<double, std::milli>(now - begin).count();
++			begin = now;
++		}
++	};
++#endif
+ 	// Workgroup dimensions are consumed by Vulkan. Only thread-dimension mode
+ 	// needs CPU counts for specialization/conversion; do not download GPU-written
+ 	// arguments solely to pass unused group counts back to the indirect command.
+-	if ((mode & 0x20u) == 0 && (args_addr & 3u) == 0 &&
+-	    GetGpuResources().IsMapped(args_addr, sizeof(DispatchIndirectArgs)) &&
+-	    !GetGpuResources().GetTextureCache().IsRegionGpuModified(args_addr,
+-	                                                             sizeof(DispatchIndirectArgs))) {
++	const bool gpu_args = (mode & 0x20u) == 0 && (args_addr & 3u) == 0 &&
++	                      GetGpuResources().IsMapped(args_addr, sizeof(DispatchIndirectArgs)) &&
++	                      !GetGpuResources().GetTextureCache().IsRegionGpuModified(
++	                          args_addr, sizeof(DispatchIndirectArgs));
++#if defined(KYTY_B32_INDIRECT_PROFILE)
++	elapsed(stats.check_ms);
++#endif
++	if (gpu_args) {
++#if defined(KYTY_B32_INDIRECT_PROFILE)
++		++stats.gpu_args;
++		stats.gpu_samples += sample;
++#endif
+ 		DispatchDirect(1, 1, 1, mode, args_addr);
++#if defined(KYTY_B32_INDIRECT_PROFILE)
++		elapsed(stats.gpu_dispatch_ms);
++#endif
+ 		return;
+ 	}
++#if defined(KYTY_B32_INDIRECT_PROFILE)
++	++stats.host_args;
++	stats.host_samples += sample;
++#endif
+ 	if (!Libs::LibKernel::Memory::SyncGpuCleanBacking(args_addr, sizeof(DispatchIndirectArgs))) {
+ 		static std::atomic<uint32_t> sync_fallback_logs {0};
+ 		if (sync_fallback_logs.fetch_add(1, std::memory_order_relaxed) < 16) {
+@@ -1264,10 +1461,18 @@ void CommandProcessor::DispatchIndirectAddress(uint64_t args_addr, uint32_t mode
+ 			     args_addr);
+ 		}
+ 	}
++#if defined(KYTY_B32_INDIRECT_PROFILE)
++	elapsed(stats.sync_ms);
++#endif
+ 	DispatchIndirectArgs args {};
+ 	std::memcpy(&args, reinterpret_cast<const void*>(args_addr), sizeof(args));
+-
++#if defined(KYTY_B32_INDIRECT_PROFILE)
++	elapsed(stats.read_ms);
++#endif
+ 	DispatchDirect(args.thread_group_x, args.thread_group_y, args.thread_group_z, mode, args_addr);
++#if defined(KYTY_B32_INDIRECT_PROFILE)
++	elapsed(stats.host_dispatch_ms);
++#endif
+ }
+ 
+ void CommandProcessor::DrawIndexAuto(DrawAutoArgs args) {
 diff --git a/src/graphics/host_gpu/renderer/cache/bufferCache.cpp b/src/graphics/host_gpu/renderer/cache/bufferCache.cpp
 index f1864a7..149b22b 100644
 --- a/src/graphics/host_gpu/renderer/cache/bufferCache.cpp
