@@ -619,6 +619,58 @@ index f373595..c6ffbbc 100644
  	Common::LeastRecentlyUsedCache<ImageId, uint64_t> m_lru_cache;
  	std::unordered_set<ImageId>                       m_download_images;
  	std::map<uint64_t, MetaDataInfo>                  m_surface_metas;
+diff --git a/src/graphics/host_gpu/renderer/commandScheduler.cpp b/src/graphics/host_gpu/renderer/commandScheduler.cpp
+index 3db1ecc..0e97769 100644
+--- a/src/graphics/host_gpu/renderer/commandScheduler.cpp
++++ b/src/graphics/host_gpu/renderer/commandScheduler.cpp
+@@ -96,7 +96,11 @@ bool CommandScheduler::InDeferredOperation() noexcept {
+ CommandScheduler::CommandScheduler(RenderContext& context, GraphicContext& graphics)
+     : m_master(graphics), m_context(context), m_graphics(graphics),
+       m_command_pool(graphics, m_master), m_command(*this),
+-      m_priority_thread([this](std::stop_token stop) { PriorityOperationsThread(stop); }) {}
++      m_priority_thread([this](std::stop_token stop) { PriorityOperationsThread(stop); }) {
++#if defined(KYTY_B32_QUEUE_LAG_PROFILE)
++	LOGF("Build32 queue lag profile enabled\n");
++#endif
++}
+ 
+ void CommandScheduler::CompleteDispatch() {
+ 	// Expose command-processor/GPU overlap without a host fence. Bound the
+@@ -362,6 +366,34 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
+ 	EXIT_IF(m_command.IsInvalid());
+ 	EXIT_IF(submit.num_wait_semaphores > SubmitInfo::MaxSemaphores ||
+ 	        submit.num_signal_semaphores >= SubmitInfo::MaxSemaphores);
++#if defined(KYTY_B32_QUEUE_LAG_PROFILE)
++	struct QueueLagStats {
++		uint32_t calls = 0, samples = 0, zero = 0, one = 0, many = 0;
++		uint64_t pending_sum = 0, pending_max = 0;
++	};
++	static thread_local QueueLagStats lag;
++	if (lag.calls == 4096) {
++		LOGF("Build32 queue lag: submits=%u samples=%u pending_zero=%u "
++		     "pending_one=%u pending_many=%u pending_sum=%" PRIu64
++		     " pending_max=%" PRIu64 " (one in 16 submits)\n",
++		     lag.calls, lag.samples, lag.zero, lag.one, lag.many,
++		     lag.pending_sum, lag.pending_max);
++		lag = {};
++	}
++	if ((++lag.calls & 15u) == 0) {
++		// Sample the timeline before this submission without waiting for the GPU.
++		m_master.Refresh();
++		const uint64_t submitted = m_master.CurrentTick() - 1u;
++		const uint64_t completed = m_master.KnownGpuTick();
++		const uint64_t pending = submitted > completed ? submitted - completed : 0;
++		++lag.samples;
++		lag.zero += pending == 0;
++		lag.one += pending == 1;
++		lag.many += pending > 1;
++		lag.pending_sum += pending;
++		lag.pending_max = std::max(lag.pending_max, pending);
++	}
++#endif
+ 
+ 	m_command.End();
+ 	const auto buffer   = m_command.m_buffer;
 diff --git a/src/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp b/src/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp
 index 83cabcd..4b513e6 100644
 --- a/src/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp
