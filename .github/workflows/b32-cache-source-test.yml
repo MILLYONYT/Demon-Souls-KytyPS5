@@ -1,8 +1,8 @@
-name: Demon Souls Build 32 dispatch outer profile Windows test
+name: Demon Souls Build 32 exact program lookup Windows test
 
 on:
   push:
-    branches: [best32-dispatch-outer-test]
+    branches: [best32-exact-program-test]
     paths:
       - .github/workflows/b32-cache-source-test.yml
       - patches/enable-vulkan-cache.patch
@@ -71,10 +71,10 @@ jobs:
             -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=ON ^
             -DKYTY_BUILD_ORIGIN=Fork ^
             -DKYTY_BUILD_REPOSITORY=${{ github.repository }} ^
-            -DKYTY_RELEASE_TAG=B32-DISPATCH-OUTER-${{ github.sha }} ^
+            -DKYTY_RELEASE_TAG=B32-EXACT-PROGRAM-${{ github.sha }} ^
             -DCMAKE_C_COMPILER=clang-cl ^
             -DCMAKE_CXX_COMPILER=clang-cl ^
-            "-DCMAKE_CXX_FLAGS=/DNOMINMAX /EHsc /DKYTY_B32_FRAME_PROFILE /DKYTY_B32_QUIET_HOT_LOGS /DKYTY_B32_BATCH_RESOURCE_GC /DKYTY_B32_FORCE_SILENT_SHADER_DUMPS /DKYTY_B32_PHASE_PROFILE /DKYTY_B32_PM4_SAMPLE_PROFILE /DKYTY_B32_DISPATCH_STAGE_PROFILE /DKYTY_B32_BUFFER_LOOKUP_PROFILE /DKYTY_B32_INDIRECT_PROFILE /DKYTY_B32_QUEUE_LAG_PROFILE" ^
+            "-DCMAKE_CXX_FLAGS=/DNOMINMAX /EHsc /DKYTY_B32_FRAME_PROFILE /DKYTY_B32_QUIET_HOT_LOGS /DKYTY_B32_BATCH_RESOURCE_GC /DKYTY_B32_FORCE_SILENT_SHADER_DUMPS /DKYTY_B32_PHASE_PROFILE /DKYTY_B32_PM4_SAMPLE_PROFILE /DKYTY_B32_DISPATCH_STAGE_PROFILE /DKYTY_B32_BUFFER_LOOKUP_PROFILE /DKYTY_B32_INDIRECT_PROFILE /DKYTY_B32_QUEUE_LAG_PROFILE /DKYTY_B32_FAST_PROGRAM_LOOKUP" ^
             -DCMAKE_PREFIX_PATH="%Qt6_DIR%"
       - name: Build Windows app
         shell: cmd
@@ -96,6 +96,7 @@ jobs:
           assert b'Build32 PM4 sample:' in exe
           assert b'Build32 dispatch stages:' in exe
           assert b'Build32 dispatch outer:' in exe
+          assert b'Build32 exact compute source lookup enabled' in exe
           assert b'Build32 binding stages:' in exe
           assert b'Build32 buffer lookup:' in exe
           assert b'Build32 indirect dispatch:' in exe
@@ -108,6 +109,6 @@ jobs:
       - name: Upload Windows x64 test build
         uses: actions/upload-artifact@v4
         with:
-          name: DemonSouls-B32-DISPATCH-OUTER-Windows-x64-${{ github.run_number }}
+          name: DemonSouls-B32-EXACT-PROGRAM-Windows-x64-${{ github.run_number }}
           path: _Build/windows/install/**
           if-no-files-found: error
