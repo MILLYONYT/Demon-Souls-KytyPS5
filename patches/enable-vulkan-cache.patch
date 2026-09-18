@@ -688,6 +688,96 @@ index 6fa19e7..e517c2e 100644
  };
  
  void LogPipelineTrace(const char* phase, uint64_t vertex_program_id, uint64_t pixel_program_id);
+diff --git a/src/graphics/host_gpu/renderer/renderCompute.cpp b/src/graphics/host_gpu/renderer/renderCompute.cpp
+index bc9112c..d3fd9af 100644
+--- a/src/graphics/host_gpu/renderer/renderCompute.cpp
++++ b/src/graphics/host_gpu/renderer/renderCompute.cpp
+@@ -28,6 +28,7 @@
+ #include <algorithm>
+ #include <array>
+ #include <atomic>
++#include <chrono>
+ #include <cmath>
+ #include <cstring>
+ #include <limits>
+@@ -289,6 +290,24 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
+                                     uint32_t thread_group_x, uint32_t thread_group_y,
+                                     uint32_t thread_group_z, uint32_t mode,
+                                     uint64_t indirect_args) {
++#if defined(KYTY_B32_DISPATCH_STAGE_PROFILE)
++	struct DispatchStageStats {
++		uint32_t calls = 0;
++		std::array<double, 3> ms {};
++		std::array<uint32_t, 3> samples {};
++	};
++	static thread_local DispatchStageStats stage_stats;
++	if (stage_stats.calls == 32768) {
++		LOGF("Build32 dispatch stages: lookup_ms=%.2f pipeline_ms=%.2f bindings_ms=%.2f "
++		     "lookup_samples=%u pipeline_samples=%u binding_samples=%u calls=%u "
++		     "(one in 32 dispatch calls)\n",
++		     stage_stats.ms[0], stage_stats.ms[1], stage_stats.ms[2], stage_stats.samples[0],
++		     stage_stats.samples[1], stage_stats.samples[2], stage_stats.calls);
++		stage_stats = {};
++	}
++	const bool sample_stage = (++stage_stats.calls & 31u) == 0;
++	using StageClock = std::chrono::steady_clock;
++#endif
+ 	EXIT_IF(buffer.IsInvalid());
+ 	m_context.GetCommandScheduler().PopPendingOperations();
+ 	auto& ctx    = buffer.GetRegisters();
+@@ -334,8 +353,18 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
+ 	ShaderComputeInputInfo input_info {};
+ 	const bool use_thread_dimensions = (mode & DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0;
+ 	input_info.dispatch_thread_dimensions = use_thread_dimensions;
++#if defined(KYTY_B32_DISPATCH_STAGE_PROFILE)
++	auto stage_begin = sample_stage ? StageClock::now() : StageClock::time_point {};
++#endif
+ 	const auto compute_program =
+ 	    m_context.GetPipelineCache().GetComputeProgram(cs_regs, sh_regs, input_info);
++#if defined(KYTY_B32_DISPATCH_STAGE_PROFILE)
++	if (sample_stage) {
++		stage_stats.ms[0] += std::chrono::duration<double, std::milli>(
++		    StageClock::now() - stage_begin).count();
++		++stage_stats.samples[0];
++	}
++#endif
+ 	if (use_thread_dimensions) {
+ 		input_info.dispatch_threads_num[0]    = thread_group_x;
+ 		input_info.dispatch_threads_num[1]    = thread_group_y;
+@@ -466,8 +495,19 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
+ 	}
+ 
+ 	buffer.EndRendering();
++#if defined(KYTY_B32_DISPATCH_STAGE_PROFILE)
++	stage_begin = sample_stage ? StageClock::now() : StageClock::time_point {};
++#endif
+ 	auto& pipeline =
+ 	    m_context.GetPipelineCache().CreateComputePipeline(input_info, compute_program);
++#if defined(KYTY_B32_DISPATCH_STAGE_PROFILE)
++	if (sample_stage) {
++		stage_stats.ms[1] += std::chrono::duration<double, std::milli>(
++		    StageClock::now() - stage_begin).count();
++		++stage_stats.samples[1];
++		stage_begin = StageClock::now();
++	}
++#endif
+ 	auto bindings = PrepareBindings(input_info.stage);
+ 	FindBuffers(bindings);
+ 	PrepareBdaBindings(bindings);
+@@ -493,6 +533,13 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
+ 	PreparedBindings* descriptor_stage = &bindings;
+ 	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
+ 	               std::span {&descriptor_stage, 1u}, chain);
++#if defined(KYTY_B32_DISPATCH_STAGE_PROFILE)
++	if (sample_stage) {
++		stage_stats.ms[2] += std::chrono::duration<double, std::milli>(
++		    StageClock::now() - stage_begin).count();
++		++stage_stats.samples[2];
++	}
++#endif
+ 	const bool continues_chain = chain && buffer.ComputeChainPending();
+ 	bool has_storage_writes = HasShaderBufferWrites(input_info.stage);
+ 	has_storage_writes =
 diff --git a/src/graphics/host_gpu/renderer/sync.cpp b/src/graphics/host_gpu/renderer/sync.cpp
 index db3003c..c5669fb 100644
 --- a/src/graphics/host_gpu/renderer/sync.cpp
