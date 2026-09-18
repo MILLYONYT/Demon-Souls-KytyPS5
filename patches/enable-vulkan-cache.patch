@@ -619,6 +619,32 @@ index f373595..c6ffbbc 100644
  	Common::LeastRecentlyUsedCache<ImageId, uint64_t> m_lru_cache;
  	std::unordered_set<ImageId>                       m_download_images;
  	std::map<uint64_t, MetaDataInfo>                  m_surface_metas;
+diff --git a/src/graphics/host_gpu/renderer/commandScheduler.cpp b/src/graphics/host_gpu/renderer/commandScheduler.cpp
+index 3db1ecc..4640005 100644
+--- a/src/graphics/host_gpu/renderer/commandScheduler.cpp
++++ b/src/graphics/host_gpu/renderer/commandScheduler.cpp
+@@ -96,12 +96,20 @@ bool CommandScheduler::InDeferredOperation() noexcept {
+ CommandScheduler::CommandScheduler(RenderContext& context, GraphicContext& graphics)
+     : m_master(graphics), m_context(context), m_graphics(graphics),
+       m_command_pool(graphics, m_master), m_command(*this),
+-      m_priority_thread([this](std::stop_token stop) { PriorityOperationsThread(stop); }) {}
++      m_priority_thread([this](std::stop_token stop) { PriorityOperationsThread(stop); }) {
++#if defined(KYTY_B32_BATCH_DISPATCH_64)
++	LOGF("Build32 dispatch batch: 64 commands per submission\n");
++#endif
++}
+ 
+ void CommandScheduler::CompleteDispatch() {
+ 	// Expose command-processor/GPU overlap without a host fence. Bound the
+ 	// recording batch; resource retirement still uses the submission timeline.
++#if defined(KYTY_B32_BATCH_DISPATCH_64)
++	constexpr uint32_t DispatchesPerSubmission = 64;
++#else
+ 	constexpr uint32_t DispatchesPerSubmission = 32;
++#endif
+ 	if (++m_recorded_dispatches < DispatchesPerSubmission) return;
+ 	CheckActive();
+ 	m_command.EndRendering();
 diff --git a/src/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp b/src/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp
 index 83cabcd..4b513e6 100644
 --- a/src/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp
