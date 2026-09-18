@@ -277,18 +277,93 @@ index cca1005..870e6e9 100644
  }
  
 diff --git a/src/graphics/host_gpu/renderer/cache/bufferCache.cpp b/src/graphics/host_gpu/renderer/cache/bufferCache.cpp
-index f1864a7..308cae4 100644
+index f1864a7..149b22b 100644
 --- a/src/graphics/host_gpu/renderer/cache/bufferCache.cpp
 +++ b/src/graphics/host_gpu/renderer/cache/bufferCache.cpp
-@@ -13,6 +13,7 @@
+@@ -13,6 +13,8 @@
  #include "kernel/memory.h"
  
  #include <algorithm>
 +#include <atomic>
++#include <chrono>
  #include <cinttypes>
  #include <cstring>
  #include <memory>
-@@ -488,12 +489,26 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
+@@ -333,7 +335,36 @@ void BufferCache::ReadMemoryOnGpu(uint64_t vaddr, uint64_t size, bool is_write)
+ }
+ 
+ BufferId BufferCache::FindBuffer(uint64_t vaddr, uint64_t size) {
++#if defined(KYTY_B32_BUFFER_LOOKUP_PROFILE)
++	struct LookupStats {
++		uint64_t calls = 0;
++		uint64_t nulls = 0;
++		uint64_t hits = 0;
++		uint64_t absent = 0;
++		uint64_t too_small = 0;
++		uint64_t creates = 0;
++		uint64_t hit_samples = 0;
++		double hit_ms = 0;
++		double create_ms = 0;
++	};
++	static thread_local LookupStats stats;
++	if (stats.calls == 65536) {
++		LOGF("Build32 buffer lookup: calls=%" PRIu64 " hits=%" PRIu64
++		     " absent=%" PRIu64 " too_small=%" PRIu64 " null=%" PRIu64
++		     " creates=%" PRIu64 " hit_ms=%.2f hit_samples=%" PRIu64
++		     " create_ms=%.2f (one in 32 hits, every creation)\n",
++		     stats.calls, stats.hits, stats.absent, stats.too_small, stats.nulls,
++		     stats.creates, stats.hit_ms, stats.hit_samples, stats.create_ms);
++		stats = {};
++	}
++	const bool sample_hit = (++stats.calls & 31u) == 0;
++	using LookupClock = std::chrono::steady_clock;
++	const auto started = sample_hit ? LookupClock::now() : LookupClock::time_point {};
++#endif
+ 	if (vaddr == 0) {
++#if defined(KYTY_B32_BUFFER_LOOKUP_PROFILE)
++		++stats.nulls;
++#endif
+ 		return NULL_BUFFER_ID;
+ 	}
+ 	if (!GuestRange {vaddr, size}.Valid()) {
+@@ -343,10 +374,34 @@ BufferId BufferCache::FindBuffer(uint64_t vaddr, uint64_t size) {
+ 	if (owner != nullptr && *owner) {
+ 		auto& buffer = m_slot_buffers[*owner];
+ 		if (buffer.IsInBounds(vaddr, size)) {
++#if defined(KYTY_B32_BUFFER_LOOKUP_PROFILE)
++			++stats.hits;
++			if (sample_hit) {
++				stats.hit_ms += std::chrono::duration<double, std::milli>(
++				    LookupClock::now() - started).count();
++				++stats.hit_samples;
++			}
++#endif
+ 			return *owner;
+ 		}
+-	}
+-	return CreateBuffer(vaddr, size);
++#if defined(KYTY_B32_BUFFER_LOOKUP_PROFILE)
++		++stats.too_small;
++#endif
++	} else {
++#if defined(KYTY_B32_BUFFER_LOOKUP_PROFILE)
++		++stats.absent;
++#endif
++	}
++#if defined(KYTY_B32_BUFFER_LOOKUP_PROFILE)
++	const auto create_begin = LookupClock::now();
++#endif
++	const auto id = CreateBuffer(vaddr, size);
++#if defined(KYTY_B32_BUFFER_LOOKUP_PROFILE)
++	stats.create_ms += std::chrono::duration<double, std::milli>(
++	    LookupClock::now() - create_begin).count();
++	++stats.creates;
++#endif
++	return id;
+ }
+ 
+ BufferCache::OverlapResult BufferCache::ResolveOverlaps(uint64_t vaddr, uint64_t size) {
+@@ -488,12 +543,26 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
  	if (copies.empty()) {
  		return nullptr;
  	}
@@ -316,7 +391,7 @@ index f1864a7..308cae4 100644
  			copy.srcOffset += base_offset;
  		}
  		m_staging_buffer.Commit();
-@@ -504,8 +519,7 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
+@@ -504,8 +573,7 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
  	                                         vk::BufferUsageFlagBits::eTransferSrc, total_size);
  	for (const auto& copy: copies) {
  		const auto address = buffer.CpuAddress() + copy.dstOffset;
@@ -326,7 +401,7 @@ index f1864a7..308cae4 100644
  	}
  	temporary->Flush(0, total_size);
  	const auto handle = temporary->Handle();
-@@ -671,8 +685,9 @@ bool BufferCache::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
+@@ -671,8 +739,9 @@ bool BufferCache::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
  	return m_memory_tracker.IsRegionCpuModified(vaddr, size);
  }
  
