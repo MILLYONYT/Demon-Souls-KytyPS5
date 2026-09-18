@@ -1,8 +1,8 @@
-name: Demon Souls Build 32 buffer lookup profile Windows test
+name: Demon Souls Build 32 buffer growth Windows test
 
 on:
   push:
-    branches: [best32-buffer-lookup-test]
+    branches: [best32-buffer-growth-test]
     paths:
       - .github/workflows/b32-cache-source-test.yml
       - patches/enable-vulkan-cache.patch
@@ -105,6 +105,6 @@ jobs:
       - name: Upload Windows x64 test build
         uses: actions/upload-artifact@v4
         with:
-          name: DemonSouls-B32-BUFFER-LOOKUP-Windows-x64-${{ github.run_number }}
+          name: DemonSouls-B32-BUFFER-GROWTH-Windows-x64-${{ github.run_number }}
           path: _Build/windows/install/**
           if-no-files-found: error
