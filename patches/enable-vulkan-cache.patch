@@ -1,18 +1,3 @@
-diff --git a/src/graphics/host_gpu/renderer/cache/bufferCache.h b/src/graphics/host_gpu/renderer/cache/bufferCache.h
---- a/src/graphics/host_gpu/renderer/cache/bufferCache.h
-+++ b/src/graphics/host_gpu/renderer/cache/bufferCache.h
-@@ -83,1 +83,1 @@ public:
--	void               RunGarbageCollector();
-+	void               RunGarbageCollector(uint64_t elapsed_submissions = 1);
-@@ -166,4 +166,7 @@ private:
- 	uint64_t m_trigger_gc_memory  = 1ull * 1024 * 1024 * 1024;
- 	uint64_t m_critical_gc_memory = 2ull * 1024 * 1024 * 1024;
- 	uint64_t m_gc_tick            = 0;
-+#if defined(KYTY_B32_FAST_BIND)
-+	BufferId m_last_buffer {};
-+#endif
- };
-
 diff --git a/src/graphics/guest_gpu/graphicsRun.cpp b/src/graphics/guest_gpu/graphicsRun.cpp
 index cca1005..64efe41 100644
 --- a/src/graphics/guest_gpu/graphicsRun.cpp
