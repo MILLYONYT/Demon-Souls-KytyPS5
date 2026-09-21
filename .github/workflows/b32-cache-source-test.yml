@@ -26,7 +26,12 @@ jobs:
           submodules: recursive
       - name: Apply isolated cache fix
         shell: pwsh
-        run: git -C source apply "$env:GITHUB_WORKSPACE/patches/enable-vulkan-cache.patch"
+        run: |
+          git -C source apply --3way --ignore-space-change --ignore-whitespace "$env:GITHUB_WORKSPACE/patches/enable-vulkan-cache.patch"
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error 'Cache/optimization patch could not be merged cleanly into the pinned Build 32 source revision.'
+            exit $LASTEXITCODE
+          }
       - name: Setup Visual Studio environment
         uses: ilammy/msvc-dev-cmd@v1
       - name: Setup Ninja
@@ -74,7 +79,7 @@ jobs:
             -DKYTY_RELEASE_TAG=B32-SHADER-BIND-${{ github.sha }} ^
             -DCMAKE_C_COMPILER=clang-cl ^
             -DCMAKE_CXX_COMPILER=clang-cl ^
-            "-DCMAKE_CXX_FLAGS=/DNOMINMAX /EHsc /DKYTY_B32_FRAME_PROFILE /DKYTY_B32_QUIET_HOT_LOGS /DKYTY_B32_BATCH_RESOURCE_GC /DKYTY_B32_FORCE_SILENT_SHADER_DUMPS /DKYTY_B32_PHASE_PROFILE /DKYTY_B32_PM4_SAMPLE_PROFILE /DKYTY_B32_DISPATCH_STAGE_PROFILE /DKYTY_B32_BUFFER_LOOKUP_PROFILE /DKYTY_B32_INDIRECT_PROFILE /DKYTY_B32_QUEUE_LAG_PROFILE /DKYTY_B32_FAST_CPU_SETS /DKYTY_B32_FAST_BIND" ^
+            "-DCMAKE_CXX_FLAGS=/DNOMINMAX /EHsc /DKYTY_B32_FRAME_PROFILE /DKYTY_B32_QUIET_HOT_LOGS /DKYTY_B32_BATCH_RESOURCE_GC /DKYTY_B32_FORCE_SILENT_SHADER_DUMPS /DKYTY_B32_PHASE_PROFILE /DKYTY_B32_PM4_SAMPLE_PROFILE /DKYTY_B32_DISPATCH_STAGE_PROFILE /DKYTY_B32_BUFFER_LOOKUP_PROFILE /DKYTY_B32_INDIRECT_PROFILE /DKY_B32_QUEUE_LAG_PROFILE /DKYTY_B32_FAST_CPU_SETS /DKYTY_B32_FAST_BIND" ^
             -DCMAKE_PREFIX_PATH="%Qt6_DIR%"
       - name: Build Windows app
         shell: cmd
