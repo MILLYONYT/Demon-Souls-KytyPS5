@@ -1,4 +1,5 @@
 name: Demon Souls Build 32 shader bind Windows test
+# retry: fixed RegistrationEpoch definition
 
 on:
   push:
