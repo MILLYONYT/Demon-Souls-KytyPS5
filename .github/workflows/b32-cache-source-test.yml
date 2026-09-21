@@ -6,6 +6,7 @@ on:
     paths:
       - .github/workflows/b32-cache-source-test.yml
       - patches/enable-vulkan-cache.patch
+      - patches/shader-bind-aggressive.patch
   workflow_dispatch:
 
 permissions:
@@ -24,26 +25,31 @@ jobs:
           ref: fbcc0c6914a9e76ae5dc52358b935657dcfcb7d7
           path: source
           submodules: recursive
-      - name: Apply isolated cache fix
+      - name: Apply aggressive cache and shader-bind optimizations
         shell: pwsh
         run: |
-          $patch = "$env:GITHUB_WORKSPACE/patches/enable-vulkan-cache.patch"
-          git -C source apply --3way --ignore-space-change --ignore-whitespace $patch
+          $patches = @(
+            "$env:GITHUB_WORKSPACE/patches/enable-vulkan-cache.patch",
+            "$env:GITHUB_WORKSPACE/patches/shader-bind-aggressive.patch"
+          )
+          foreach ($patch in $patches) {
+            git -C source apply --3way --ignore-space-change --ignore-whitespace $patch
+            if ($LASTEXITCODE -ne 0) {
+              throw "Patch application failed for $patch; refusing to compile partial changes."
+            }
+          }
           $header = "$env:GITHUB_WORKSPACE/source/src/graphics/host_gpu/renderer/cache/bufferCache.h"
           $text = Get-Content $header -Raw
-          $text = $text.Replace("void               RunGarbageCollector();", "void               RunGarbageCollector(uint64_t elapsed_submissions = 1);")
-          $text = $text.Replace("uint64_t m_gc_tick            = 0;", "uint64_t m_gc_tick            = 0;`r`n#if defined(KYTY_B32_FAST_BIND)`r`n`tBufferId m_last_buffer {};`r`n#endif")
-          Set-Content -Path $header -Value $text -NoNewline
-          if ($LASTEXITCODE -ne 0) {
-            git -C source reset --hard HEAD
-            git -C source clean -fd
-            git -C source apply --reject --whitespace=nowarn $patch
-            if ($LASTEXITCODE -ne 0) { Write-Error 'Patch application failed; refusing to compile partial changes.' }
-            $text = Get-Content $header -Raw
-            $text = $text.Replace("void               RunGarbageCollector();", "void               RunGarbageCollector(uint64_t elapsed_submissions = 1);")
-            $text = $text.Replace("uint64_t m_gc_tick            = 0;", "uint64_t m_gc_tick            = 0;`r`n#if defined(KYTY_B32_FAST_BIND)`r`n`tBufferId m_last_buffer {};`r`n#endif")
-            Set-Content -Path $header -Value $text -NoNewline
+          $old_gc = "void               RunGarbageCollector();"
+          $new_gc = "void               RunGarbageCollector(uint64_t elapsed_submissions = 1);"
+          if ($text.Contains($old_gc)) { $text = $text.Replace($old_gc, $new_gc) }
+          $old_buffer = "uint64_t m_gc_tick            = 0;"
+          $new_buffer = "uint64_t m_gc_tick            = 0;`r`n#if defined(KYTY_B32_FAST_BIND)`r`n`tBufferId m_last_buffer {};`r`n#endif"
+          if (!$text.Contains("BufferId m_last_buffer")) {
+            if (!$text.Contains($old_buffer)) { throw "Expected Build 32 buffer cache anchor was not found." }
+            $text = $text.Replace($old_buffer, $new_buffer)
           }
+          Set-Content -Path $header -Value $text -NoNewline
       - name: Setup Visual Studio environment
         uses: ilammy/msvc-dev-cmd@v1
       - name: Setup Ninja
@@ -80,6 +86,12 @@ jobs:
         shell: cmd
         run: |
           cmake -S source -B _Build/windows -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=ON -DKYTY_BUILD_ORIGIN=Fork -DKYTY_BUILD_REPOSITORY=${{ github.repository }} -DKYTY_RELEASE_TAG=B32-SHADER-BIND-${{ github.sha }} -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl "-DCMAKE_CXX_FLAGS=/DNOMINMAX /EHsc /DKYTY_B32_FRAME_PROFILE /DKYTY_B32_QUIET_HOT_LOGS /DKYTY_B32_BATCH_RESOURCE_GC /DKYTY_B32_FORCE_SILENT_SHADER_DUMPS /DKYTY_B32_PHASE_PROFILE /DKYTY_B32_PM4_SAMPLE_PROFILE /DKYTY_B32_DISPATCH_STAGE_PROFILE /DKYTY_B32_BUFFER_LOOKUP_PROFILE /DKYTY_B32_INDIRECT_PROFILE /DKYTY_B32_QUEUE_LAG_PROFILE /DKYTY_B32_FAST_CPU_SETS /DKYTY_B32_FAST_BIND" -DCMAKE_PREFIX_PATH="%Qt6_DIR%"
+      - name: Verify aggressive bind patch markers
+        shell: pwsh
+        run: |
+          $src = Get-Content "$env:GITHUB_WORKSPACE/source/src/graphics/host_gpu/renderer/pipeline/descriptors.cpp" -Raw
+          if (!$src.Contains("Reuse host buffer descriptors for stable read-only bindings")) { throw "Aggressive bind reuse code missing." }
+          if (!$src.Contains("RegistrationEpoch()")) { throw "Bind reuse epoch guard missing." }
       - name: Build Windows app
         shell: cmd
         run: cmake --build _Build/windows --target launcher --parallel
