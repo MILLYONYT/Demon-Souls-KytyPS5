@@ -1,3 +1,27 @@
+diff --git a/src/graphics/host_gpu/renderer/cache/bufferCache.h b/src/graphics/host_gpu/renderer/cache/bufferCache.h
+--- a/src/graphics/host_gpu/renderer/cache/bufferCache.h
++++ b/src/graphics/host_gpu/renderer/cache/bufferCache.h
+@@ -60,6 +60,7 @@ public:
+ 	[[nodiscard]] BufferId FindBuffer(uint64_t vaddr, uint64_t size);
++	[[nodiscard]] uint64_t RegistrationEpoch() const noexcept { return m_registration_epoch; }
+ 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBuffer(uint64_t vaddr, uint64_t size,
+@@ -130,6 +131,7 @@ private:
+ 	uint64_t                                          m_gc_tick            = 0;
++	uint64_t                                          m_registration_epoch = 0;
+ };
+diff --git a/src/graphics/host_gpu/renderer/cache/bufferCache.cpp b/src/graphics/host_gpu/renderer/cache/bufferCache.cpp
+--- a/src/graphics/host_gpu/renderer/cache/bufferCache.cpp
++++ b/src/graphics/host_gpu/renderer/cache/bufferCache.cpp
+@@ -1373,6 +1373,7 @@ void BufferCache::Register(BufferId id) {
+ 	ChangeRegister<true>(id);
++	++m_registration_epoch;
+ }
+ 
+ void BufferCache::Unregister(BufferId id) {
+ 	ChangeRegister<false>(id);
++	++m_registration_epoch;
+ }
+ 
 diff --git a/src/graphics/host_gpu/renderer/pipeline/descriptors.cpp b/src/graphics/host_gpu/renderer/pipeline/descriptors.cpp
 --- a/src/graphics/host_gpu/renderer/pipeline/descriptors.cpp
 +++ b/src/graphics/host_gpu/renderer/pipeline/descriptors.cpp
