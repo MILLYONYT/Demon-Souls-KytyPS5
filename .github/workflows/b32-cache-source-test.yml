@@ -29,6 +29,11 @@ jobs:
         run: |
           $patch = "$env:GITHUB_WORKSPACE/patches/enable-vulkan-cache.patch"
           git -C source apply --3way --ignore-space-change --ignore-whitespace $patch
+          # Build 32's header is pinned; apply this one declaration directly so patch context cannot drift.
+          $header = "$env:GITHUB_WORKSPACE/source/src/graphics/host_gpu/renderer/cache/bufferCache.h"
+          $text = Get-Content $header -Raw
+          $text = $text.Replace("void               RunGarbageCollector();", "void               RunGarbageCollector(uint64_t elapsed_submissions = 1);")
+          Set-Content -Path $header -Value $text -NoNewline
           if ($LASTEXITCODE -ne 0) {
             Write-Warning 'Three-way patch application failed; retrying with non-fatal rejected hunks so compatible Build 32 changes can still compile.'
             git -C source reset --hard HEAD
