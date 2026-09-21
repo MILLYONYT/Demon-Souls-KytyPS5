@@ -1,7 +1,7 @@
 diff --git a/src/graphics/host_gpu/renderer/pipeline/descriptors.cpp b/src/graphics/host_gpu/renderer/pipeline/descriptors.cpp
 --- a/src/graphics/host_gpu/renderer/pipeline/descriptors.cpp
 +++ b/src/graphics/host_gpu/renderer/pipeline/descriptors.cpp
-@@ -867,7 +867,48 @@
+@@ -867,7 +867,49 @@
 -	for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
 -		uint32_t buffer_offset = 0;
 -		prepared.buffers.push_back(NativeStorageBuffer(m_context, prepared.buffer_sources[i],
