@@ -1,3 +1,24 @@
+diff --git a/src/graphics/host_gpu/renderer/cache/bufferCache.h b/src/graphics/host_gpu/renderer/cache/bufferCache.h
+index cc9e511..1268029 100644
+--- a/src/graphics/host_gpu/renderer/cache/bufferCache.h
++++ b/src/graphics/host_gpu/renderer/cache/bufferCache.h
+@@ -80,11 +80,14 @@ public:
+ 	[[nodiscard]] uint64_t RegistrationEpoch() const { return m_registration_epoch; }
+ 	void CollectMappedRegisteredRanges(const RangeSet& mapped, std::vector<RangeSet::Range>& ranges) const;
+ 
+-	void               RunGarbageCollector();
++	void               RunGarbageCollector(uint64_t elapsed_submissions = 1);
+ 
+ private:
+ 	friend struct BufferCacheTestAccess;@@ -176,6 +176,9 @@ private:
+ 	uint64_t m_trigger_gc_memory  = 1ull * 1024 * 1024 * 1024;
+ 	uint64_t m_critical_gc_memory = 2ull * 1024 * 1024 * 1024;
+ 	uint64_t m_gc_tick            = 0;
++#if defined(KYTY_B32_FAST_BIND)
++	BufferId m_last_buffer {};
++#endif
+ };
+ 
 diff --git a/src/graphics/guest_gpu/graphicsRun.cpp b/src/graphics/guest_gpu/graphicsRun.cpp
 index cca1005..64efe41 100644
 --- a/src/graphics/guest_gpu/graphicsRun.cpp
