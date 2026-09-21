@@ -1,8 +1,8 @@
-name: Demon Souls Build 32 GPU priority Windows test
+name: Demon Souls Build 32 shader bind Windows test
 
 on:
   push:
-    branches: [best32-gpu-priority-test]
+    branches: [best32-shader-bind-test]
     paths:
       - .github/workflows/b32-cache-source-test.yml
       - patches/enable-vulkan-cache.patch
@@ -71,10 +71,10 @@ jobs:
             -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=ON ^
             -DKYTY_BUILD_ORIGIN=Fork ^
             -DKYTY_BUILD_REPOSITORY=${{ github.repository }} ^
-            -DKYTY_RELEASE_TAG=B32-GPU-PRIORITY-${{ github.sha }} ^
+            -DKYTY_RELEASE_TAG=B32-SHADER-BIND-${{ github.sha }} ^
             -DCMAKE_C_COMPILER=clang-cl ^
             -DCMAKE_CXX_COMPILER=clang-cl ^
-            "-DCMAKE_CXX_FLAGS=/DNOMINMAX /EHsc /DKYTY_B32_FRAME_PROFILE /DKYTY_B32_QUIET_HOT_LOGS /DKYTY_B32_BATCH_RESOURCE_GC /DKYTY_B32_FORCE_SILENT_SHADER_DUMPS /DKYTY_B32_PHASE_PROFILE /DKYTY_B32_PM4_SAMPLE_PROFILE /DKYTY_B32_DISPATCH_STAGE_PROFILE /DKYTY_B32_BUFFER_LOOKUP_PROFILE /DKYTY_B32_INDIRECT_PROFILE /DKYTY_B32_QUEUE_LAG_PROFILE /DKYTY_B32_FAST_CPU_SETS" ^
+            "-DCMAKE_CXX_FLAGS=/DNOMINMAX /EHsc /DKYTY_B32_FRAME_PROFILE /DKYTY_B32_QUIET_HOT_LOGS /DKYTY_B32_BATCH_RESOURCE_GC /DKYTY_B32_FORCE_SILENT_SHADER_DUMPS /DKYTY_B32_PHASE_PROFILE /DKYTY_B32_PM4_SAMPLE_PROFILE /DKYTY_B32_DISPATCH_STAGE_PROFILE /DKYTY_B32_BUFFER_LOOKUP_PROFILE /DKYTY_B32_INDIRECT_PROFILE /DKYTY_B32_QUEUE_LAG_PROFILE /DKYTY_B32_FAST_CPU_SETS /DKYTY_B32_FAST_BIND" ^
             -DCMAKE_PREFIX_PATH="%Qt6_DIR%"
       - name: Build Windows app
         shell: cmd
@@ -102,16 +102,19 @@ jobs:
           assert b'KYTY_B32_GPU_PRIORITY' in exe
           assert b'Build32 binding stages:' in exe
           assert b'Build32 buffer lookup:' in exe
+          assert b'Build32 buffer find reuse:' in exe
+          assert b'last_id_hits=' in exe
+          assert b'KYTY_B32_FAST_BIND' in exe
           assert b'Build32 indirect dispatch:' in exe
           assert b'Build32 queue lag: submits=' in exe
           assert b'Build32 shader diagnostics: requested=' in exe
           assert b'BufferCache: unmapped guest upload' in exe
           assert b'AJM ATRAC9 initialized:' not in exe
-          print('Vulkan cache, frame profiler, and quiet command logging compiled into executable')
+          print('Vulkan cache, frame profiler, and shader bind path compiled into executable')
           '@ | python -
       - name: Upload Windows x64 test build
         uses: actions/upload-artifact@v4
         with:
-          name: DemonSouls-B32-GPU-PRIORITY-Windows-x64-${{ github.run_number }}
+          name: DemonSouls-B32-SHADER-BIND-Windows-x64-${{ github.run_number }}
           path: _Build/windows/install/**
           if-no-files-found: error

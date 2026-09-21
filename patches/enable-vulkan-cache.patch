@@ -474,7 +474,7 @@ index f1864a7..149b22b 100644
  #include <cinttypes>
  #include <cstring>
  #include <memory>
-@@ -333,7 +335,36 @@ void BufferCache::ReadMemoryOnGpu(uint64_t vaddr, uint64_t size, bool is_write)
+@@ -333,7 +335,54 @@ void BufferCache::ReadMemoryOnGpu(uint64_t vaddr, uint64_t size, bool is_write)
  }
  
  BufferId BufferCache::FindBuffer(uint64_t vaddr, uint64_t size) {
@@ -486,6 +486,7 @@ index f1864a7..149b22b 100644
 +		uint64_t absent = 0;
 +		uint64_t too_small = 0;
 +		uint64_t creates = 0;
++		uint64_t last_id_hits = 0;
 +		uint64_t hit_samples = 0;
 +		double hit_ms = 0;
 +		double create_ms = 0;
@@ -494,10 +495,10 @@ index f1864a7..149b22b 100644
 +	if (stats.calls == 65536) {
 +		LOGF("Build32 buffer lookup: calls=%" PRIu64 " hits=%" PRIu64
 +		     " absent=%" PRIu64 " too_small=%" PRIu64 " null=%" PRIu64
-+		     " creates=%" PRIu64 " hit_ms=%.2f hit_samples=%" PRIu64
++		     " creates=%" PRIu64 " last_id_hits=%" PRIu64 " hit_ms=%.2f hit_samples=%" PRIu64
 +		     " create_ms=%.2f (one in 32 hits, every creation)\n",
 +		     stats.calls, stats.hits, stats.absent, stats.too_small, stats.nulls,
-+		     stats.creates, stats.hit_ms, stats.hit_samples, stats.create_ms);
++		     stats.creates, stats.last_id_hits, stats.hit_ms, stats.hit_samples, stats.create_ms);
 +		stats = {};
 +	}
 +	const bool sample_hit = (++stats.calls & 31u) == 0;
@@ -510,8 +511,37 @@ index f1864a7..149b22b 100644
 +#endif
  		return NULL_BUFFER_ID;
  	}
++#if defined(KYTY_B32_FAST_BIND)
++	if (m_last_buffer) {
++		auto* last = m_slot_buffers.try_get(m_last_buffer);
++		if (last != nullptr && !last->is_deleted && last->IsInBounds(vaddr, size)) {
++#if defined(KYTY_B32_BUFFER_LOOKUP_PROFILE)
++			++stats.hits;
++			++stats.last_id_hits;
++			if (sample_hit) {
++				stats.hit_ms += std::chrono::duration<double, std::milli>(
++				    LookupClock::now() - started).count();
++				++stats.hit_samples;
++			}
++#endif
++			return m_last_buffer;
++		}
++	}
++#endif
  	if (!GuestRange {vaddr, size}.Valid()) {
-@@ -343,10 +374,34 @@ BufferId BufferCache::FindBuffer(uint64_t vaddr, uint64_t size) {
+@@ -107,6 +107,11 @@ void BufferCache::DeleteBuffer(BufferId id) {
+ 	auto* buffer = m_slot_buffers.try_get(id);
+ 	if (buffer == nullptr || buffer->is_deleted) {
+ 		return;
+ 	}
++#if defined(KYTY_B32_FAST_BIND)
++	if (m_last_buffer == id) {
++		m_last_buffer = {};
++	}
++#endif
+ 	Unregister(id);
+ 	if (m_scheduler.Active()) {
+@@ -343,10 +374,40 @@ BufferId BufferCache::FindBuffer(uint64_t vaddr, uint64_t size) {
  	if (owner != nullptr && *owner) {
  		auto& buffer = m_slot_buffers[*owner];
  		if (buffer.IsInBounds(vaddr, size)) {
@@ -522,6 +552,9 @@ index f1864a7..149b22b 100644
 +				    LookupClock::now() - started).count();
 +				++stats.hit_samples;
 +			}
++#endif
++#if defined(KYTY_B32_FAST_BIND)
++			m_last_buffer = *owner;
 +#endif
  			return *owner;
  		}
@@ -543,6 +576,9 @@ index f1864a7..149b22b 100644
 +	stats.create_ms += std::chrono::duration<double, std::milli>(
 +	    LookupClock::now() - create_begin).count();
 +	++stats.creates;
++#endif
++#if defined(KYTY_B32_FAST_BIND)
++	m_last_buffer = id;
 +#endif
 +	return id;
  }
@@ -602,7 +638,7 @@ diff --git a/src/graphics/host_gpu/renderer/cache/bufferCache.h b/src/graphics/h
 index cc9e511..1268029 100644
 --- a/src/graphics/host_gpu/renderer/cache/bufferCache.h
 +++ b/src/graphics/host_gpu/renderer/cache/bufferCache.h
-@@ -80,7 +80,7 @@ public:
+@@ -80,11 +80,14 @@ public:
  	[[nodiscard]] uint64_t RegistrationEpoch() const { return m_registration_epoch; }
  	void CollectMappedRegisteredRanges(const RangeSet& mapped, std::vector<RangeSet::Range>& ranges) const;
  
@@ -610,7 +646,15 @@ index cc9e511..1268029 100644
 +	void               RunGarbageCollector(uint64_t elapsed_submissions = 1);
  
  private:
- 	friend struct BufferCacheTestAccess;
+ 	friend struct BufferCacheTestAccess;@@ -176,6 +176,9 @@ private:
+ 	uint64_t m_trigger_gc_memory  = 1ull * 1024 * 1024 * 1024;
+ 	uint64_t m_critical_gc_memory = 2ull * 1024 * 1024 * 1024;
+ 	uint64_t m_gc_tick            = 0;
++#if defined(KYTY_B32_FAST_BIND)
++	BufferId m_last_buffer {};
++#endif
+ };
+
 diff --git a/src/graphics/host_gpu/renderer/cache/gpuResourceManager.cpp b/src/graphics/host_gpu/renderer/cache/gpuResourceManager.cpp
 index 017042a..1a95c1e 100644
 --- a/src/graphics/host_gpu/renderer/cache/gpuResourceManager.cpp
@@ -3242,3 +3286,77 @@ index 94f0093..9ee53e3 100644
  
  		if (is_valid_chunk(chunk_ids[i])) {
  			out_loci[i] = PLAYGO_LOCUS_LOCAL_FAST;
+diff --git a/src/graphics/host_gpu/renderer/pipeline/descriptors.cpp b/src/graphics/host_gpu/renderer/pipeline/descriptors.cpp
+--- a/src/graphics/host_gpu/renderer/pipeline/descriptors.cpp
++++ b/src/graphics/host_gpu/renderer/pipeline/descriptors.cpp
+@@ -162,6 +162,7 @@
+ 	if (resource.formatted && resource.written) {
+ 		context.GetTextureCache().InvalidateMemoryFromGPU(address, size);
+ 	}
++#if !defined(KYTY_B32_FAST_BIND)
+ 	const char* access = "Read";
+ 	if (resource.written && resource.read) {
+ 		access = "ReadWrite";
+@@ -172,6 +173,7 @@
+ 	    graphics.device, result.buffer,
+ 	    "Kyty.{}.StorageBuffer[slot={} guest=0x{:016x} size=0x{:x} access={} formatted={}]",
+ 	    ShaderStageResourceName(stage), slot, address, size, access, resource.formatted);
++#endif
+ 	return result;
+ }
+ 
+@@ -862,6 +864,40 @@
+ 	const auto& snapshot = prepared.runtime->resources;
+ 	auto&       cache    = m_context.GetBufferCache();
+ 
++#if defined(KYTY_B32_FAST_BIND)
++	struct FindReuseStats {
++		const ShaderStageRuntime* runtime = nullptr;
++		uint64_t epoch = 0;
++		uint64_t fingerprint = 0;
++		std::vector<PreparedBindings::BufferSource> sources;
++		uint64_t hits = 0;
++		uint64_t misses = 0;
++	};
++	static thread_local FindReuseStats reuse;
++	if ((reuse.hits + reuse.misses) == 8192) {
++		LOGF("Build32 buffer find reuse: hits=%" PRIu64 " misses=%" PRIu64
++		     " (same program + descriptors + cache epoch)\n",
++		     reuse.hits, reuse.misses);
++		reuse.hits = reuse.misses = 0;
++	}
++	uint64_t fingerprint = program.info.buffers.size();
++	for (uint32_t i = 0; i < program.info.buffers.size(); ++i) {
++		const auto& value = snapshot.buffers[i];
++		fingerprint ^= (static_cast<uint64_t>(value.dwords[0]) + 0x9e3779b97f4a7c15ULL +
++		                (fingerprint << 6u) + (fingerprint >> 2u));
++		fingerprint ^= (static_cast<uint64_t>(value.dwords[1]) << 1u);
++		fingerprint ^= (static_cast<uint64_t>(value.dwords[2]) << 2u);
++		fingerprint ^= (static_cast<uint64_t>(value.dwords[3]) << 3u);
++	}
++	const auto epoch = cache.RegistrationEpoch();
++	if (reuse.runtime == prepared.runtime && reuse.epoch == epoch &&
++	    reuse.fingerprint == fingerprint &&
++	    reuse.sources.size() == program.info.buffers.size()) {
++		prepared.buffer_sources = reuse.sources;
++		++reuse.hits;
++		return;
++	}
++#endif
+ 	prepared.buffer_sources.clear();
+ 	prepared.buffer_sources.reserve(program.info.buffers.size());
+ 	for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
+@@ -878,6 +914,13 @@
+ 		const auto size = Libs::LibKernel::Memory::ClampRangeSize(address, requested_size);
+ 		prepared.buffer_sources.push_back({address, size, cache.FindBuffer(address, size)});
+ 	}
++#if defined(KYTY_B32_FAST_BIND)
++	reuse.runtime = prepared.runtime;
++	reuse.epoch = epoch;
++	reuse.fingerprint = fingerprint;
++	reuse.sources = prepared.buffer_sources;
++	++reuse.misses;
++#endif
+ }
+ 
+ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
