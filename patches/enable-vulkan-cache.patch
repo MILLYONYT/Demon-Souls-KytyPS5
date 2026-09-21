@@ -1,10 +1,7 @@
 diff --git a/src/graphics/host_gpu/renderer/cache/bufferCache.h b/src/graphics/host_gpu/renderer/cache/bufferCache.h
 --- a/src/graphics/host_gpu/renderer/cache/bufferCache.h
 +++ b/src/graphics/host_gpu/renderer/cache/bufferCache.h
-@@ -80,4 +80,4 @@ public:
- 	[[nodiscard]] uint64_t RegistrationEpoch() const { return m_registration_epoch; }
- 	void CollectMappedRegisteredRanges(const RangeSet& mapped, std::vector<RangeSet::Range>& ranges) const;
- 
+@@ -83,1 +83,1 @@ public:
 -	void               RunGarbageCollector();
 +	void               RunGarbageCollector(uint64_t elapsed_submissions = 1);
 @@ -166,4 +166,7 @@ private:
