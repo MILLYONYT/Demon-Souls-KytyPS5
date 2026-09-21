@@ -1,7 +1,7 @@
 diff --git a/src/graphics/host_gpu/renderer/pipeline/descriptors.cpp b/src/graphics/host_gpu/renderer/pipeline/descriptors.cpp
 --- a/src/graphics/host_gpu/renderer/pipeline/descriptors.cpp
 +++ b/src/graphics/host_gpu/renderer/pipeline/descriptors.cpp
-@@ -867,8 +867,57 @@
+@@ -867,7 +867,48 @@
 -	for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
 -		uint32_t buffer_offset = 0;
 -		prepared.buffers.push_back(NativeStorageBuffer(m_context, prepared.buffer_sources[i],
@@ -14,7 +14,6 @@ diff --git a/src/graphics/host_gpu/renderer/pipeline/descriptors.cpp b/src/graph
 +		const ShaderStageRuntime* runtime = nullptr;
 +		uint64_t epoch = 0;
 +		uint64_t fingerprint = 0;
-+		std::vector<decltype(prepared.buffers)::value_type> buffers;
 +		std::vector<uint32_t> offsets;
 +	};
 +	static thread_local RebindReuse reuse;
@@ -32,24 +31,18 @@ diff --git a/src/graphics/host_gpu/renderer/pipeline/descriptors.cpp b/src/graph
 +		fingerprint ^= source.address + (source.size << 1u);
 +	}
 +	const auto epoch = buffer_cache.RegistrationEpoch();
-+	if (reusable && reuse.runtime == prepared.runtime && reuse.epoch == epoch &&
-+	    reuse.fingerprint == fingerprint && reuse.buffers.size() == program.info.buffers.size() &&
-+	    reuse.offsets.size() == program.info.buffers.size()) {
-+		prepared.buffers = reuse.buffers;
-+		for (uint32_t i = 0; i < prepared.buffers.size(); ++i) {
-+			pack_memory_offset(i, reuse.offsets[i]);
-+		}
-+		return;
-+	}
++	const bool same_bindings = reusable && reuse.runtime == prepared.runtime && reuse.epoch == epoch &&
++	                            reuse.fingerprint == fingerprint &&
++	                            reuse.offsets.size() == program.info.buffers.size();
 +#endif
 +	for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
 +		uint32_t buffer_offset = 0;
 +		prepared.buffers.push_back(NativeStorageBuffer(m_context, prepared.buffer_sources[i],
 +		                                               program.info.buffers[i], program.stage, i,
 +		                                               buffer_offset));
-+		pack_memory_offset(i, buffer_offset);
++		pack_memory_offset(i, same_bindings ? reuse.offsets[i] : buffer_offset);
 +#if defined(KYTY_B32_FAST_BIND)
-+		if (reusable) {
++		if (reusable && !same_bindings) {
 +			if (reuse.offsets.size() != program.info.buffers.size()) {
 +				reuse.offsets.assign(program.info.buffers.size(), 0);
 +			}
@@ -58,11 +51,10 @@ diff --git a/src/graphics/host_gpu/renderer/pipeline/descriptors.cpp b/src/graph
 +#endif
 +	}
 +#if defined(KYTY_B32_FAST_BIND)
-+	if (reusable) {
++	if (reusable && !same_bindings) {
 +		reuse.runtime = prepared.runtime;
 +		reuse.epoch = epoch;
 +		reuse.fingerprint = fingerprint;
-+		reuse.buffers = prepared.buffers;
 +	}
 +#endif
- 	if (ShaderRecompiler::IR::FindBinding(
+	if (ShaderRecompiler::IR::FindBinding(
