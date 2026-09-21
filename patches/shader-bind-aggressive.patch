@@ -2,6 +2,13 @@ diff --git a/src/graphics/host_gpu/renderer/pipeline/descriptors.cpp b/src/graph
 --- a/src/graphics/host_gpu/renderer/pipeline/descriptors.cpp
 +++ b/src/graphics/host_gpu/renderer/pipeline/descriptors.cpp
 @@ -867,8 +867,57 @@
+-	for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
+-		uint32_t buffer_offset = 0;
+-		prepared.buffers.push_back(NativeStorageBuffer(m_context, prepared.buffer_sources[i],
+-		                                               program.info.buffers[i], program.stage, i,
+-		                                               buffer_offset));
+-		pack_memory_offset(i, buffer_offset);
+-	}
 +#if defined(KYTY_B32_FAST_BIND)
 +	struct RebindReuse {
 +		const ShaderStageRuntime* runtime = nullptr;
