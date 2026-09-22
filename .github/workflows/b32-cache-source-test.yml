@@ -1,5 +1,5 @@
 name: Demon Souls Build 32 shader bind Windows test
-# retry: fixed RegistrationEpoch definition
+# The pinned source already provides fast buffer lookup and bind-time object naming control.
 
 on:
   push:
@@ -7,7 +7,6 @@ on:
     paths:
       - .github/workflows/b32-cache-source-test.yml
       - patches/enable-vulkan-cache.patch
-      - patches/shader-bind-aggressive.patch
   workflow_dispatch:
 
 permissions:
@@ -30,8 +29,7 @@ jobs:
         shell: pwsh
         run: |
           $patches = @(
-            "$env:GITHUB_WORKSPACE/patches/enable-vulkan-cache.patch",
-            "$env:GITHUB_WORKSPACE/patches/shader-bind-aggressive.patch"
+            "$env:GITHUB_WORKSPACE/patches/enable-vulkan-cache.patch"
           )
           foreach ($patch in $patches) {
             git -C source apply --3way --ignore-space-change --ignore-whitespace $patch
@@ -87,12 +85,13 @@ jobs:
         shell: cmd
         run: |
           cmake -S source -B _Build/windows -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=ON -DKYTY_BUILD_ORIGIN=Fork -DKYTY_BUILD_REPOSITORY=${{ github.repository }} -DKYTY_RELEASE_TAG=B32-SHADER-BIND-${{ github.sha }} -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl "-DCMAKE_CXX_FLAGS=/DNOMINMAX /EHsc /DKYTY_B32_FRAME_PROFILE /DKYTY_B32_QUIET_HOT_LOGS /DKYTY_B32_BATCH_RESOURCE_GC /DKYTY_B32_FORCE_SILENT_SHADER_DUMPS /DKYTY_B32_PHASE_PROFILE /DKYTY_B32_PM4_SAMPLE_PROFILE /DKYTY_B32_DISPATCH_STAGE_PROFILE /DKYTY_B32_BUFFER_LOOKUP_PROFILE /DKYTY_B32_INDIRECT_PROFILE /DKYTY_B32_QUEUE_LAG_PROFILE /DKYTY_B32_FAST_CPU_SETS /DKYTY_B32_FAST_BIND" -DCMAKE_PREFIX_PATH="%Qt6_DIR%"
-      - name: Verify aggressive bind patch markers
+      - name: Verify pinned fast bind and cache markers
         shell: pwsh
         run: |
           $src = Get-Content "$env:GITHUB_WORKSPACE/source/src/graphics/host_gpu/renderer/pipeline/descriptors.cpp" -Raw
-          if (!$src.Contains("Reuse host buffer descriptors for stable read-only bindings")) { throw "Aggressive bind reuse code missing." }
-          if (!$src.Contains("RegistrationEpoch()")) { throw "Bind reuse epoch guard missing." }
+          if (!$src.Contains("FindReuseStats")) { throw "Pinned buffer find reuse code missing." }
+          if (!$src.Contains("#if !defined(KYTY_B32_FAST_BIND)")) { throw "Pinned fast bind code missing." }
+          if (!$src.Contains("RegistrationEpoch()")) { throw "Pinned buffer lookup epoch guard missing." }
       - name: Build Windows app
         shell: cmd
         run: cmake --build _Build/windows --target launcher --parallel
