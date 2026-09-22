@@ -1,0 +1,35 @@
+diff --git a/src/graphics/host_gpu/renderer/renderCompute.cpp b/src/graphics/host_gpu/renderer/renderCompute.cpp
+index 06b79e5..fe2091c 100644
+--- a/src/graphics/host_gpu/renderer/renderCompute.cpp
++++ b/src/graphics/host_gpu/renderer/renderCompute.cpp
+@@ -408,7 +408,6 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
+ 		input_info.dispatch_threads_num[2]    = thread_group_z;
+ 	}
+ 
+-	const uint32_t frame_num = static_cast<uint32_t>(m_context.GetGpu().GetFrameNum());
+ 	const bool     large_workgroup =
+ 	    (input_info.threads_num[0] * input_info.threads_num[1] * input_info.threads_num[2] >= 512);
+ 	const auto& program   = *input_info.stage.program;
+@@ -440,14 +439,16 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
+ 		ResetBindings();
+ 		return;
+ 	}
+-	const auto sampled_images = std::count_if(
+-	    program.info.images.begin(), program.info.images.end(), [](const auto& image) {
+-		    return image.resource_class == ShaderRecompiler::IR::ImageResourceClass::Sampled;
+-	    });
+-	const bool                   has_sampler = !program.info.samplers.empty();
+ 	static std::atomic<uint32_t> dispatch_log_count {0};
+-	if ((large_workgroup || has_sampler) &&
++	// Once diagnostics are capped, avoid scanning image resources on every dispatch.
++	if ((large_workgroup || !program.info.samplers.empty()) &&
++	    dispatch_log_count.load(std::memory_order_relaxed) < 512 &&
+ 	    dispatch_log_count.fetch_add(1, std::memory_order_relaxed) < 512) {
++		const auto sampled_images = std::count_if(
++		    program.info.images.begin(), program.info.images.end(), [](const auto& image) {
++		        return image.resource_class == ShaderRecompiler::IR::ImageResourceClass::Sampled;
++		    });
++		const uint32_t frame_num = static_cast<uint32_t>(m_context.GetGpu().GetFrameNum());
+ 		LOGF("GraphicsRenderDispatchDirect: frame=%u shader=0x%016" PRIx64
+ 		     " groups=%ux%ux%u mode=0x%08" PRIx32 " local=%ux%ux%u "
+ 		     "buffers=%zu textures=%zu sampled=%zu storage=%zu samplers=%zu push=%u\n",
