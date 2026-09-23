@@ -1,0 +1,48 @@
+diff --git a/src/graphics/host_gpu/renderer/renderCompute.cpp b/src/graphics/host_gpu/renderer/renderCompute.cpp
+index fe2091c..138d741 100644
+--- a/src/graphics/host_gpu/renderer/renderCompute.cpp
++++ b/src/graphics/host_gpu/renderer/renderCompute.cpp
+@@ -439,6 +439,43 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
+ 		ResetBindings();
+ 		return;
+ 	}
++	// The uniform-fill analysis proves a fill has exactly one store along every
++	// path. For ordinary, unaliased buffers, use the existing coherent fill path
++	// instead of building descriptors and recording a compute dispatch.
++	if (indirect_args == 0 && program.info.buffers.size() == 1 &&
++	    resources.buffers.size() == 1 && program.info.images.empty() &&
++	    program.info.samplers.empty() && !program.info.uses_dma) {
++		const auto& destination = program.info.buffers.front();
++		if (destination.written && !destination.read && !destination.atomic &&
++		    !destination.scalar) {
++			ShaderBufferResource fill_descriptor;
++			uint32_t fill_value = 0;
++			uint64_t fill_size = 0;
++			if (ResolveComputeBufferFill(input_info, thread_group_x, thread_group_y,
++			                             thread_group_z, mode, fill_descriptor, fill_value,
++			                             fill_size) && fill_size <= 8u * 1024u * 1024u) {
++				auto& texture_cache = m_context.GetTextureCache();
++				const auto address = fill_descriptor.Base48();
++				if ((address & 3u) == 0 && !texture_cache.IsMeta(address) &&
++				    !texture_cache.FindImageFromRange(address, fill_size)) {
++					buffer.EndRendering();
++					m_context.GetBufferCache().FillBuffer(address, fill_size, fill_value, false);
++					static thread_local uint64_t converted_fills = 0;
++					if (++converted_fills % 16384 == 1) {
++						LOGF("Build32 ordinary buffer fills: converted=%" PRIu64
++						     " shader=0x%016" PRIx64 " size=%" PRIu64 "\n",
++						     converted_fills, program.shader_hash, fill_size);
++					}
++#if defined(KYTY_B32_DISPATCH_STAGE_PROFILE)
++					mark_outer(2);
++					++stage_stats.fast_returns;
++#endif
++					ResetBindings();
++					return;
++				}
++			}
++		}
++	}
+ 	static std::atomic<uint32_t> dispatch_log_count {0};
+ 	// Once diagnostics are capped, avoid scanning image resources on every dispatch.
+ 	if ((large_workgroup || !program.info.samplers.empty()) &&
