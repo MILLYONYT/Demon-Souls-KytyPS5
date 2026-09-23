@@ -1,0 +1,45 @@
+diff --git a/src/graphics/host_gpu/renderer/pipeline/descriptors.cpp b/src/graphics/host_gpu/renderer/pipeline/descriptors.cpp
+index dbfd458..56fcca2 100644
+--- a/src/graphics/host_gpu/renderer/pipeline/descriptors.cpp
++++ b/src/graphics/host_gpu/renderer/pipeline/descriptors.cpp
+@@ -875,12 +875,16 @@ void RenderExecutor::FindBuffers(PreparedBindings& prepared) {
+ 		std::vector<PreparedBindings::BufferSource> sources;
+ 	};
+ 	struct FindReuseStats {
+-		std::array<FindReuseEntry, 8> entries;
+-		uint32_t next = 0;
++		// Four ways per bucket let many active shaders coexist without
++		// searching every cached descriptor list on each draw.
++		std::array<FindReuseEntry, 64> entries;
++		std::array<uint8_t, 16> next {};
+ 		uint64_t hits = 0;
+ 		uint64_t misses = 0;
+ 	};
+ 	static thread_local FindReuseStats reuse;
++	constexpr size_t FindReuseBucketCount = 16;
++	constexpr size_t FindReuseWays = 4;
+ 	if ((reuse.hits + reuse.misses) == 8192) {
+ 		LOGF("Build32 buffer find reuse: hits=%" PRIu64 " misses=%" PRIu64
+ 		     " (same program + descriptors + cache epoch)\n",
+@@ -897,7 +901,10 @@ void RenderExecutor::FindBuffers(PreparedBindings& prepared) {
+ 		fingerprint ^= (static_cast<uint64_t>(value.dwords[3]) << 3u);
+ 	}
+ 	const auto epoch = cache.RegistrationEpoch();
+-	for (const auto& entry: reuse.entries) {
++	const auto bucket = (fingerprint ^ (reinterpret_cast<uintptr_t>(&program) >> 4u)) &
++	                    (FindReuseBucketCount - 1);
++	for (size_t way = 0; way < FindReuseWays; ++way) {
++		const auto& entry = reuse.entries[bucket * FindReuseWays + way];
+ 		if (entry.program == &program && entry.buffer_cache == &cache && entry.epoch == epoch &&
+ 		    entry.fingerprint == fingerprint &&
+ 		    entry.sources.size() == program.info.buffers.size() &&
+@@ -932,7 +939,8 @@ void RenderExecutor::FindBuffers(PreparedBindings& prepared) {
+ 		prepared.buffer_sources.push_back({address, size, cache.FindBuffer(address, size)});
+ 	}
+ #if defined(KYTY_B32_FAST_BIND)
+-	auto& entry = reuse.entries[reuse.next++ % reuse.entries.size()];
++	auto& entry = reuse.entries[bucket * FindReuseWays +
++	                            reuse.next[bucket]++ % FindReuseWays];
+ 	entry.program = &program;
+ 	entry.buffer_cache = &cache;
+ 	// FindBuffer may register a buffer. Capture the epoch after the lookups so
