@@ -1,0 +1,65 @@
+diff --git a/src/graphics/host_gpu/renderer/pipeline/descriptors.cpp b/src/graphics/host_gpu/renderer/pipeline/descriptors.cpp
+index 56fcca2..68c2b94 100644
+--- a/src/graphics/host_gpu/renderer/pipeline/descriptors.cpp
++++ b/src/graphics/host_gpu/renderer/pipeline/descriptors.cpp
+@@ -35,6 +35,7 @@
+ #include <limits>
+ #include <span>
+ #include <vector>
++#include <xxhash.h>
+ 
+ #ifdef min
+ #undef min
+@@ -787,9 +788,51 @@ static vk::Sampler NativeSampler(RenderContext&                       context,
+ static vk::DescriptorBufferInfo NativeUpload(RenderContext&            context,
+                                              std::span<const uint32_t> data) {
+ 	EXIT_IF(data.empty());
+-	auto& command_buffer = context.GetCommandScheduler().Current();
++	auto& scheduler = context.GetCommandScheduler();
++	auto& command_buffer = scheduler.Current();
+ 	EXIT_IF(command_buffer.IsInvalid());
+ 	auto&      buffer = context.GetBufferCache().GetUtilityBuffer(MemoryUsage::Stream);
++	// These uploads are immutable until their submission completes. Reuse exact
++	// byte matches only within the same timeline tick and the same stream buffer.
++	if (data.size() <= 64) {
++		struct UploadEntry {
++			const RenderContext* owner = nullptr;
++			uint64_t tick = 0;
++			uint64_t hash = 0;
++			std::vector<uint32_t> words;
++			vk::DescriptorBufferInfo view {};
++		};
++		struct UploadCache {
++			std::array<UploadEntry, 8> entries;
++			uint32_t next = 0;
++			uint32_t probes = 0;
++			uint32_t hits = 0;
++		};
++		static thread_local UploadCache cache;
++		if (++cache.probes == 8192) {
++			LOGF("Build32 upload reuse: hits=%u probes=%u (same submission and exact data)\n",
++			     cache.hits, cache.probes);
++			cache.probes = cache.hits = 0;
++		}
++		const auto hash = XXH3_64bits(data.data(), data.size_bytes());
++		const auto tick = scheduler.CurrentTick();
++		for (const auto& entry: cache.entries) {
++			if (entry.owner == &context && entry.tick == tick && entry.hash == hash &&
++			    entry.view.buffer == buffer.Handle() && entry.words.size() == data.size() &&
++			    std::equal(entry.words.begin(), entry.words.end(), data.begin())) {
++				++cache.hits;
++				return entry.view;
++			}
++		}
++		const auto offset = buffer.Copy(data.data(), data.size_bytes(), 256);
++		auto& entry = cache.entries[cache.next++ % cache.entries.size()];
++		entry.owner = &context;
++		entry.tick = tick;
++		entry.hash = hash;
++		entry.words.assign(data.begin(), data.end());
++		entry.view = vk::DescriptorBufferInfo {buffer.Handle(), offset, data.size_bytes()};
++		return entry.view;
++	}
+ 	const auto offset = buffer.Copy(data.data(), data.size_bytes(), 256);
+ 	return {buffer.Handle(), offset, data.size_bytes()};
+ }
