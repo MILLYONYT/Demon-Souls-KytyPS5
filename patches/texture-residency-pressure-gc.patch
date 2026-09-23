@@ -1,0 +1,32 @@
+diff --git a/src/graphics/host_gpu/renderer/cache/textureCache.cpp b/src/graphics/host_gpu/renderer/cache/textureCache.cpp
+index 463c25d..4f9569d 100644
+--- a/src/graphics/host_gpu/renderer/cache/textureCache.cpp
++++ b/src/graphics/host_gpu/renderer/cache/textureCache.cpp
+@@ -19,6 +19,7 @@
+ #include <array>
+ #include <bit>
+ #include <cinttypes>
++#include <cstdlib>
+ #include <cstring>
+ #include <limits>
+ #include <mutex>
+@@ -182,7 +183,18 @@ TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler
+ 		    std::max<int64_t>(std::min(budget - 6 * threshold / 10, budget - GiB), GiB + GiB / 2));
+ 		m_critical_gc_memory = static_cast<uint64_t>(
+ 		    std::max<int64_t>(std::min(budget - 2 * threshold / 10, budget - GiB / 2), 3 * GiB));
+-		m_trigger_gc_memory = static_cast<uint64_t>(std::max<int64_t>((budget - threshold) / 2, 0));
++		// Reclaim reusable images only once the device reports memory pressure.
++		// The old threshold could be zero on devices with an 8 GiB budget,
++		// causing every GC pass to evict recently used images.
++		m_trigger_gc_memory = m_pressure_gc_memory;
++		if (const auto* legacy = std::getenv("KYTY_TEXTURE_CACHE_EARLY_GC");
++		    legacy != nullptr && std::strcmp(legacy, "1") == 0) {
++			m_trigger_gc_memory =
++			    static_cast<uint64_t>(std::max<int64_t>((budget - threshold) / 2, 0));
++		}
++		LOGF("Build32 texture GC: budget=%" PRIu64 " trigger=%" PRIu64 " pressure=%" PRIu64
++		     " critical=%" PRIu64 "\n", static_cast<uint64_t>(budget), m_trigger_gc_memory,
++		     m_pressure_gc_memory, m_critical_gc_memory);
+ 	}
+ }
+ 
