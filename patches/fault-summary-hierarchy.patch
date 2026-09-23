@@ -1,0 +1,189 @@
+diff --git a/src/graphics/host_gpu/renderer/cache/bufferCache.h b/src/graphics/host_gpu/renderer/cache/bufferCache.h
+index cc9e511..17532ec 100644
+--- a/src/graphics/host_gpu/renderer/cache/bufferCache.h
++++ b/src/graphics/host_gpu/renderer/cache/bufferCache.h
+@@ -61,7 +61,7 @@ public:
+ 	void ReportLodStats(void* dst, uint32_t size, bool reset);
+ 	[[nodiscard]] const Buffer* GetGdsBuffer() const noexcept { return &m_gds_buffer; }
+ 	[[nodiscard]] Buffer* GetBdaPageTableBuffer() noexcept { return &m_bda_pagetable_buffer; }
+-	[[nodiscard]] Buffer* GetFaultBuffer() noexcept { return m_fault_manager.GetFaultBuffer(); }
++	[[nodiscard]] Buffer* GetFaultBuffer() { return m_fault_manager.GetFaultBuffer(); }
+ 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBufferForImage(uint64_t vaddr, uint64_t size);
+ 	void FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool is_gds);
+ 	void CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t size, bool dst_gds,
+diff --git a/src/graphics/host_gpu/renderer/cache/faultManager.cpp b/src/graphics/host_gpu/renderer/cache/faultManager.cpp
+index c40b54e..f013e46 100644
+--- a/src/graphics/host_gpu/renderer/cache/faultManager.cpp
++++ b/src/graphics/host_gpu/renderer/cache/faultManager.cpp
+@@ -8,6 +8,7 @@
+ #include "graphics/host_gpu/renderer/commandScheduler.h"
+ #include "graphics/host_gpu/vulkanCommon.h"
+ 
++#include <algorithm>
+ #include <bit>
+ #include <cinttypes>
+ #include <cstring>
+@@ -19,14 +20,18 @@ namespace {
+ 
+ constexpr size_t MaxPageFaults    = 1024;
+ constexpr size_t PageFaultAreaSize = MaxPageFaults * sizeof(uint64_t);
++constexpr uint64_t FaultWordCount = BufferCache::CACHING_NUMPAGES / 32;
++constexpr uint64_t SummaryWordCount = FaultWordCount / 32;
++constexpr uint64_t SummaryOffset = FaultWordCount * sizeof(uint32_t);
++static_assert(BufferCache::CACHING_PAGEBITS == 14 && FaultWordCount == (1u << 21));
+ 
+ } // namespace
+ 
+ FaultManager::FaultManager(GraphicContext& graphics, CommandScheduler& scheduler,
+                            BufferCache& buffer_cache)
+     : m_graphics(graphics), m_scheduler(scheduler), m_buffer_cache(buffer_cache),
+-      m_fault_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, 0, AllFlags,
+-                     BufferCache::CACHING_NUMPAGES / 8),
++	      m_fault_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, 0, AllFlags,
++	                     SummaryOffset + SummaryWordCount * sizeof(uint32_t)),
+       m_download_buffer(graphics, scheduler, MemoryUsage::Download, 0, AllFlags,
+                         MaxPendingFaults * PageFaultAreaSize) {
+ 	SetVulkanObjectNameF(m_graphics.device, m_fault_buffer.Handle(), "Fault Buffer");
+@@ -79,7 +84,16 @@ FaultManager::~FaultManager() {
+ 	m_graphics.device.destroyDescriptorSetLayout(m_fault_process_desc_layout, nullptr);
+ }
+ 
++void FaultManager::InitializeFaultBuffer() {
++	if (m_fault_buffer_initialized) return;
++	// A shader binding first reaches this method while the scheduler has an
++	// active command. Clear both bitsets before the guest shader can record faults.
++	m_fault_buffer.Fill(0, m_fault_buffer.Size(), 0);
++	m_fault_buffer_initialized = true;
++}
++
+ void FaultManager::ProcessFaultBuffer() {
++	InitializeFaultBuffer();
+ 	if (const auto wait_tick = m_fault_areas[m_current_area]; wait_tick != 0) {
+ 		m_scheduler.Wait(wait_tick);
+ 		m_scheduler.PopPendingOperations();
+@@ -94,7 +108,8 @@ void FaultManager::ProcessFaultBuffer() {
+ 	pre_barrier.srcStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
+ 	pre_barrier.srcAccessMask = vk::AccessFlagBits2::eShaderWrite;
+ 	pre_barrier.dstStageMask  = vk::PipelineStageFlagBits2::eComputeShader;
+-	pre_barrier.dstAccessMask = vk::AccessFlagBits2::eShaderRead;
++	pre_barrier.dstAccessMask = vk::AccessFlagBits2::eShaderRead |
++	                            vk::AccessFlagBits2::eShaderWrite;
+ 	pre_barrier.buffer        = m_fault_buffer.Handle();
+ 	pre_barrier.offset        = 0;
+ 	pre_barrier.size           = m_fault_buffer.Size();
+@@ -126,7 +141,7 @@ void FaultManager::ProcessFaultBuffer() {
+ 	command.bindPipeline(vk::PipelineBindPoint::eCompute, m_fault_process_pipeline);
+ 	command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute,
+ 	                             m_fault_process_pipeline_layout, 0, writes);
+-	const auto num_threads    = BufferCache::CACHING_NUMPAGES / 32;
++	const auto num_threads    = SummaryWordCount;
+ 	const auto num_workgroups = (num_threads + 63) / 64;
+ 	command.dispatch(static_cast<uint32_t>(num_workgroups), 1, 1);
+ 	dependency.pBufferMemoryBarriers = &post_barrier;
+@@ -137,7 +152,8 @@ void FaultManager::ProcessFaultBuffer() {
+ 		m_download_buffer.Invalidate(offset, PageFaultAreaSize);
+ 		RangeSet    fault_ranges;
+ 		const auto* faults = std::bit_cast<const uint64_t*>(mapped);
+-		const auto  count  = static_cast<uint32_t>(faults[0]);
++		const auto  count  = std::min(static_cast<uint32_t>(faults[0]),
++		                             static_cast<uint32_t>(MaxPageFaults - 1));
+ 		for (uint32_t index = 1; index <= count; ++index) {
+ 			fault_ranges.Add(faults[index], BufferCache::CACHING_PAGESIZE);
+ 			LOGF("Accessed non-GPU cached memory at 0x%016" PRIx64 "\n", faults[index]);
+diff --git a/src/graphics/host_gpu/renderer/cache/faultManager.h b/src/graphics/host_gpu/renderer/cache/faultManager.h
+index 86dde24..f95b865 100644
+--- a/src/graphics/host_gpu/renderer/cache/faultManager.h
++++ b/src/graphics/host_gpu/renderer/cache/faultManager.h
+@@ -19,15 +19,17 @@ public:
+ 	~FaultManager();
+ 	KYTY_CLASS_NO_COPY(FaultManager);
+ 
+-	[[nodiscard]] Buffer* GetFaultBuffer() noexcept { return &m_fault_buffer; }
++	[[nodiscard]] Buffer* GetFaultBuffer() { InitializeFaultBuffer(); return &m_fault_buffer; }
+ 	void                  ProcessFaultBuffer();
+ 
+ private:
++	void InitializeFaultBuffer();
+ 	GraphicContext&                            m_graphics;
+ 	CommandScheduler&                          m_scheduler;
+ 	BufferCache&                               m_buffer_cache;
+ 	Buffer                                     m_fault_buffer;
+ 	Buffer                                     m_download_buffer;
++	bool                                       m_fault_buffer_initialized = false;
+ 	std::array<uint64_t, MaxPendingFaults>      m_fault_areas {};
+ 	uint32_t                                   m_current_area = 0;
+ 	vk::DescriptorSetLayout                    m_fault_process_desc_layout = nullptr;
+diff --git a/src/graphics/host_gpu/shaders/fault_buffer_process.comp b/src/graphics/host_gpu/shaders/fault_buffer_process.comp
+index 04a86ba..c6deb7e 100644
+--- a/src/graphics/host_gpu/shaders/fault_buffer_process.comp
++++ b/src/graphics/host_gpu/shaders/fault_buffer_process.comp
+@@ -19,17 +19,23 @@ layout(std430, binding = 1) buffer output_buf32 {
+ 
+ void main() {
+     const uint id = gl_GlobalInvocationID.x;
+-    uint word = fault_buffer[id];
+-    fault_buffer[id] = 0u;
+-    const uint base_bit = id * 32u;
+-    while (word != 0u) {
+-        const uint store_index = atomicAdd(download_buffer32[0], 1u) + 1u;
+-        if (store_index >= MAX_PAGE_FAULTS) {
+-            return;
++    const uint fault_words = (1u << (40u - CACHING_PAGEBITS)) / 32u;
++    // Each summary bit covers 32 ordinary fault words. Most passes contain
++    // no faults, so scan 1/32 as much device memory and skip all clean blocks.
++    uint blocks = atomicExchange(fault_buffer[fault_words + id], 0u);
++    while (blocks != 0u) {
++        const uint block = findLSB(blocks);
++        blocks &= blocks - 1u;
++        const uint word_index = id * 32u + block;
++        uint word = atomicExchange(fault_buffer[word_index], 0u);
++        while (word != 0u) {
++            const uint store_index = atomicAdd(download_buffer32[0], 1u) + 1u;
++            const uint bit = findLSB(word);
++            word &= word - 1u;
++            if (store_index < MAX_PAGE_FAULTS) {
++                const uint page = word_index * 32u + bit;
++                download_buffer[store_index] = uint64_t(page) << CACHING_PAGEBITS;
++            }
+         }
+-        const uint bit = findLSB(word);
+-        word &= word - 1;
+-        const uint page = base_bit + bit;
+-        download_buffer[store_index] = uint64_t(page) << CACHING_PAGEBITS;
+     }
+ }
+diff --git a/src/graphics/shader/recompiler/backend/spirv/spirvEmitterMemory.cpp b/src/graphics/shader/recompiler/backend/spirv/spirvEmitterMemory.cpp
+index d34aa6c..e4e668a 100644
+--- a/src/graphics/shader/recompiler/backend/spirv/spirvEmitterMemory.cpp
++++ b/src/graphics/shader/recompiler/backend/spirv/spirvEmitterMemory.cpp
+@@ -165,10 +165,26 @@ void RecordBdaFault(EmitterState& state, uint32_t page) {
+ 	    state, OpShiftLeftLogical, TypeU32(state), ConstantU32(state, 1),
+ 	    Binary(state, OpBitwiseAnd, TypeU32(state), page, ConstantU32(state, 31)));
+ 	const auto pointer = FaultElementPointer(state, word);
+-	const auto value   = state.builder.AllocateId();
+-	state.builder.AddFunction({OpLoad, TypeU32(state), value, pointer});
+-	state.builder.AddFunction(
+-	    {OpStore, pointer, Binary(state, OpBitwiseOr, TypeU32(state), value, bit)});
++	const auto ignored = state.builder.AllocateId();
++	state.builder.AddFunction({OpAtomicOr, TypeU32(state), ignored, pointer,
++	                           ConstantU32(state, ScopeDevice),
++	                           ConstantU32(state, MemorySemanticsNone), bit});
++	// Publish the owning 32-word block after the fault bit itself. The parser
++	// reads both after the shader-write/compute-read barrier in FaultManager.
++	constexpr uint32_t FaultWordCount = 1u << (40 - 14 - 5);
++	const auto summary_word = Binary(state, OpIAdd, TypeU32(state),
++	                                 ConstantU32(state, FaultWordCount),
++	                                 Binary(state, OpShiftRightLogical, TypeU32(state), word,
++	                                        ConstantU32(state, 5)));
++	const auto summary_bit = Binary(state, OpShiftLeftLogical, TypeU32(state),
++	                                ConstantU32(state, 1),
++	                                Binary(state, OpBitwiseAnd, TypeU32(state), word,
++	                                       ConstantU32(state, 31)));
++	const auto summary_pointer = FaultElementPointer(state, summary_word);
++	const auto summary_ignored = state.builder.AllocateId();
++	state.builder.AddFunction({OpAtomicOr, TypeU32(state), summary_ignored, summary_pointer,
++	                           ConstantU32(state, ScopeDevice),
++	                           ConstantU32(state, MemorySemanticsNone), summary_bit});
+ }
+ 
+ uint32_t GetBdaPointer(ValueEmitContext& ctx, uint32_t address) {
