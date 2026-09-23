@@ -1,0 +1,56 @@
+diff --git a/src/graphics/shader/shader.cpp b/src/graphics/shader/shader.cpp
+index bc8e414..91e7b15 100644
+--- a/src/graphics/shader/shader.cpp
++++ b/src/graphics/shader/shader.cpp
+@@ -18,6 +18,7 @@
+ #include "libs/errno.h"
+ 
+ #include <algorithm>
++#include <array>
+ #include <atomic>
+ #include <bit>
+ #include <cstdio>
+@@ -63,6 +64,9 @@ struct ShaderBinaryInfo {
+ 
+ static std::unique_ptr<std::unordered_map<uint64_t, ShaderMappedData>> g_shader_map;
+ static std::mutex                                                      g_shader_map_mutex;
++// Odd while a shader registration is changing the map, even when readers may
++// reuse a previously observed entry. This also invalidates per-thread entries.
++static std::atomic<uint64_t> g_shader_map_generation {0};
+ 
+ void ShaderInit() {
+ 	EXIT_IF(g_shader_map != nullptr);
+@@ -75,16 +79,32 @@ void ShaderMapUserData(uint64_t addr, const ShaderMappedData& data) {
+ 
+ 	std::scoped_lock lock(g_shader_map_mutex);
+ 
++	g_shader_map_generation.fetch_add(1, std::memory_order_acq_rel);
+ 	(*g_shader_map)[addr] = data;
++	g_shader_map_generation.fetch_add(1, std::memory_order_release);
+ }
+ 
+ static ShaderMappedData ShaderGetMappedData(uint64_t addr, const char* label) {
+ 	EXIT_IF(g_shader_map == nullptr);
++	struct RecentShader {
++		uint64_t addr = 0;
++		uint64_t generation = UINT64_MAX;
++		ShaderMappedData data {};
++	};
++	static thread_local std::array<RecentShader, 64> recent;
++	auto& last = recent[((addr >> 8u) ^ (addr >> 18u)) & (recent.size() - 1u)];
++	const auto generation = g_shader_map_generation.load(std::memory_order_acquire);
++	if ((generation & 1u) == 0 && last.addr == addr && last.generation == generation) {
++		return last.data;
++	}
+ 
+ 	std::scoped_lock lock(g_shader_map_mutex);
+ 
+ 	if (auto iter = g_shader_map->find(addr); iter != g_shader_map->end()) {
+-		return iter->second;
++		last.data = iter->second;
++		last.addr = addr;
++		last.generation = g_shader_map_generation.load(std::memory_order_acquire);
++		return last.data;
+ 	}
+ 
+ 	EXIT("%s shader=0x%016" PRIx64 " is missing from ShaderMap\n", label, addr);
