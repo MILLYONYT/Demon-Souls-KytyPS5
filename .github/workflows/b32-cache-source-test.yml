@@ -1,15 +1,16 @@
-name: Demon Souls Build 32 draw auto profile Windows test
+name: Demon Souls Build 32 SRT planner Windows test
 # The pinned source already provides fast buffer lookup and bind-time object naming control.
 
 on:
   push:
-    branches: [best32-draw-auto-profile-test]
+    branches: [best32-srt-planner-test]
     paths:
       - .github/workflows/b32-cache-source-test.yml
       - patches/enable-vulkan-cache.patch
       - patches/dispatch-diagnostics-fastpath.patch
       - patches/dispatch-hotpath.patch
       - patches/draw-auto-profile.patch
+      - patches/srt-planner-visited-set.patch
   workflow_dispatch:
 
 permissions:
@@ -35,7 +36,8 @@ jobs:
             "$env:GITHUB_WORKSPACE/patches/enable-vulkan-cache.patch",
             "$env:GITHUB_WORKSPACE/patches/dispatch-diagnostics-fastpath.patch",
             "$env:GITHUB_WORKSPACE/patches/dispatch-hotpath.patch",
-            "$env:GITHUB_WORKSPACE/patches/draw-auto-profile.patch"
+            "$env:GITHUB_WORKSPACE/patches/draw-auto-profile.patch",
+            "$env:GITHUB_WORKSPACE/patches/srt-planner-visited-set.patch"
           )
           foreach ($patch in $patches) {
             git -C source apply --3way --ignore-space-change --ignore-whitespace $patch
@@ -90,7 +92,7 @@ jobs:
       - name: Configure Release LTO
         shell: cmd
         run: |
-          cmake -S source -B _Build/windows -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=ON -DKYTY_BUILD_ORIGIN=Fork -DKYTY_BUILD_REPOSITORY=${{ github.repository }} -DKYTY_RELEASE_TAG=B32-DRAW-AUTO-PROFILE-${{ github.sha }} -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl "-DCMAKE_CXX_FLAGS=/DNOMINMAX /EHsc /DKYTY_B32_FRAME_PROFILE /DKYTY_B32_QUIET_HOT_LOGS /DKYTY_B32_BATCH_RESOURCE_GC /DKYTY_B32_FORCE_SILENT_SHADER_DUMPS /DKYTY_B32_PHASE_PROFILE /DKYTY_B32_PM4_SAMPLE_PROFILE /DKYTY_B32_DISPATCH_STAGE_PROFILE /DKYTY_B32_BUFFER_LOOKUP_PROFILE /DKYTY_B32_INDIRECT_PROFILE /DKYTY_B32_QUEUE_LAG_PROFILE /DKYTY_B32_FAST_CPU_SETS /DKYTY_B32_FAST_BIND /DKYTY_B32_DRAW_AUTO_PROFILE" -DCMAKE_PREFIX_PATH="%Qt6_DIR%"
+          cmake -S source -B _Build/windows -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=ON -DKYTY_BUILD_ORIGIN=Fork -DKYTY_BUILD_REPOSITORY=${{ github.repository }} -DKYTY_RELEASE_TAG=B32-SRT-PLANNER-${{ github.sha }} -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl "-DCMAKE_CXX_FLAGS=/DNOMINMAX /EHsc /DKYTY_B32_FRAME_PROFILE /DKYTY_B32_QUIET_HOT_LOGS /DKYTY_B32_BATCH_RESOURCE_GC /DKYTY_B32_FORCE_SILENT_SHADER_DUMPS /DKYTY_B32_PHASE_PROFILE /DKYTY_B32_PM4_SAMPLE_PROFILE /DKYTY_B32_DISPATCH_STAGE_PROFILE /DKYTY_B32_BUFFER_LOOKUP_PROFILE /DKYTY_B32_INDIRECT_PROFILE /DKYTY_B32_QUEUE_LAG_PROFILE /DKYTY_B32_FAST_CPU_SETS /DKYTY_B32_FAST_BIND /DKYTY_B32_DRAW_AUTO_PROFILE" -DCMAKE_PREFIX_PATH="%Qt6_DIR%"
       - name: Verify pinned fast bind and cache markers
         shell: pwsh
         run: |
@@ -105,6 +107,8 @@ jobs:
           if (!$scheduler.Contains("HandleForFullBarrier().pipelineBarrier")) { throw "Batch barrier coalescing missing." }
           $draw = Get-Content "$env:GITHUB_WORKSPACE/source/src/graphics/host_gpu/renderer/renderDraw.cpp" -Raw
           if (!$draw.Contains("Build32 draw auto stages:")) { throw "Draw stage profiler missing." }
+          $srt = Get-Content "$env:GITHUB_WORKSPACE/source/src/graphics/shader/recompiler/ir/passes/SrtWalker.cpp" -Raw
+          if (!$srt.Contains("m_visited.contains(inst)")) { throw "SRT planner visited set missing." }
       - name: Build Windows app
         shell: cmd
         run: cmake --build _Build/windows --target launcher --parallel
@@ -126,6 +130,6 @@ jobs:
       - name: Upload Windows x64 test build
         uses: actions/upload-artifact@v4
         with:
-          name: DemonSouls-B32-DRAW-AUTO-PROFILE-Windows-x64-${{ github.run_number }}
+          name: DemonSouls-B32-SRT-PLANNER-Windows-x64-${{ github.run_number }}
           path: _Build/windows/install/**
           if-no-files-found: error

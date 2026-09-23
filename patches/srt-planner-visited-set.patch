@@ -1,0 +1,31 @@
+diff --git a/src/graphics/shader/recompiler/ir/passes/SrtWalker.cpp b/src/graphics/shader/recompiler/ir/passes/SrtWalker.cpp
+index 6a24d1b..97465d1 100644
+--- a/src/graphics/shader/recompiler/ir/passes/SrtWalker.cpp
++++ b/src/graphics/shader/recompiler/ir/passes/SrtWalker.cpp
+@@ -479,7 +479,7 @@ private:
+ 			Fail(use_pc, fmt::format("cyclic typed planning value {} without a phi",
+ 			                         ValueOpcodeName(inst->GetOpcode())));
+ 		}
+-		if (std::ranges::find(m_visited, inst) != m_visited.end()) {
++		if (m_visited.contains(inst)) {
+ 			return;
+ 		}
+ 		m_visiting.push_back(inst);
+@@ -487,7 +487,7 @@ private:
+ 			Collect(inst->Arg(index), use_pc);
+ 		}
+ 		m_visiting.pop_back();
+-		m_visited.push_back(inst);
++		m_visited.insert(inst);
+ 		if (!IsRawRead(m_program, *inst)) {
+ 			return;
+ 		}
+@@ -544,7 +544,7 @@ private:
+ 
+ 	Program&           m_program;
+ 	std::vector<Inst*> m_visiting;
+-	std::vector<Inst*> m_visited;
++	std::unordered_set<Inst*> m_visited;
+ 	std::vector<Patch> m_patches;
+ };
+ 
