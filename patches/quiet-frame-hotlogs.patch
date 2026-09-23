@@ -1,0 +1,114 @@
+diff --git a/src/graphics/presentation/window/window.cpp b/src/graphics/presentation/window/window.cpp
+index 1b358db..5cc532a 100644
+--- a/src/graphics/presentation/window/window.cpp
++++ b/src/graphics/presentation/window/window.cpp
+@@ -331,7 +331,7 @@ static void GameEventFinger([[maybe_unused]] const EventFinger& f) {
+ static void GameEventController([[maybe_unused]] const EventController& f) {
+ 	EXIT_NOT_IMPLEMENTED(f.remapped);
+ 
+-#ifdef KYTY_DBG_INPUT
++#if defined(KYTY_DBG_INPUT) && !defined(KYTY_B32_QUIET_HOT_LOGS)
+ 	if (f.added || f.removed) {
+ 		LOGF("Controller %s: %d, time = %.04f\n", (f.added ? "added" : "removed"), f.id,
+ 		     f.timestamp_seconds);
+diff --git a/src/kernel/memory.cpp b/src/kernel/memory.cpp
+index 9b38135..4e53aeb 100644
+--- a/src/kernel/memory.cpp
++++ b/src/kernel/memory.cpp
+@@ -53,6 +53,15 @@ namespace VirtualMemory = Common::VirtualMemory;
+ 
+ LIB_NAME("libkernel", "libkernel");
+ 
++// Keep failures visible while skipping high-volume mapping traces in FPS builds.
++#if defined(KYTY_B32_QUIET_HOT_LOGS)
++#define MEMORY_HOT_LOG(...) ((void)0)
++#define MEMORY_HOT_PRINT_NAME() ((void)0)
++#else
++#define MEMORY_HOT_LOG(...) LOGF(__VA_ARGS__)
++#define MEMORY_HOT_PRINT_NAME() PRINT_NAME()
++#endif
++
+ constexpr int PROT_CPU_READ  = 0x01;
+ constexpr int PROT_CPU_WRITE = 0x02;
+ constexpr int PROT_CPU_EXEC  = 0x04;
+@@ -2276,7 +2285,7 @@ static bool UnmapPooledBackingTransactional(const std::vector<PooledMemory::Mapp
+ 
+ int32_t KYTY_SYSV_ABI KernelMapNamedFlexibleMemory(void** addr_in_out, size_t len, int prot,
+                                                    int flags, const char* name) {
+-	PRINT_NAME();
++	MEMORY_HOT_PRINT_NAME();
+ 
+ 	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
+ 
+@@ -2395,7 +2404,7 @@ int32_t KYTY_SYSV_ABI KernelMapNamedFlexibleMemory(void** addr_in_out, size_t le
+ 		return KERNEL_ERROR_EBUSY;
+ 	}
+ 
+-	LOGF("\t in_addr  = 0x%016" PRIx64 "\n"
++	MEMORY_HOT_LOG("\t in_addr  = 0x%016" PRIx64 "\n"
+ 	     "\t out_addr = 0x%016" PRIx64 "\n"
+ 	     "\t size     = %" PRIu64 "\n"
+ 	     "\t mode     = %s\n"
+@@ -2989,7 +2998,7 @@ int KYTY_SYSV_ABI KernelCheckedReleaseDirectMemory(int64_t start, size_t len) {
+ 
+ int KYTY_SYSV_ABI KernelMapDirectMemory(void** addr, size_t len, int prot, int flags,
+                                         int64_t direct_memory_start, size_t alignment) {
+-	PRINT_NAME();
++	MEMORY_HOT_PRINT_NAME();
+ 
+ 	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
+ 
+@@ -3108,7 +3117,7 @@ int KYTY_SYSV_ABI KernelMapDirectMemory(void** addr, size_t len, int prot, int f
+ 		shared_reason = GuestBackingStore::GetFailureReasonName(shared_failure);
+ 	}
+ 
+-	LOGF("\t in_addr  = 0x%016" PRIx64 "\n"
++	MEMORY_HOT_LOG("\t in_addr  = 0x%016" PRIx64 "\n"
+ 	     "\t out_addr = 0x%016" PRIx64 "\n"
+ 	     "\t dmem     = 0x%016" PRIx64 "\n"
+ 	     "\t size     = 0x%016" PRIx64 "\n"
+@@ -3869,11 +3878,11 @@ int KYTY_SYSV_ABI KernelMtypeprotect(const void* addr, size_t len, int type, int
+ 
+ int KYTY_SYSV_ABI KernelBatchMap2(KernelBatchMapEntry* entries, int num_entries,
+                                   int* num_entries_out, int flags) {
+-	PRINT_NAME();
++	MEMORY_HOT_PRINT_NAME();
+ 
+ 	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
+ 
+-	LOGF("\t entries         = %p\n"
++	MEMORY_HOT_LOG("\t entries         = %p\n"
+ 	     "\t num_entries     = %d\n"
+ 	     "\t num_entries_out = %p\n"
+ 	     "\t flags           = 0x%08" PRIx32 "\n",
+@@ -3897,7 +3906,7 @@ int KYTY_SYSV_ABI KernelBatchMap2(KernelBatchMapEntry* entries, int num_entries,
+ 	for (int i = 0; i < num_entries; i++, processed++) {
+ 		auto* entry = &entries[i];
+ 
+-		LOGF("\t [%d] start = %p, offset = 0x%016" PRIx64 ", length = 0x%016" PRIx64
++		MEMORY_HOT_LOG("\t [%d] start = %p, offset = 0x%016" PRIx64 ", length = 0x%016" PRIx64
+ 		     ", prot = 0x%02" PRIx32 ", type = 0x%02" PRIx32 ", op = %d\n",
+ 		     i, entry->start, entry->offset, entry->length,
+ 		     static_cast<uint32_t>(entry->protection), static_cast<uint32_t>(entry->type),
+diff --git a/src/libs/agc.cpp b/src/libs/agc.cpp
+index 6c3c1b5..348d90a 100644
+--- a/src/libs/agc.cpp
++++ b/src/libs/agc.cpp
+@@ -635,7 +635,7 @@ int KYTY_SYSV_ABI AgcCreateShader(Shader** dst, void* header, const volatile voi
+ 	EXIT_NOT_IMPLEMENTED(header == nullptr);
+ 	EXIT_NOT_IMPLEMENTED(code == nullptr);
+ 
+-	LOGF("\t header = 0x%016" PRIx64 "\n"
++	AGC_ROUTINE_LOG("\t header = 0x%016" PRIx64 "\n"
+ 	     "\t code   = 0x%016" PRIx64 "\n",
+ 	     reinterpret_cast<uint64_t>(header), reinterpret_cast<uint64_t>(code));
+ 
+@@ -669,7 +669,7 @@ int KYTY_SYSV_ABI AgcCreateShader(Shader** dst, void* header, const volatile voi
+ 
+ 	auto base = reinterpret_cast<uint64_t>(code);
+ 
+-	LOGF("\t base   = 0x%016" PRIx64 "\n", base);
++	AGC_ROUTINE_LOG("\t base   = 0x%016" PRIx64 "\n", base);
+ 
+ 	ShaderMappedData map;
+ 	map.type                = static_cast<Prospero::ShaderBinaryType>(h->type);
