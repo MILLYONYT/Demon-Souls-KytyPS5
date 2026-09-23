@@ -1,0 +1,27 @@
+diff --git a/src/graphics/host_gpu/renderer/commandScheduler.cpp b/src/graphics/host_gpu/renderer/commandScheduler.cpp
+index 0e97769..a7b8eba 100644
+--- a/src/graphics/host_gpu/renderer/commandScheduler.cpp
++++ b/src/graphics/host_gpu/renderer/commandScheduler.cpp
+@@ -112,7 +112,8 @@ void CommandScheduler::CompleteDispatch() {
+ 	VulkanMemoryBarrier dependency {};
+ 	dependency.srcAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
+ 	dependency.dstAccessMask = dependency.srcAccessMask;
+-	m_command.Handle().pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
++	// This full dependency also covers the pending compute-chain access barrier.
++	m_command.HandleForFullBarrier().pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+ 	                                   vk::PipelineStageFlagBits::eAllCommands, {}, 1, &dependency,
+ 	                                   0, nullptr, 0, nullptr);
+ 	Flush();
+@@ -227,6 +228,12 @@ void CommandScheduler::Wait(uint64_t tick) {
+ }
+ 
+ void CommandScheduler::PopPendingOperations() {
++	// No retired callback needs a timeline query when the deferred queue is empty.
++	// A callback added after this check is handled at the next operation boundary.
++	{
++		std::lock_guard lock(m_operation_mutex);
++		if (m_pending_operations.empty()) return;
++	}
+ 	m_master.Refresh();
+ 	for (;;) {
+ 		PendingOperation operation;
