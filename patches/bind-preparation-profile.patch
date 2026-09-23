@@ -1,0 +1,82 @@
+diff --git a/src/graphics/host_gpu/renderer/pipeline/descriptors.cpp b/src/graphics/host_gpu/renderer/pipeline/descriptors.cpp
+index 56fcca2..103b653 100644
+--- a/src/graphics/host_gpu/renderer/pipeline/descriptors.cpp
++++ b/src/graphics/host_gpu/renderer/pipeline/descriptors.cpp
+@@ -31,6 +31,7 @@
+ #include <array>
+ #include <atomic>
+ #include <bit>
++#include <chrono>
+ #include <fmt/format.h>
+ #include <limits>
+ #include <span>
+@@ -832,8 +833,42 @@ void RenderExecutor::ResetBindings() {
+ PreparedBindings RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime) {
+ 	KYTY_PROFILER_FUNCTION();
+ 	EXIT_IF(!runtime);
++#if defined(KYTY_B32_BIND_PREP_PROFILE)
++	struct BindPrepStats {
++		uint32_t calls = 0;
++		uint32_t samples = 0;
++		std::array<double, 3> ms {};
++		std::array<uint64_t, 3> resources {};
++	};
++	static thread_local BindPrepStats stats;
++	if (stats.calls == 8192) {
++		LOGF("Build32 binding prepare: images_ms=%.2f samplers_ms=%.2f data_ms=%.2f "
++		     "images=%" PRIu64 " samplers=%" PRIu64 " buffers=%" PRIu64
++		     " samples=%u calls=%u (one in 32 calls)\n",
++		     stats.ms[0], stats.ms[1], stats.ms[2], stats.resources[0], stats.resources[1],
++		     stats.resources[2], stats.samples, stats.calls);
++		stats = {};
++	}
++	const bool sample = (++stats.calls & 31u) == 0;
++	using BindClock = std::chrono::steady_clock;
++	auto started = sample ? BindClock::now() : BindClock::time_point {};
++	const auto mark = [&](size_t stage) {
++		if (!sample) return;
++		const auto now = BindClock::now();
++		stats.ms[stage] += std::chrono::duration<double, std::milli>(now - started).count();
++		started = now;
++	};
++#endif
+ 	const auto& program  = *runtime.program;
+ 	const auto& snapshot = runtime.resources;
++#if defined(KYTY_B32_BIND_PREP_PROFILE)
++	if (sample) {
++		++stats.samples;
++		stats.resources[0] += program.info.images.size();
++		stats.resources[1] += program.info.samplers.size();
++		stats.resources[2] += program.info.buffers.size();
++	}
++#endif
+ 	PreparedBindings prepared;
+ 	prepared.runtime = &runtime;
+ 	prepared.images.reserve(program.info.images.size());
+@@ -842,10 +877,16 @@ PreparedBindings RenderExecutor::PrepareBindings(const ShaderStageRuntime& runti
+ 		BindImage(binding.image_id, binding.desc.type == TextureCache::BindingType::Storage);
+ 		prepared.images.push_back(std::move(binding));
+ 	}
++#if defined(KYTY_B32_BIND_PREP_PROFILE)
++	mark(0);
++#endif
+ 	prepared.samplers.reserve(program.info.samplers.size());
+ 	for (uint32_t i = 0; i < program.info.samplers.size(); i++) {
+ 		prepared.samplers.push_back(NativeSampler(m_context, program, i, snapshot.samplers[i]));
+ 	}
++#if defined(KYTY_B32_BIND_PREP_PROFILE)
++	mark(1);
++#endif
+ 	prepared.shader_data.reserve(program.bindings.ShaderDataDwords());
+ 	for (const auto reg: program.bindings.user_data_registers) {
+ 		prepared.shader_data.push_back(snapshot.user_data[reg - program.user_data_base]);
+@@ -855,6 +896,9 @@ PreparedBindings RenderExecutor::PrepareBindings(const ShaderStageRuntime& runti
+ 	        program.bindings, ShaderRecompiler::IR::DescriptorBindingKind::Gds) != nullptr) {
+ 		prepared.gds.buffer = m_context.GetBufferCache().GetGdsBuffer()->Handle();
+ 	}
++#if defined(KYTY_B32_BIND_PREP_PROFILE)
++	mark(2);
++#endif
+ 	return prepared;
+ }
+ 
