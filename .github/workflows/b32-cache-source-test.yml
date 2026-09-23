@@ -1,9 +1,9 @@
-name: Demon Souls Build 32 grouped bind cache Windows test
+name: Demon Souls Build 32 bind timing Windows test
 # The pinned source already provides fast buffer lookup and bind-time object naming control.
 
 on:
   push:
-    branches: [best32-grouped-bind-cache-test]
+    branches: [best32-bind-timing-test]
     paths:
       - .github/workflows/b32-cache-source-test.yml
       - patches/enable-vulkan-cache.patch
@@ -17,6 +17,7 @@ on:
       - patches/texture-residency-pressure-gc.patch
       - patches/srt-dense-memo.patch
       - patches/buffer-bind-64-way.patch
+      - patches/bind-preparation-profile.patch
   workflow_dispatch:
 
 permissions:
@@ -49,7 +50,8 @@ jobs:
             "$env:GITHUB_WORKSPACE/patches/dispatch-batch-128.patch",
             "$env:GITHUB_WORKSPACE/patches/texture-residency-pressure-gc.patch",
             "$env:GITHUB_WORKSPACE/patches/srt-dense-memo.patch",
-            "$env:GITHUB_WORKSPACE/patches/buffer-bind-64-way.patch"
+            "$env:GITHUB_WORKSPACE/patches/buffer-bind-64-way.patch",
+            "$env:GITHUB_WORKSPACE/patches/bind-preparation-profile.patch"
           )
           foreach ($patch in $patches) {
             git -C source apply --3way --ignore-space-change --ignore-whitespace $patch
@@ -104,7 +106,7 @@ jobs:
       - name: Configure Release LTO
         shell: cmd
         run: |
-          cmake -S source -B _Build/windows -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=ON -DKYTY_BUILD_ORIGIN=Fork -DKYTY_BUILD_REPOSITORY=${{ github.repository }} -DKYTY_RELEASE_TAG=B32-GROUPED-BIND-CACHE-${{ github.sha }} -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl "-DCMAKE_CXX_FLAGS=/DNOMINMAX /EHsc /DKYTY_B32_FRAME_PROFILE /DKYTY_B32_QUIET_HOT_LOGS /DKYTY_B32_BATCH_RESOURCE_GC /DKYTY_B32_FORCE_SILENT_SHADER_DUMPS /DKYTY_B32_PHASE_PROFILE /DKYTY_B32_FAST_CPU_SETS /DKYTY_B32_FAST_BIND" -DCMAKE_PREFIX_PATH="%Qt6_DIR%"
+          cmake -S source -B _Build/windows -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=ON -DKYTY_BUILD_ORIGIN=Fork -DKYTY_BUILD_REPOSITORY=${{ github.repository }} -DKYTY_RELEASE_TAG=B32-BIND-TIMING-${{ github.sha }} -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl "-DCMAKE_CXX_FLAGS=/DNOMINMAX /EHsc /DKYTY_B32_FRAME_PROFILE /DKYTY_B32_QUIET_HOT_LOGS /DKYTY_B32_BATCH_RESOURCE_GC /DKYTY_B32_FORCE_SILENT_SHADER_DUMPS /DKYTY_B32_PHASE_PROFILE /DKYTY_B32_FAST_CPU_SETS /DKYTY_B32_FAST_BIND /DKYTY_B32_BIND_PREP_PROFILE /DKYTY_B32_DISPATCH_STAGE_PROFILE /DKYTY_B32_DRAW_AUTO_PROFILE" -DCMAKE_PREFIX_PATH="%Qt6_DIR%"
       - name: Verify pinned fast bind and cache markers
         shell: pwsh
         run: |
@@ -127,6 +129,7 @@ jobs:
           if (!$agc.Contains("AGC_ROUTINE_LOG(")) { throw "Quiet shader creation path missing." }
           $bindings = Get-Content "$env:GITHUB_WORKSPACE/source/src/graphics/host_gpu/renderer/pipeline/descriptors.cpp" -Raw
           if (!$bindings.Contains("std::array<FindReuseEntry, 64> entries") -or !$bindings.Contains("FindReuseWays = 4")) { throw "Grouped binding cache entries missing." }
+          if (!$bindings.Contains("Build32 binding prepare: images_ms=")) { throw "Binding preparation timing missing." }
           if (!$scheduler.Contains("DispatchesPerSubmission = 128")) { throw "Dispatch batch size missing." }
           $texture = Get-Content "$env:GITHUB_WORKSPACE/source/src/graphics/host_gpu/renderer/cache/textureCache.cpp" -Raw
           if (!$texture.Contains("m_trigger_gc_memory = m_pressure_gc_memory")) { throw "Texture residency change missing." }
@@ -154,6 +157,6 @@ jobs:
       - name: Upload Windows x64 test build
         uses: actions/upload-artifact@v4
         with:
-          name: DemonSouls-B32-GROUPED-BIND-CACHE-Windows-x64-${{ github.run_number }}
+          name: DemonSouls-B32-BIND-TIMING-Windows-x64-${{ github.run_number }}
           path: _Build/windows/install/**
           if-no-files-found: error
