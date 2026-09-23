@@ -1,0 +1,169 @@
+diff --git a/src/graphics/shader/recompiler/ir/ShaderIR.h b/src/graphics/shader/recompiler/ir/ShaderIR.h
+index d2ac8f6..d10baa8 100644
+--- a/src/graphics/shader/recompiler/ir/ShaderIR.h
++++ b/src/graphics/shader/recompiler/ir/ShaderIR.h
+@@ -537,6 +537,7 @@ struct ResourcePlan {
+ 	uint32_t                      user_data_base  = 0;
+ 	uint32_t                      user_data_count = 64;
+ 	std::list<Inst>                     value_storage;
++	uint32_t                            memo_slot_count = 0;
+ 	std::shared_ptr<const LinearSrtPlan> linear_srt;
+ 	std::vector<MemoryInfo>             memory_info;
+ 	std::vector<DescriptorSource>       descriptor_sources;
+diff --git a/src/graphics/shader/recompiler/ir/Value.h b/src/graphics/shader/recompiler/ir/Value.h
+index dd00283..bb10302 100644
+--- a/src/graphics/shader/recompiler/ir/Value.h
++++ b/src/graphics/shader/recompiler/ir/Value.h
+@@ -111,6 +111,9 @@ public:
+ 	Inst& operator=(Inst&&)      = delete;
+ 
+ 	[[nodiscard]] ValueOpcode             GetOpcode() const;
++	static constexpr uint32_t             NoMemoSlot = UINT32_MAX;
++	[[nodiscard]] uint32_t                MemoSlot() const { return memo_slot; }
++	void                                  SetMemoSlot(uint32_t slot) { memo_slot = slot; }
+ 	[[nodiscard]] Type                    GetType() const;
+ 	[[nodiscard]] bool                    MayHaveSideEffects() const;
+ 	[[nodiscard]] bool                    HasUses() const;
+@@ -150,6 +153,7 @@ private:
+ 	void ClearArgs();
+ 
+ 	ValueOpcode         opcode;
++	uint32_t            memo_slot = NoMemoSlot;
+ 	uint64_t            flags;
+ 	Block*              parent = nullptr;
+ 	std::vector<Value>  args;
+diff --git a/src/graphics/shader/recompiler/ir/passes/ResourceMaterialization.cpp b/src/graphics/shader/recompiler/ir/passes/ResourceMaterialization.cpp
+index d398b24..37852d0 100644
+--- a/src/graphics/shader/recompiler/ir/passes/ResourceMaterialization.cpp
++++ b/src/graphics/shader/recompiler/ir/passes/ResourceMaterialization.cpp
+@@ -1231,6 +1231,7 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
+ 		}
+ 		auto& target =
+ 		    plan.value_storage.emplace_back(source->GetOpcode(), source->Flags<uint64_t>());
++		target.SetMemoSlot(plan.memo_slot_count++);
+ 		cloned.emplace(source, &target);
+ 		if (source->GetOpcode() == ValueOpcode::Phi) {
+ 			for (size_t index = 0; index < source->NumArgs(); index++) {
+diff --git a/src/graphics/shader/recompiler/ir/passes/SrtWalker.cpp b/src/graphics/shader/recompiler/ir/passes/SrtWalker.cpp
+index 97465d1..f25edf6 100644
+--- a/src/graphics/shader/recompiler/ir/passes/SrtWalker.cpp
++++ b/src/graphics/shader/recompiler/ir/passes/SrtWalker.cpp
+@@ -18,6 +18,7 @@
+ #include <cmath>
+ #include <cstring>
+ #include <fmt/format.h>
++#include <memory>
+ #include <unordered_map>
+ #include <unordered_set>
+ 
+@@ -601,6 +602,55 @@ private:
+ 	size_t m_size = 0;
+ };
+ 
++// ResourcePlan owns stable instruction objects. Slots assigned while cloning the
++// plan let the hot evaluator bypass pointer hashing for its own instructions.
++// Reuse arenas by nesting depth so the clean and active evaluators remain isolated.
++struct DenseMemoEntry {
++	const Inst* owner = nullptr;
++	uint64_t value = 0;
++	uint32_t generation = 0;
++};
++
++struct DenseMemoArena {
++	std::vector<DenseMemoEntry> entries;
++	uint32_t generation = 0;
++	void Advance() {
++		if (generation == UINT32_MAX) {
++			for (auto& entry : entries) entry.generation = 0;
++			generation = 0;
++		}
++		++generation;
++	}
++};
++
++struct DenseMemoStack {
++	std::vector<std::unique_ptr<DenseMemoArena>> arenas;
++	size_t depth = 0;
++	DenseMemoArena& Acquire() {
++		if (depth == arenas.size()) arenas.push_back(std::make_unique<DenseMemoArena>());
++		auto& arena = *arenas[depth++];
++		arena.Advance();
++		return arena;
++	}
++	void Release() { --depth; }
++};
++
++DenseMemoStack& MemoStack() {
++	thread_local DenseMemoStack stack;
++	return stack;
++}
++
++class DenseMemoLease {
++public:
++	DenseMemoLease() : m_arena(MemoStack().Acquire()) {}
++	~DenseMemoLease() { MemoStack().Release(); }
++	DenseMemoLease(const DenseMemoLease&) = delete;
++	DenseMemoLease& operator=(const DenseMemoLease&) = delete;
++	DenseMemoArena& Arena() const { return m_arena; }
++private:
++	DenseMemoArena& m_arena;
++};
++
+ class Evaluator {
+ public:
+ 	Evaluator(const ResourcePlan& program, const SrtRuntime& runtime,
+@@ -643,7 +693,6 @@ private:
+ 		}
+ 		if (!m_reserved) {
+ 			// Most draws evaluate only the descriptor slice of a much larger IR.
+-			m_cache.Reserve(std::min<size_t>(m_program.value_storage.size(), 256));
+ 			m_visiting.reserve(std::min<size_t>(m_program.value_storage.size(), 64));
+ 			m_reserved = true;
+ 		}
+@@ -651,9 +700,21 @@ private:
+ 		    inst->NumArgs() == 3 && inst->Arg(0).Resolve() == m_active_mask) {
+ 			return EvaluateWide(inst->Arg(1), result);
+ 		}
+-		if (m_cache.Find(inst, result)) {
+-			return true;
++		auto& arena = m_lease.Arena();
++		const auto slot = inst->MemoSlot();
++		const bool slotted = slot < m_program.memo_slot_count;
++		if (slotted && slot >= arena.entries.size()) arena.entries.resize(slot + 1);
++		bool dense = false;
++		if (slotted) {
++			const auto& entry = arena.entries[slot];
++			if (entry.generation != arena.generation) {
++				dense = true;
++			} else if (entry.owner == inst) {
++				result = entry.value;
++				return true;
++			}
+ 		}
++		if (!dense && m_cache.Find(inst, result)) return true;
+ 		if (std::ranges::find(m_visiting, inst) != m_visiting.end()) {
+ 			return false;
+ 		}
+@@ -664,7 +725,13 @@ private:
+ 		if (!evaluated) {
+ 			return false;
+ 		}
+-		m_cache.Insert(inst, out);
++		// A foreign plan's instruction can share a slot and recurse into an
++		// instruction from our plan. Never overwrite a slot claimed during that call.
++		if (dense && arena.entries[slot].generation != arena.generation) {
++			arena.entries[slot] = {inst, out, arena.generation};
++		} else {
++			m_cache.Insert(inst, out);
++		}
+ 		result = out;
+ 		return true;
+ 	}
+@@ -1140,6 +1207,7 @@ private:
+ 	std::span<const uint8_t>                  m_clean_flat_slots;
+ 	Evaluator*                                m_clean_evaluator = nullptr;
+ 	Value                                     m_active_mask;
++	DenseMemoLease                            m_lease;
+ 	EvaluationCache                           m_cache;
+ 	std::vector<const Inst*>                  m_visiting;
+ 	bool                                      m_reserved = false;
