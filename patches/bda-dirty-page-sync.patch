@@ -1,0 +1,126 @@
+diff --git a/src/graphics/host_gpu/memoryTracker.cpp b/src/graphics/host_gpu/memoryTracker.cpp
+index 2e433e1..01f1652 100644
+--- a/src/graphics/host_gpu/memoryTracker.cpp
++++ b/src/graphics/host_gpu/memoryTracker.cpp
+@@ -76,6 +76,22 @@ bool MemoryTracker::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
+ 	});
+ }
+ 
++void MemoryTracker::CollectCpuDirtyRanges(uint64_t vaddr, uint64_t size,
++                                          std::vector<GuestRange>& ranges) {
++	CheckNotInUploadCallback();
++	ranges.clear();
++	const auto end = GuestRange {vaddr, size}.End();
++	Iterate<true>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
++		std::scoped_lock lock(manager->lock);
++		manager->ForEachModifiedRange<DirtySource::Cpu, false>(
++		    manager->GetCpuAddr() + offset, bytes, [&](uint64_t dirty, uint64_t length) {
++			    const auto begin = std::max(vaddr, dirty);
++			    const auto finish = std::min(end, dirty + length);
++			    if (begin < finish) ranges.push_back({begin, finish - begin});
++		    });
++	});
++}
++
+ bool MemoryTracker::IsRegionGpuModified(uint64_t vaddr, uint64_t size) {
+ 	CheckNotInUploadCallback();
+ 	return Iterate<false>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+diff --git a/src/graphics/host_gpu/memoryTracker.h b/src/graphics/host_gpu/memoryTracker.h
+index de387a4..37db944 100644
+--- a/src/graphics/host_gpu/memoryTracker.h
++++ b/src/graphics/host_gpu/memoryTracker.h
+@@ -31,6 +31,9 @@ public:
+ 		return manager == nullptr ? 0 : manager->CpuModificationEpoch();
+ 	}
+ 	[[nodiscard]] bool IsRegionCpuModified(uint64_t vaddr, uint64_t size);
++	// Snapshot CPU-dirty pages before synchronizing buffers, without holding
++	// region locks across uploads or guest-memory reads.
++	void CollectCpuDirtyRanges(uint64_t vaddr, uint64_t size, std::vector<GuestRange>& ranges);
+ 	[[nodiscard]] bool IsRegionFullyGpuModified(uint64_t vaddr, uint64_t size);
+ 	[[nodiscard]] bool TryInvalidateCpuWriteWindow(uint64_t fault, uint64_t begin,
+ 	                                               uint64_t size) noexcept;
+diff --git a/src/graphics/host_gpu/renderer/cache/bufferCache.cpp b/src/graphics/host_gpu/renderer/cache/bufferCache.cpp
+index 1e28ae9..79caa24 100644
+--- a/src/graphics/host_gpu/renderer/cache/bufferCache.cpp
++++ b/src/graphics/host_gpu/renderer/cache/bufferCache.cpp
+@@ -880,27 +880,28 @@ void BufferCache::SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size) {
+ 		m_sync_stamps.assign(m_sync_buffers.size(), {});
+ 		m_sync_buffers_valid = true;
+ 	}
+-	const auto end = vaddr + size;
+-
+-	auto it = std::lower_bound(m_sync_buffers.begin(), m_sync_buffers.end(), vaddr,
+-	                           [](const SyncBuffer& buffer, uint64_t address) {
++	std::vector<GuestRange> dirty_ranges;
++	m_memory_tracker.CollectCpuDirtyRanges(vaddr, size, dirty_ranges);
++	for (const auto dirty : dirty_ranges) {
++		// A CPU write usually touches a few pages in a 4 MiB tracker region.
++		// Binary-search the registered buffers for those pages instead of
++		// checking every clean buffer whenever the region epoch changes.
++		auto it = std::lower_bound(m_sync_buffers.begin(), m_sync_buffers.end(), dirty.address,
++		                           [](const SyncBuffer& buffer, uint64_t address) {
+ 		                           return buffer.end <= address;
+-	                           });
+-	for (; it != m_sync_buffers.end() && it->start < end; ++it) {
+-		const auto start  = std::max(it->start, vaddr);
+-		const auto finish = std::min(it->end, end);
+-		if (start < finish) {
+-			SyncStamp* stamp = nullptr;
+-			uint64_t epoch = 0;
+-			{
+-				stamp = &m_sync_stamps[static_cast<size_t>(it - m_sync_buffers.begin())];
+-				epoch = m_memory_tracker.CpuModificationEpoch(start, finish - start);
+-				if (epoch != 0 && stamp->epoch == epoch && start >= stamp->begin && finish <= stamp->end) continue;
+-			}
++		                           });
++		for (; it != m_sync_buffers.end() && it->start < dirty.End(); ++it) {
++			const auto start = std::max(it->start, dirty.address);
++			const auto finish = std::min(it->end, dirty.End());
++			if (start >= finish) continue;
++			auto& stamp = m_sync_stamps[static_cast<size_t>(it - m_sync_buffers.begin())];
++			const auto epoch = m_memory_tracker.CpuModificationEpoch(start, finish - start);
++			if (epoch != 0 && stamp.epoch == epoch && start >= stamp.begin && finish <= stamp.end)
++				continue;
+ 			(void)SynchronizeBuffer(*it->buffer, start, finish - start, false, false);
+-			if (stamp != nullptr && epoch != 0 && m_sync_buffers_valid &&
++			if (epoch != 0 && m_sync_buffers_valid &&
+ 			    m_memory_tracker.CpuModificationEpoch(start, finish - start) == epoch) {
+-				*stamp = {start, finish, epoch};
++				stamp = {start, finish, epoch};
+ 			}
+ 		}
+ 	}
+diff --git a/tests/MemoryTrackerTests.cpp b/tests/MemoryTrackerTests.cpp
+index 057aaa8..47ad3be 100644
+--- a/tests/MemoryTrackerTests.cpp
++++ b/tests/MemoryTrackerTests.cpp
+@@ -294,6 +294,12 @@ void TestCpuDirtyUpload() {
+   Check(tracker.IsRegionCpuModified(address + 16, 32),
+         "new region was not CPU dirty");
+ 
++  std::vector<GuestRange> dirty_ranges;
++  tracker.CollectCpuDirtyRanges(address + 16, page_size + 32, dirty_ranges);
++  Check(dirty_ranges.size() == 1 && dirty_ranges[0].address == address + 16 &&
++            dirty_ranges[0].size == page_size + 32,
++        "dirty page snapshot did not clip to the requested range");
++
+   uint32_t ranges = 0;
+   bool uploaded = false;
+   tracker.ForEachUploadRange(
+@@ -309,7 +315,16 @@ void TestCpuDirtyUpload() {
+             Protection(memory) == PAGE_READONLY,
+         "upload did not clear CPU dirty state and arm protection");
+ 
++  tracker.CollectCpuDirtyRanges(address, page_size * 2, dirty_ranges);
++  Check(dirty_ranges.size() == 1 && dirty_ranges[0].address == address + page_size &&
++            dirty_ranges[0].size == page_size,
++        "dirty page snapshot revisited clean buffer pages");
++
+   tracker.MarkRegionAsCpuModified(address + 16, 32);
++  tracker.CollectCpuDirtyRanges(address, page_size * 2, dirty_ranges);
++  Check(dirty_ranges.size() == 1 && dirty_ranges[0].address == address &&
++            dirty_ranges[0].size == 2 * page_size,
++        "dirty page snapshot missed a newly dirtied page");
+   Check(tracker.IsRegionCpuModified(address, page_size) && IsWritable(memory),
+         "explicit CPU dirtiness did not release write protection");
+   tracker.UntrackMemory(address, page_size * 2);
