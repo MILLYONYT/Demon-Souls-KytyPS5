@@ -1,0 +1,86 @@
+diff --git a/src/graphics/host_gpu/renderer/pipeline/descriptors.cpp b/src/graphics/host_gpu/renderer/pipeline/descriptors.cpp
+index 462f775..dbfd458 100644
+--- a/src/graphics/host_gpu/renderer/pipeline/descriptors.cpp
++++ b/src/graphics/host_gpu/renderer/pipeline/descriptors.cpp
+@@ -28,6 +28,7 @@
+ #include "kernel/memory.h"
+ 
+ #include <algorithm>
++#include <array>
+ #include <atomic>
+ #include <bit>
+ #include <fmt/format.h>
+@@ -865,11 +866,17 @@ void RenderExecutor::FindBuffers(PreparedBindings& prepared) {
+ 	auto&       cache    = m_context.GetBufferCache();
+ 
+ #if defined(KYTY_B32_FAST_BIND)
+-	struct FindReuseStats {
+-		const ShaderStageRuntime* runtime = nullptr;
++	struct FindReuseEntry {
++		const void* program = nullptr;
++		const void* buffer_cache = nullptr;
+ 		uint64_t epoch = 0;
+ 		uint64_t fingerprint = 0;
++		std::vector<std::array<uint32_t, 4>> descriptors;
+ 		std::vector<PreparedBindings::BufferSource> sources;
++	};
++	struct FindReuseStats {
++		std::array<FindReuseEntry, 8> entries;
++		uint32_t next = 0;
+ 		uint64_t hits = 0;
+ 		uint64_t misses = 0;
+ 	};
+@@ -890,12 +897,22 @@ void RenderExecutor::FindBuffers(PreparedBindings& prepared) {
+ 		fingerprint ^= (static_cast<uint64_t>(value.dwords[3]) << 3u);
+ 	}
+ 	const auto epoch = cache.RegistrationEpoch();
+-	if (reuse.runtime == prepared.runtime && reuse.epoch == epoch &&
+-	    reuse.fingerprint == fingerprint &&
+-	    reuse.sources.size() == program.info.buffers.size()) {
+-		prepared.buffer_sources = reuse.sources;
+-		++reuse.hits;
+-		return;
++	for (const auto& entry: reuse.entries) {
++		if (entry.program == &program && entry.buffer_cache == &cache && entry.epoch == epoch &&
++		    entry.fingerprint == fingerprint &&
++		    entry.sources.size() == program.info.buffers.size() &&
++		    entry.descriptors.size() == snapshot.buffers.size() &&
++		    std::equal(entry.descriptors.begin(), entry.descriptors.end(),
++		               snapshot.buffers.begin(), [](const auto& cached, const auto& current) {
++			               return cached[0] == current.dwords[0] &&
++			                      cached[1] == current.dwords[1] &&
++			                      cached[2] == current.dwords[2] &&
++			                      cached[3] == current.dwords[3];
++		               })) {
++			prepared.buffer_sources = entry.sources;
++			++reuse.hits;
++			return;
++		}
+ 	}
+ #endif
+ 	prepared.buffer_sources.clear();
+@@ -915,10 +932,20 @@ void RenderExecutor::FindBuffers(PreparedBindings& prepared) {
+ 		prepared.buffer_sources.push_back({address, size, cache.FindBuffer(address, size)});
+ 	}
+ #if defined(KYTY_B32_FAST_BIND)
+-	reuse.runtime = prepared.runtime;
+-	reuse.epoch = epoch;
+-	reuse.fingerprint = fingerprint;
+-	reuse.sources = prepared.buffer_sources;
++	auto& entry = reuse.entries[reuse.next++ % reuse.entries.size()];
++	entry.program = &program;
++	entry.buffer_cache = &cache;
++	// FindBuffer may register a buffer. Capture the epoch after the lookups so
++	// the just-computed sources can be reused on the next identical binding.
++	entry.epoch = cache.RegistrationEpoch();
++	entry.fingerprint = fingerprint;
++	entry.descriptors.clear();
++	entry.descriptors.reserve(snapshot.buffers.size());
++	for (const auto& descriptor: snapshot.buffers) {
++		entry.descriptors.push_back({descriptor.dwords[0], descriptor.dwords[1],
++		                             descriptor.dwords[2], descriptor.dwords[3]});
++	}
++	entry.sources = prepared.buffer_sources;
+ 	++reuse.misses;
+ #endif
+ }
