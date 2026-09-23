@@ -1,0 +1,13 @@
+diff --git a/src/graphics/host_gpu/renderer/commandScheduler.cpp b/src/graphics/host_gpu/renderer/commandScheduler.cpp
+index a7b8eba..2307e34 100644
+--- a/src/graphics/host_gpu/renderer/commandScheduler.cpp
++++ b/src/graphics/host_gpu/renderer/commandScheduler.cpp
+@@ -105,7 +105,7 @@ CommandScheduler::CommandScheduler(RenderContext& context, GraphicContext& graph
+ void CommandScheduler::CompleteDispatch() {
+ 	// Expose command-processor/GPU overlap without a host fence. Bound the
+ 	// recording batch; resource retirement still uses the submission timeline.
+-	constexpr uint32_t DispatchesPerSubmission = 32;
++	constexpr uint32_t DispatchesPerSubmission = 128;
+ 	if (++m_recorded_dispatches < DispatchesPerSubmission) return;
+ 	CheckActive();
+ 	m_command.EndRendering();
