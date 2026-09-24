@@ -1,0 +1,132 @@
+diff --git a/src/graphics/guest_gpu/tile.h b/src/graphics/guest_gpu/tile.h
+index 6d2bab6..80334d9 100644
+--- a/src/graphics/guest_gpu/tile.h
++++ b/src/graphics/guest_gpu/tile.h
+@@ -86,6 +86,7 @@ struct TileMipLayout {
+ 	uint32_t padded_height = 0;
+ 	uint32_t tail_x        = 0;
+ 	uint32_t tail_y        = 0;
++	bool     operator==(const TileMipLayout&) const = default;
+ };
+ 
+ struct TileSurfaceLayout {
+diff --git a/src/graphics/host_gpu/renderer/cache/textureCache.cpp b/src/graphics/host_gpu/renderer/cache/textureCache.cpp
+index 35e4c7a..e867054 100644
+--- a/src/graphics/host_gpu/renderer/cache/textureCache.cpp
++++ b/src/graphics/host_gpu/renderer/cache/textureCache.cpp
+@@ -217,6 +217,10 @@ bool TextureCache::SameBacking(const ImageInfo& cached, const ImageInfo& request
+ 	if (cached.extent != requested.extent) {
+ 		return false;
+ 	}
++	if (cached.resources.levels < requested.resources.levels ||
++	    cached.resources.layers < requested.resources.layers) {
++		return false;
++	}
+ 	if (cached.samples != requested.samples) {
+ 		return false;
+ 	}
+@@ -900,6 +904,17 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
+ 		    ImageViewOps::FormatsCompatible(cached.info.pixel_format, requested.pixel_format)) {
+ 			return {ExpandImage(requested, cached_id)};
+ 		}
++		// Mip tails can expose more views without growing the guest allocation.
++		// Preserve GPU writes when expanding a compatible cached image.
++		if (requested.pixel_format == cached.info.pixel_format &&
++		    requested.type == cached.info.type && requested.resources > cached.info.resources &&
++		    (requested.data.size > cached.info.data.size ||
++		     (requested.data.size == cached.info.data.size &&
++		      requested.extent == cached.info.extent &&
++		      cached.info.resources.levels > 1 &&
++		      requested.resources.layers == cached.info.resources.layers))) {
++			return {ExpandImage(requested, cached_id)};
++		}
+ 		if (requested.pixel_format != cached.info.pixel_format ||
+ 		    requested.data.size <= cached.info.data.size) {
+ 			const auto result_id = merged_id ? merged_id : cached_id;
+@@ -909,9 +924,6 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
+ 			            ? result_id
+ 			            : ImageId {}};
+ 		}
+-		if (requested.type == cached.info.type && requested.resources > cached.info.resources) {
+-			return {ExpandImage(requested, cached_id)};
+-		}
+ 		EXIT("TextureCache: unresolvable equal-address image overlap, address=0x%016" PRIx64
+ 		     " requested=%ux%u "
+ 		     "cached=%ux%u requested_size=0x%016" PRIx64 " cached_size=0x%016" PRIx64
+diff --git a/src/graphics/host_gpu/renderer/pipeline/descriptors.cpp b/src/graphics/host_gpu/renderer/pipeline/descriptors.cpp
+index a4d44e3..665898d 100644
+--- a/src/graphics/host_gpu/renderer/pipeline/descriptors.cpp
++++ b/src/graphics/host_gpu/renderer/pipeline/descriptors.cpp
+@@ -336,13 +336,8 @@ static bool IsSupportedStorageTextureDescriptor(const ShaderRecompiler::IR::Imag
+ 	const bool supported_swizzle =
+ 	    IsValidImageSwizzle(swizzle) &&
+ 	    (swizzle == DstSel(4, 5, 6, 7) || !resource.read || resource.atomic);
+-	const auto max_mip = resource.r128 ? descriptor.LastLevel() : descriptor.MaxMip();
+-	const auto view_last_level =
+-	    resource.mip_mode == ShaderRecompiler::IR::ImageMipMode::DynamicStorage
+-	        ? descriptor.LastLevel()
+-	        : std::min(descriptor.LastLevel(), max_mip);
+ 	return (is_1d || is_1d_array || is_2d || is_2d_array || is_3d) && supported_tile &&
+-	       descriptor.BaseLevel() <= view_last_level && view_last_level <= max_mip &&
++	       descriptor.BaseLevel() <= descriptor.LastLevel() &&
+ 	       descriptor.MinLod() == 0 && supported_swizzle && descriptor.BCSwizzle() == 0 &&
+ 	       !descriptor.MsaaDepth();
+ }
+@@ -583,6 +578,22 @@ static ImageViewInfo TextureViewInfo(const ShaderRecompiler::IR::ImageResource&
+ 	return view;
+ }
+ 
++static bool TextureViewPreservesMipLayout(const TileSurfaceDescription& description,
++                                          uint32_t view_levels) {
++	if (description.levels > 16 || view_levels > 16) return false;
++	TileSurfaceLayout physical {};
++	TileSurfaceLayout view {};
++	auto view_description = description;
++	view_description.levels = view_levels;
++	return TileGetTiledTextureLayout(description, physical) &&
++	       TileGetTiledTextureLayout(view_description, view) &&
++	       physical.first_tail_level == view.first_tail_level &&
++	       physical.block_slice_size == view.block_slice_size &&
++	       physical.total_size == view.total_size &&
++	       std::equal(std::begin(physical.mips), std::begin(physical.mips) + description.levels,
++	                  std::begin(view.mips));
++}
++
+ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&   resource,
+                                               const ShaderRecompiler::IR::DescriptorValue& value) {
+ 	auto descriptor = DecodeNativeDescriptor<ShaderTextureResource>(value);
+@@ -656,6 +667,16 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
+ 	                             type == Prospero::ImageType::kColor2DArray ||
+ 	                             type == Prospero::ImageType::kColor2DMsaaArray;
+ 	const auto    image_layers = layered ? depth : 1u;
++	if (levels > physical_levels) {
++		const TileSurfaceDescription physical {
++		    format, tile, volume ? TileSurfaceDimension::Dim3D : TileSurfaceDimension::Dim2D,
++		    width, height, volume ? depth : 1u, physical_levels, image_layers};
++		if (!TextureViewPreservesMipLayout(physical, levels)) {
++			EXIT("unsupported texture mip view changes physical layout: base=%u last=%u max=%u "
++			     "extent=%ux%ux%u tile=%u\n", base_level, last_level, max_mip, width, height,
++			     depth, static_cast<uint32_t>(tile));
++		}
++	}
+ 	uint32_t      pitch        = 0;
+ 	TileSizeAlign size {};
+ 	const auto& limits    = m_context.GetGraphics().GetPhysicalDeviceProperties().limits;
+@@ -673,7 +694,7 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
+ 		size.size *= image_layers;
+ 	} else {
+ 		pitch = TileGetTexturePitch(format, width, tile);
+-		if (!TileGetTextureTotalSize(format, width, height, volume ? depth : image_layers, levels,
++		if (!TileGetTextureTotalSize(format, width, height, volume ? depth : image_layers, physical_levels,
+ 		                             tile, volume, size)) {
+ 			rejection = "footprint exceeds 32 bits";
+ 		}
+@@ -746,7 +767,7 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
+ 	    !desc.info.IsDepth()) {
+ 		TileSizeAlign metadata_size {};
+ 		(void)TileGetDccSize(width, height, volume ? depth : image_layers,
+-		                     desc.info.bytes_per_block, levels, tile, metadata_size,
++		                     desc.info.bytes_per_block, physical_levels, tile, metadata_size,
+ 		                     std::countr_zero(samples));
+ 		desc.info.metadata.kind          = ImageMetadataKind::Dcc;
+ 		desc.info.metadata.range         = {descriptor.MetaAddr() << 8u, metadata_size.size};
