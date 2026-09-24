@@ -1,0 +1,53 @@
+diff --git a/src/graphics/host_gpu/renderer/pipeline/descriptors.cpp b/src/graphics/host_gpu/renderer/pipeline/descriptors.cpp
+index 4439731..0324baa 100644
+--- a/src/graphics/host_gpu/renderer/pipeline/descriptors.cpp
++++ b/src/graphics/host_gpu/renderer/pipeline/descriptors.cpp
+@@ -598,16 +598,20 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
+ 	const auto type         = TextureType(descriptor);
+ 	const bool multisampled = IsMultisampledTexture(type);
+ 	const auto max_mip      = resource.r128 ? last_level : descriptor.MaxMip();
+-	const auto levels       = multisampled ? 1u : static_cast<uint32_t>(max_mip) + 1u;
+-	const bool dynamic_storage =
+-	    storage && resource.mip_mode == ShaderRecompiler::IR::ImageMipMode::DynamicStorage;
+-	const auto view_last_level =
+-	    !multisampled && !dynamic_storage ? std::min(last_level, max_mip) : last_level;
++	const auto physical_levels = multisampled ? 1u : static_cast<uint32_t>(max_mip) + 1u;
++	// Fixed IMAGE_STORE writes BASE_LEVEL only. Dynamic IMAGE_STORE_MIP may
++	// address the remaining view mips; preserve those in the physical allocation.
++	const bool single_storage_mip =
++	    storage && resource.mip_mode != ShaderRecompiler::IR::ImageMipMode::DynamicStorage;
++	const auto view_levels = multisampled || single_storage_mip
++	                             ? 1u
++	                             : static_cast<uint32_t>(last_level - base_level) + 1u;
++	const auto levels = multisampled ? 1u : std::max(physical_levels, base_level + view_levels);
+ 	const auto tile       = descriptor.TileMode();
+ 	const bool depth_tile = tile == Prospero::TileMode::kDepth;
+ 	const bool msaa_tile  = depth_tile || tile == Prospero::TileMode::kRenderTarget;
+ 	const bool msaa_array = type == Prospero::ImageType::kColor2DMsaaArray;
+-	if ((!multisampled && (base_level > view_last_level || view_last_level >= levels)) ||
++	if ((!multisampled && (base_level > last_level || base_level >= levels)) ||
+ 	    (multisampled &&
+ 	     (base_level != 0 || last_level == 0 || last_level > 3 || max_mip != last_level ||
+ 	      !msaa_tile || (descriptor.MsaaDepth() && !depth_tile) ||
+@@ -625,8 +629,6 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
+ 		     descriptor.fields[6], descriptor.fields[7]);
+ 	}
+ 	const auto samples = multisampled ? 1u << last_level : 1u;
+-	const auto view_levels =
+-	    multisampled ? 1u : static_cast<uint32_t>(view_last_level - base_level) + 1u;
+ 	const auto depth          = static_cast<uint32_t>(descriptor.Depth()) + 1u;
+ 	const auto format         = descriptor.Format();
+ 	const auto surface_format = TextureGetSurfaceFormatInfo(format);
+@@ -1056,11 +1058,7 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
+ 			}
+ 			binding.image_view = binding.mip_views.front();
+ 		} else {
+-			auto desc = binding.desc;
+-			if (desc.type == TextureCache::BindingType::Storage) {
+-				desc.view_info.level_count = 1;
+-			}
+-			binding.image_view = texture_cache.FindTexture(binding.image_id, desc);
++			binding.image_view = texture_cache.FindTexture(binding.image_id, binding.desc);
+ 		}
+ 		auto&      image   = texture_cache.GetImage(binding.image_id);
+ 		const bool storage = binding.desc.type == TextureCache::BindingType::Storage;
