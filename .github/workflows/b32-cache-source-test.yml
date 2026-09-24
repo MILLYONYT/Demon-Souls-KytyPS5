@@ -1,4 +1,4 @@
-name: Demon Souls Build 32 streamed mip and depth feedback Windows test
+name: Demon Souls Build 32 mip tail and WQM lane mask Windows test
 # The pinned source already provides fast buffer lookup and bind-time object naming control.
 
 on:
@@ -23,6 +23,8 @@ on:
       - patches/upstream-storage-mip-view.patch
       - patches/upstream-texture-min-lod.patch
       - patches/upstream-depth-feedback.patch
+      - patches/upstream-mip-tail-expand.patch
+      - patches/upstream-wqm-lane-mask.patch
   workflow_dispatch:
 
 permissions:
@@ -61,7 +63,9 @@ jobs:
             "$env:GITHUB_WORKSPACE/patches/buffer-cache-epoch-refresh.patch",
             "$env:GITHUB_WORKSPACE/patches/upstream-storage-mip-view.patch",
             "$env:GITHUB_WORKSPACE/patches/upstream-texture-min-lod.patch",
-            "$env:GITHUB_WORKSPACE/patches/upstream-depth-feedback.patch"
+            "$env:GITHUB_WORKSPACE/patches/upstream-depth-feedback.patch",
+            "$env:GITHUB_WORKSPACE/patches/upstream-mip-tail-expand.patch",
+            "$env:GITHUB_WORKSPACE/patches/upstream-wqm-lane-mask.patch"
           )
           foreach ($patch in $patches) {
             git -C source apply --3way --ignore-space-change --ignore-whitespace $patch
@@ -116,7 +120,7 @@ jobs:
       - name: Configure Release LTO
         shell: cmd
         run: |
-          cmake -S source -B _Build/windows -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=ON -DKYTY_BUILD_ORIGIN=Fork -DKYTY_BUILD_REPOSITORY=${{ github.repository }} -DKYTY_RELEASE_TAG=B32-STREAMED-MIP-DEPTH-FEEDBACK-${{ github.sha }} -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl "-DCMAKE_CXX_FLAGS=/DNOMINMAX /EHsc /DKYTY_B32_FRAME_PROFILE /DKYTY_B32_QUIET_HOT_LOGS /DKYTY_B32_BATCH_RESOURCE_GC /DKYTY_B32_FORCE_SILENT_SHADER_DUMPS /DKYTY_B32_PHASE_PROFILE /DKYTY_B32_FAST_CPU_SETS /DKYTY_B32_FAST_BIND" -DCMAKE_PREFIX_PATH="%Qt6_DIR%"
+          cmake -S source -B _Build/windows -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=ON -DKYTY_BUILD_ORIGIN=Fork -DKYTY_BUILD_REPOSITORY=${{ github.repository }} -DKYTY_RELEASE_TAG=B32-MIP-TAIL-WQM-MASK-${{ github.sha }} -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl "-DCMAKE_CXX_FLAGS=/DNOMINMAX /EHsc /DKYTY_B32_FRAME_PROFILE /DKYTY_B32_QUIET_HOT_LOGS /DKYTY_B32_BATCH_RESOURCE_GC /DKYTY_B32_FORCE_SILENT_SHADER_DUMPS /DKYTY_B32_PHASE_PROFILE /DKYTY_B32_FAST_CPU_SETS /DKYTY_B32_FAST_BIND" -DCMAKE_PREFIX_PATH="%Qt6_DIR%"
       - name: Verify pinned fast bind and cache markers
         shell: pwsh
         run: |
@@ -150,6 +154,11 @@ jobs:
           if (!$view.Contains("ImageViewMinLodCreateInfoEXT")) { throw "Minimum LOD image views missing." }
           $depth = Get-Content "$env:GITHUB_WORKSPACE/source/src/graphics/host_gpu/renderer/renderDraw.cpp" -Raw
           if (!$depth.Contains("DepthFeedbackAspects(draw_writes") -or !$depth.Contains("setAttachmentFeedbackLoopEnableEXT(feedback_aspects)")) { throw "Cross-stage depth feedback missing." }
+          $texture = Get-Content "$env:GITHUB_WORKSPACE/source/src/graphics/host_gpu/renderer/cache/textureCache.cpp" -Raw
+          if (!$texture.Contains("cached.info.resources.levels > 1") -or !$texture.Contains("cached.resources.levels < requested.resources.levels")) { throw "Mip-tail image expansion missing." }
+          if (!$reuse.Contains("TextureViewPreservesMipLayout")) { throw "Mip-tail view layout guard missing." }
+          $wqm = Get-Content "$env:GITHUB_WORKSPACE/source/src/graphics/shader/recompiler/frontend/translate/Control.cpp" -Raw
+          if (!$wqm.Contains("const auto retained_live = ir.LogicalAnd(source_valid, source_live)")) { throw "WQM lane mask fix missing." }
           $draw = Get-Content "$env:GITHUB_WORKSPACE/source/src/graphics/host_gpu/renderer/renderDraw.cpp" -Raw
           if (!$draw.Contains("const auto  size   = sizes[i]")) { throw "Vertex descriptor size reuse missing." }
           if (!$scheduler.Contains("DispatchesPerSubmission = 128")) { throw "Dispatch batch size missing." }
@@ -179,7 +188,7 @@ jobs:
       - name: Upload Windows x64 test build
         uses: actions/upload-artifact@v4
         with:
-          name: DemonSouls-B32-STREAMED-MIP-DEPTH-FEEDBACK-Windows-x64-${{ github.run_number }}
+          name: DemonSouls-B32-MIP-TAIL-WQM-MASK-Windows-x64-${{ github.run_number }}
           path: _Build/windows/install/**
           if-no-files-found: error
 
