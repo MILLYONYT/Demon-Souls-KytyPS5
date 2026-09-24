@@ -1,0 +1,41 @@
+diff --git a/src/graphics/host_gpu/renderer/cache/samplerCache.cpp b/src/graphics/host_gpu/renderer/cache/samplerCache.cpp
+index ca010ea..48080e2 100644
+--- a/src/graphics/host_gpu/renderer/cache/samplerCache.cpp
++++ b/src/graphics/host_gpu/renderer/cache/samplerCache.cpp
+@@ -4,6 +4,10 @@
+ #include "common/logging/log.h"
+ #include "graphics/guest_gpu/gpu_defs.h"
+ #include "graphics/host_gpu/renderer/renderContext.h"
++#include "loader/systemContent.h"
++
++#include <algorithm>
++#include <string>
+ 
+ namespace Libs::Graphics {
+ 
+@@ -149,6 +153,25 @@ vk::Sampler SamplerCache::GetSampler(const ShaderSamplerResource& r) {
+ 		sampler_info.mipLodBias       = 0.0f;
+ 	}
+ 
++#if defined(KYTY_B32_HALF_TEXTURE_LOD)
++	static const bool demon_souls = [] {
++		std::string title_id;
++		return Loader::SystemContentParamSfoGetString("TITLE_ID", &title_id) &&
++		       title_id == "PPSA01342";
++	}();
++	// One extra mip halves the sampled texture dimensions. Leave non-mipmapped,
++	// shadow-comparison and unnormalized samplers alone; their LOD has other uses.
++	if (demon_souls &&
++	    static_cast<Prospero::SamplerMipFilter>(mip_filter) != Prospero::SamplerMipFilter::kNone &&
++	    max_lod >= min_lod + 1.0f && !r.ForceUnormCoords() && !sampler_info.compareEnable) {
++		const float max_bias = m_graphics.GetPhysicalDeviceProperties().limits.maxSamplerLodBias;
++		sampler_info.mipLodBias = std::min(sampler_info.mipLodBias + 1.0f, max_bias);
++		if (sampler_info.anisotropyEnable) {
++			sampler_info.maxAnisotropy = std::min(sampler_info.maxAnisotropy, 2.0f);
++		}
++	}
++#endif
++
+ 	vk::Sampler vk_sampler = nullptr;
+ 	const auto  result     = m_graphics.device.createSampler(&sampler_info, nullptr, &vk_sampler);
+ 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess || vk_sampler == nullptr);
