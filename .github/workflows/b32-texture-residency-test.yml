@@ -5,7 +5,7 @@ on:
   push:
     branches: [best32-texture-residency-safeguard-test]
     paths:
-      - .github/workflows/b32-cache-source-test.yml
+      - .github/workflows/b32-texture-residency-test.yml
       - patches/enable-vulkan-cache.patch
       - patches/dispatch-diagnostics-fastpath.patch
       - patches/dispatch-hotpath.patch
