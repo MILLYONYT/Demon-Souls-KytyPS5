@@ -1,4 +1,4 @@
-name: Demon Souls Build 32 half texture LOD Windows test
+name: Demon Souls Build 32 volume fog and depth cutoff Windows test
 # The pinned source already provides fast buffer lookup and bind-time object naming control.
 
 on:
@@ -28,6 +28,7 @@ on:
       - patches/indirect-image-log-dedupe.patch
       - patches/async-pipeline-cache-checkpoint.patch
       - patches/half-texture-lod-experiment.patch
+      - patches/fog-volume-distance-experiment.patch
   workflow_dispatch:
 
 permissions:
@@ -71,7 +72,8 @@ jobs:
             "$env:GITHUB_WORKSPACE/patches/buffer-range-epoch-memo.patch",
             "$env:GITHUB_WORKSPACE/patches/indirect-image-log-dedupe.patch",
             "$env:GITHUB_WORKSPACE/patches/async-pipeline-cache-checkpoint.patch",
-            "$env:GITHUB_WORKSPACE/patches/half-texture-lod-experiment.patch"
+            "$env:GITHUB_WORKSPACE/patches/half-texture-lod-experiment.patch",
+            "$env:GITHUB_WORKSPACE/patches/fog-volume-distance-experiment.patch"
           )
           foreach ($patch in $patches) {
             git -C source apply --3way --ignore-space-change --ignore-whitespace $patch
@@ -126,7 +128,7 @@ jobs:
       - name: Configure Release LTO
         shell: cmd
         run: |
-          cmake -S source -B _Build/windows -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=ON -DKYTY_BUILD_ORIGIN=Fork -DKYTY_BUILD_REPOSITORY=${{ github.repository }} -DKYTY_RELEASE_TAG=B32-HALF-TEXTURE-LOD-${{ github.sha }} -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl "-DCMAKE_CXX_FLAGS=/DNOMINMAX /EHsc /DKYTY_B32_FRAME_PROFILE /DKYTY_B32_QUIET_HOT_LOGS /DKYTY_B32_BATCH_RESOURCE_GC /DKYTY_B32_FORCE_SILENT_SHADER_DUMPS /DKYTY_B32_PHASE_PROFILE /DKYTY_B32_FAST_CPU_SETS /DKYTY_B32_FAST_BIND /DKYTY_B32_HALF_TEXTURE_LOD" -DCMAKE_PREFIX_PATH="%Qt6_DIR%"
+          cmake -S source -B _Build/windows -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=ON -DKYTY_BUILD_ORIGIN=Fork -DKYTY_BUILD_REPOSITORY=${{ github.repository }} -DKYTY_RELEASE_TAG=B32-NO-VOLUME-FOG-SHORT-DISTANCE-${{ github.sha }} -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl "-DCMAKE_CXX_FLAGS=/DNOMINMAX /EHsc /DKYTY_B32_FRAME_PROFILE /DKYTY_B32_QUIET_HOT_LOGS /DKYTY_B32_BATCH_RESOURCE_GC /DKYTY_B32_FORCE_SILENT_SHADER_DUMPS /DKYTY_B32_PHASE_PROFILE /DKYTY_B32_FAST_CPU_SETS /DKYTY_B32_FAST_BIND /DKYTY_B32_HALF_TEXTURE_LOD /DKYTY_B32_NO_VOLUME_FOG /DKYTY_B32_SHORT_DISTANCE" -DCMAKE_PREFIX_PATH="%Qt6_DIR%"
       - name: Verify pinned fast bind and cache markers
         shell: pwsh
         run: |
@@ -165,6 +167,9 @@ jobs:
           if (!$reports.Contains("std::async(std::launch::async") -or !$reports.Contains("WriteDriverCacheFile(path, prefix, payload)")) { throw "Asynchronous pipeline cache checkpoint missing." }
           $sampler = Get-Content "$env:GITHUB_WORKSPACE/source/src/graphics/host_gpu/renderer/cache/samplerCache.cpp" -Raw
           if (!$sampler.Contains("KYTY_B32_HALF_TEXTURE_LOD") -or !$sampler.Contains("PPSA01342") -or !$sampler.Contains("mipLodBias + 1.0f")) { throw "Demon Souls half texture LOD test missing." }
+          $fog = Get-Content "$env:GITHUB_WORKSPACE/source/src/graphics/host_gpu/renderer/renderCompute.cpp" -Raw
+          if (!$fog.Contains("Build32 fog experiment: cleared RGBA16F volume") -or !$fog.Contains("thread_group_z == depth")) { throw "Volume fog bypass missing." }
+          if (!$reports.Contains("Build32 distance experiment: depth bounds") -or !$reports.Contains("distance_test_title")) { throw "Distant scene depth cutoff missing." }
           $view = Get-Content "$env:GITHUB_WORKSPACE/source/src/graphics/host_gpu/renderer/image/imageView.cpp" -Raw
           if (!$view.Contains("ImageViewMinLodCreateInfoEXT")) { throw "Minimum LOD image views missing." }
           $depth = Get-Content "$env:GITHUB_WORKSPACE/source/src/graphics/host_gpu/renderer/renderDraw.cpp" -Raw
@@ -199,6 +204,6 @@ jobs:
       - name: Upload Windows x64 test build
         uses: actions/upload-artifact@v4
         with:
-          name: DemonSouls-B32-HALF-TEXTURE-LOD-Windows-x64-${{ github.run_number }}
+          name: DemonSouls-B32-NO-VOLUME-FOG-SHORT-DISTANCE-Windows-x64-${{ github.run_number }}
           path: _Build/windows/install/**
           if-no-files-found: error
