@@ -1,9 +1,9 @@
-name: Demon Souls Build 32 shader metadata cache Windows test
+name: Demon Souls Build 32 PM4 hotspot Windows diagnostic
 # The pinned source already provides fast buffer lookup and bind-time object naming control.
 
 on:
   push:
-    branches: [best32-shader-map-cache-test]
+    branches: [best32-pm4-hotspot-diagnostic]
     paths:
       - .github/workflows/b32-cache-source-test.yml
       - patches/enable-vulkan-cache.patch
@@ -106,7 +106,7 @@ jobs:
       - name: Configure Release LTO
         shell: cmd
         run: |
-          cmake -S source -B _Build/windows -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=ON -DKYTY_BUILD_ORIGIN=Fork -DKYTY_BUILD_REPOSITORY=${{ github.repository }} -DKYTY_RELEASE_TAG=B32-SHADER-MAP-CACHE-${{ github.sha }} -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl "-DCMAKE_CXX_FLAGS=/DNOMINMAX /EHsc /DKYTY_B32_FRAME_PROFILE /DKYTY_B32_QUIET_HOT_LOGS /DKYTY_B32_BATCH_RESOURCE_GC /DKYTY_B32_FORCE_SILENT_SHADER_DUMPS /DKYTY_B32_PHASE_PROFILE /DKYTY_B32_FAST_CPU_SETS /DKYTY_B32_FAST_BIND" -DCMAKE_PREFIX_PATH="%Qt6_DIR%"
+          cmake -S source -B _Build/windows -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=ON -DKYTY_BUILD_ORIGIN=Fork -DKYTY_BUILD_REPOSITORY=${{ github.repository }} -DKYTY_RELEASE_TAG=B32-PM4-HOTSPOT-${{ github.sha }} -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl "-DCMAKE_CXX_FLAGS=/DNOMINMAX /EHsc /DKYTY_B32_FRAME_PROFILE /DKYTY_B32_QUIET_HOT_LOGS /DKYTY_B32_BATCH_RESOURCE_GC /DKYTY_B32_FORCE_SILENT_SHADER_DUMPS /DKYTY_B32_PHASE_PROFILE /DKYTY_B32_FAST_CPU_SETS /DKYTY_B32_FAST_BIND /DKYTY_B32_PM4_SAMPLE_PROFILE" -DCMAKE_PREFIX_PATH="%Qt6_DIR%"
       - name: Verify pinned fast bind and cache markers
         shell: pwsh
         run: |
@@ -131,6 +131,8 @@ jobs:
           if (!$bindings.Contains("std::array<FindReuseEntry, 64> entries") -or !$bindings.Contains("FindReuseWays = 4")) { throw "Grouped binding cache entries missing." }
           $shader = Get-Content "$env:GITHUB_WORKSPACE/source/src/graphics/shader/shader.cpp" -Raw
           if (!$shader.Contains("g_shader_map_generation") -or !$shader.Contains("std::array<RecentShader, 64>")) { throw "Shader metadata cache missing." }
+          $pm4 = Get-Content "$env:GITHUB_WORKSPACE/source/src/graphics/guest_gpu/graphicsRun.cpp" -Raw
+          if (!$pm4.Contains("Build32 PM4 sample: op=")) { throw "PM4 command profiler missing." }
           if (!$scheduler.Contains("DispatchesPerSubmission = 128")) { throw "Dispatch batch size missing." }
           $texture = Get-Content "$env:GITHUB_WORKSPACE/source/src/graphics/host_gpu/renderer/cache/textureCache.cpp" -Raw
           if (!$texture.Contains("m_trigger_gc_memory = m_pressure_gc_memory")) { throw "Texture residency change missing." }
@@ -152,12 +154,13 @@ jobs:
           assert b'Vulkan pipeline cache: initialized empty' in exe
           assert b'Vulkan pipeline cache: disabled (dirty build)' not in exe
           assert b'Build32 GPU thread profile:' in exe
+          assert b'Build32 PM4 sample: op=' in exe
           assert b'Build32 GPU worker priority: requested=highest' in exe
           print('Compatible cache and GPU optimization code compiled into executable')
           '@ | python -
       - name: Upload Windows x64 test build
         uses: actions/upload-artifact@v4
         with:
-          name: DemonSouls-B32-SHADER-MAP-CACHE-Windows-x64-${{ github.run_number }}
+          name: DemonSouls-B32-PM4-HOTSPOT-Windows-x64-${{ github.run_number }}
           path: _Build/windows/install/**
           if-no-files-found: error
