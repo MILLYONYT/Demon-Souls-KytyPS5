@@ -37,7 +37,7 @@ index 92fdf97..1e5b74d 100644
  	static_params.cull_front = !rect_list && mc.cull_front;
  	static_params.face       = mc.face;
 diff --git a/src/graphics/host_gpu/renderer/renderCompute.cpp b/src/graphics/host_gpu/renderer/renderCompute.cpp
-index 40833cd..f22c5d0 100644
+index 40833cd..023ee67 100644
 --- a/src/graphics/host_gpu/renderer/renderCompute.cpp
 +++ b/src/graphics/host_gpu/renderer/renderCompute.cpp
 @@ -24,6 +24,7 @@
@@ -99,8 +99,8 @@ index 40833cd..f22c5d0 100644
 +				    binding.desc.view_info.layer_count == 1) {
 +					const vk::ImageSubresourceRange full_volume {
 +					    vk::ImageAspectFlagBits::eColor, 0, 1, 0, depth};
-+					cache.ClearImage(buffer, binding.image_id, image.backing.format,
-+					                 full_volume, vk::ClearValue {});
++					cache.ClearImage(buffer, binding.image_id, full_volume,
++					                 vk::ClearValue {});
 +					cleared = true;
 +				}
 +			}
