@@ -1,0 +1,23 @@
+diff --git a/src/graphics/host_gpu/renderer/cache/textureCache.cpp b/src/graphics/host_gpu/renderer/cache/textureCache.cpp
+index fb204f6..35e4c7a 100644
+--- a/src/graphics/host_gpu/renderer/cache/textureCache.cpp
++++ b/src/graphics/host_gpu/renderer/cache/textureCache.cpp
+@@ -2187,13 +2187,15 @@ void TextureCache::RunGarbageCollector(uint64_t elapsed_submissions) {
+ 			}
+ 			if (owner->IsGpuModified()) {
+ 				const bool safe = SafeToDownload(*owner);
+-				if (safe && owner->info.IsTiled()) {
++				// The GPU image is the only current copy until a readback succeeds.
++				// Evicting an unresolvable image makes later texture reads lose pixels.
++				if (!safe || owner->info.IsTiled()) {
+ 					continue;
+ 				}
+-				if (safe && !pressured) {
++				if (!pressured) {
+ 					continue;
+ 				}
+-				if (safe && !TryDownloadImage(id)) {
++				if (!TryDownloadImage(id)) {
+ 					continue;
+ 				}
+ 				owner->ClearGpuModified();
