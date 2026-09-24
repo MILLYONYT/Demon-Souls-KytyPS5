@@ -1,0 +1,33 @@
+diff --git a/src/graphics/host_gpu/renderer/image/image.cpp b/src/graphics/host_gpu/renderer/image/image.cpp
+index 9d4eaa4..0ee6a46 100644
+--- a/src/graphics/host_gpu/renderer/image/image.cpp
++++ b/src/graphics/host_gpu/renderer/image/image.cpp
+@@ -132,8 +132,12 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout                      destinat
+ 				constexpr auto write_access = vk::AccessFlagBits2::eTransferWrite |
+ 				                              vk::AccessFlagBits2::eShaderWrite |
+ 				                              vk::AccessFlagBits2::eMemoryWrite;
+-				const bool     repeated_write =
+-				    static_cast<bool>(subresource_state.access_mask & write_access);
++				constexpr auto attachment_write = vk::AccessFlagBits2::eColorAttachmentWrite |
++				                                  vk::AccessFlagBits2::eDepthStencilAttachmentWrite;
++				const bool repeated_write =
++				    static_cast<bool>(subresource_state.access_mask & write_access) ||
++				    (static_cast<bool>(subresource_state.access_mask & attachment_write) &&
++				     static_cast<bool>(destination_access & vk::AccessFlagBits2::eShaderRead));
+ 				if (subresource_state.layout != destination_layout ||
+ 				    subresource_state.access_mask != destination_access || repeated_write) {
+ 					vk::ImageMemoryBarrier2 barrier {};
+@@ -164,7 +168,12 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout                      destinat
+ 		constexpr auto write_access   = vk::AccessFlagBits2::eTransferWrite |
+ 		                                vk::AccessFlagBits2::eShaderWrite |
+ 		                                vk::AccessFlagBits2::eMemoryWrite;
+-		const bool     repeated_write = static_cast<bool>(state.access_mask & write_access);
++		constexpr auto attachment_write = vk::AccessFlagBits2::eColorAttachmentWrite |
++		                                  vk::AccessFlagBits2::eDepthStencilAttachmentWrite;
++		const bool repeated_write =
++		    static_cast<bool>(state.access_mask & write_access) ||
++		    (static_cast<bool>(state.access_mask & attachment_write) &&
++		     static_cast<bool>(destination_access & vk::AccessFlagBits2::eShaderRead));
+ 		if (state.layout == destination_layout && state.access_mask == destination_access &&
+ 		    !repeated_write) {
+ 			return {};
