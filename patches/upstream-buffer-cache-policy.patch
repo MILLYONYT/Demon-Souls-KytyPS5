@@ -1,0 +1,195 @@
+diff --git a/src/graphics/shader/recompiler/backend/spirv/SpirvEmitter.cpp b/src/graphics/shader/recompiler/backend/spirv/SpirvEmitter.cpp
+index 3f052b4..f0b1183 100644
+--- a/src/graphics/shader/recompiler/backend/spirv/SpirvEmitter.cpp
++++ b/src/graphics/shader/recompiler/backend/spirv/SpirvEmitter.cpp
+@@ -224,6 +224,7 @@ void AnalyzeProgramRequirements(IR::Program& program) {
+ 				}
+ 				const auto& memory = program.memory_info[memory_index];
+ 				if (memory.kind == IR::ResourceKind::Buffer) {
++					requirements.coherent_buffers |= memory.coherent;
+ 					if (memory.resource >= program.info.buffers.size()) {
+ 						Fail(program, "buffer operation has invalid resource metadata");
+ 					}
+diff --git a/src/graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h b/src/graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h
+index 689e993..0120b48 100644
+--- a/src/graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h
++++ b/src/graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h
+@@ -80,6 +80,7 @@ enum : uint32_t {
+ 	DecorationNoPerspective = 13,
+ 	DecorationFlat          = 14,
+ 	DecorationAliased       = 20,
++	DecorationCoherent      = 23,
+ 	DecorationLocation      = 30,
+ 	DecorationArrayStride   = 6,
+ 	DecorationBinding       = 33,
+@@ -288,6 +289,7 @@ enum : uint32_t {
+ 
+ enum : uint32_t {
+ 	MemoryAccessAlignedMask = 0x2,
++	MemoryAccessVolatileMask = 0x1,
+ };
+ 
+ enum : uint32_t {
+@@ -678,6 +680,7 @@ struct MemoryResourceAccess {
+ 	uint32_t         index_offset     = 0;
+ 	uint32_t         byte_offset      = 0;
+ 	bool             add_index_offset = false;
++	uint32_t         memory_access    = 0;
+ };
+ 
+ MemoryResourceAccess PrepareMemoryResourceAccess(EmitterState& state, const IR::MemoryInfo& mem);
+diff --git a/src/graphics/shader/recompiler/backend/spirv/spirvEmitterMemory.cpp b/src/graphics/shader/recompiler/backend/spirv/spirvEmitterMemory.cpp
+index d34aa6c..8e3c485 100644
+--- a/src/graphics/shader/recompiler/backend/spirv/spirvEmitterMemory.cpp
++++ b/src/graphics/shader/recompiler/backend/spirv/spirvEmitterMemory.cpp
+@@ -326,7 +326,8 @@ uint32_t LoadWordInBounds(ValueEmitContext& ctx, const MemoryResourceAccess& res
+                           uint32_t index) {
+ 	const auto value   = ctx.state.builder.AllocateId();
+ 	const auto pointer = EmitMemoryElementPointer(ctx.state, resource, index);
+-	ctx.state.builder.AddFunction({OpLoad, TypeU32(ctx.state), value, pointer});
++	ctx.state.builder.AddFunction(
++	    {OpLoad, TypeU32(ctx.state), value, pointer, resource.memory_access});
+ 	return value;
+ }
+ 
+@@ -516,14 +517,16 @@ void StoreWordPrepared(ValueEmitContext& ctx, const IR::Inst& inst, const IR::Me
+ 	EmitIfCondition(
+ 	    ctx.state, EmitMemoryElementInBounds(ctx.state, resource, index), [&]() {
+ 		    ctx.state.builder.AddFunction(
+-		        {OpStore, EmitMemoryElementPointer(ctx.state, resource, index), data});
++		        {OpStore, EmitMemoryElementPointer(ctx.state, resource, index), data,
++		         resource.memory_access});
+ 	    });
+ }
+ 
+ void StoreWordInBounds(ValueEmitContext& ctx, const MemoryResourceAccess& resource, uint32_t index,
+                        uint32_t data) {
+ 	ctx.state.builder.AddFunction(
+-	    {OpStore, EmitMemoryElementPointer(ctx.state, resource, index), data});
++	    {OpStore, EmitMemoryElementPointer(ctx.state, resource, index), data,
++	     resource.memory_access});
+ }
+ 
+ void StoreWord(ValueEmitContext& ctx, const IR::Inst& inst, IR::MemoryInfo mem) {
+diff --git a/src/graphics/shader/recompiler/backend/spirv/spirvEmitterMemoryHelpers.cpp b/src/graphics/shader/recompiler/backend/spirv/spirvEmitterMemoryHelpers.cpp
+index 0fa43c6..ba62b19 100644
+--- a/src/graphics/shader/recompiler/backend/spirv/spirvEmitterMemoryHelpers.cpp
++++ b/src/graphics/shader/recompiler/backend/spirv/spirvEmitterMemoryHelpers.cpp
+@@ -96,7 +96,9 @@ MemoryResourceAccess PrepareStorageBufferResourceAccess(EmitterState& state,
+ 	}
+ 	const auto array_index =
+ 	    ResourceForDescriptor(state, IR::DescriptorBindingKind::Buffers, mem.resource);
+-	MemoryResourceAccess access {.kind = mem.kind};
++	MemoryResourceAccess access {
++	    .kind = mem.kind,
++	    .memory_access = mem.coherent ? MemoryAccessVolatileMask : 0u};
+ 	access.object_pointer = state.builder.AllocateId();
+ 	state.builder.AddFunction({OpAccessChain, pointer_type, access.object_pointer, variable,
+ 	                           ConstantU32(state, array_index)});
+diff --git a/src/graphics/shader/recompiler/backend/spirv/spirvEmitterModule.cpp b/src/graphics/shader/recompiler/backend/spirv/spirvEmitterModule.cpp
+index 5f978fd..aba84d2 100644
+--- a/src/graphics/shader/recompiler/backend/spirv/spirvEmitterModule.cpp
++++ b/src/graphics/shader/recompiler/backend/spirv/spirvEmitterModule.cpp
+@@ -611,6 +611,16 @@ void AddDescriptorAnnotationsAndNames(EmitterState& state) {
+ 		state.builder.AddAnnotation(
+ 		    {OpDecorate, state.storage_buffer_u64_variable, DecorationAliased});
+ 	}
++	if (state.requirements.coherent_buffers) {
++		if (state.storage_buffer_variable != 0) {
++			state.builder.AddAnnotation(
++			    {OpDecorate, state.storage_buffer_variable, DecorationCoherent});
++		}
++		if (state.storage_buffer_u64_variable != 0) {
++			state.builder.AddAnnotation(
++			    {OpDecorate, state.storage_buffer_u64_variable, DecorationCoherent});
++		}
++	}
+ 	if (state.bda_pagetable_variable != 0) {
+ 		Decorate(state.bda_pagetable_variable, "bda_pagetable",
+ 		         IR::DescriptorBindingKind::BdaPagetable);
+diff --git a/src/graphics/shader/recompiler/frontend/decode/MemoryOps.cpp b/src/graphics/shader/recompiler/frontend/decode/MemoryOps.cpp
+index 75974ec..f200fb9 100644
+--- a/src/graphics/shader/recompiler/frontend/decode/MemoryOps.cpp
++++ b/src/graphics/shader/recompiler/frontend/decode/MemoryOps.cpp
+@@ -263,6 +263,7 @@ void DecodeMubuf(uint32_t pc, std::span<const uint32_t> code, uint32_t word_inde
+ 	inst.idxen       = ((word0 >> 13u) & 1u) != 0;
+ 	inst.offen       = ((word0 >> 12u) & 1u) != 0;
+ 	inst.glc         = ((word0 >> 14u) & 1u) != 0;
++	inst.dlc         = ((word0 >> 15u) & 1u) != 0;
+ 	inst.slc         = ((word1 >> 22u) & 1u) != 0;
+ 	inst.family      = Family::MUBUF;
+ 	inst.opcode_id   = opcode;
+@@ -298,6 +299,7 @@ void DecodeMtbuf(uint32_t pc, std::span<const uint32_t> code, uint32_t word_inde
+ 	inst.idxen         = ((word0 >> 13u) & 1u) != 0;
+ 	inst.offen         = ((word0 >> 12u) & 1u) != 0;
+ 	inst.glc           = ((word0 >> 14u) & 1u) != 0;
++	inst.dlc           = ((word0 >> 15u) & 1u) != 0;
+ 	inst.slc           = ((word1 >> 22u) & 1u) != 0;
+ 	inst.family        = Family::MTBUF;
+ 	inst.opcode_id     = opcode;
+diff --git a/src/graphics/shader/recompiler/frontend/decode/ShaderDecoder.cpp b/src/graphics/shader/recompiler/frontend/decode/ShaderDecoder.cpp
+index 8bf1bc3..416b994 100644
+--- a/src/graphics/shader/recompiler/frontend/decode/ShaderDecoder.cpp
++++ b/src/graphics/shader/recompiler/frontend/decode/ShaderDecoder.cpp
+@@ -77,11 +77,11 @@ std::string FormatMemory(const Instruction& inst) {
+ 		text += OperandToString(*sources[i]);
+ 	}
+ 	text += fmt::format(" ; offset={} offset2={} dwords={} bits={} dfmt={} nfmt={} signed={} "
+-	                    "typed={} formatted={} segment={} glc={} slc={} idxen={} offen={}",
++	                    "typed={} formatted={} segment={} glc={} dlc={} slc={} idxen={} offen={}",
+ 	                    inst.offset, inst.secondary_offset, inst.data_dwords, inst.data_bits,
+ 	                    inst.data_format, inst.number_format, inst.data_signed ? 1u : 0u,
+ 	                    inst.typed ? 1u : 0u, inst.formatted ? 1u : 0u, inst.memory_segment,
+-	                    inst.glc ? 1u : 0u, inst.slc ? 1u : 0u, inst.idxen ? 1u : 0u,
++	                    inst.glc ? 1u : 0u, inst.dlc ? 1u : 0u, inst.slc ? 1u : 0u, inst.idxen ? 1u : 0u,
+ 	                    inst.offen ? 1u : 0u);
+ 	return text;
+ }
+diff --git a/src/graphics/shader/recompiler/frontend/decode/ShaderDecoder.h b/src/graphics/shader/recompiler/frontend/decode/ShaderDecoder.h
+index b5c9c41..486d09e 100644
+--- a/src/graphics/shader/recompiler/frontend/decode/ShaderDecoder.h
++++ b/src/graphics/shader/recompiler/frontend/decode/ShaderDecoder.h
+@@ -695,6 +695,7 @@ struct Instruction {
+ 	bool           formatted                                    = false;
+ 	bool           gds                                          = false;
+ 	bool           glc                                          = false;
++	bool           dlc                                          = false;
+ 	bool           slc                                          = false;
+ 	bool           idxen                                        = false;
+ 	bool           offen                                        = false;
+diff --git a/src/graphics/shader/recompiler/frontend/translate/Memory.cpp b/src/graphics/shader/recompiler/frontend/translate/Memory.cpp
+index fa79a40..1d7ae6d 100644
+--- a/src/graphics/shader/recompiler/frontend/translate/Memory.cpp
++++ b/src/graphics/shader/recompiler/frontend/translate/Memory.cpp
+@@ -129,6 +129,11 @@ IR::MemoryInfo MemoryInfoFromDecoded(const Decoder::Instruction& decoded) {
+ 	memory.slc           = decoded.slc;
+ 	memory.idxen         = decoded.idxen;
+ 	memory.offen         = decoded.offen;
++	// Vector loads bypass L0/GL1 with GLC/DLC; atomic GLC only requests a return value.
++	const bool buffer_atomic = decoded.opcode >= Decoder::Opcode::BUFFER_ATOMIC_SWAP &&
++	                           decoded.opcode <= Decoder::Opcode::BUFFER_ATOMIC_FMAX;
++	memory.coherent = memory.kind == ResourceKind::Buffer && !buffer_atomic &&
++	                  (decoded.glc || decoded.dlc);
+ 	memory.resource      = ResourceIndexFromOperand(decoded.src1);
+ 	memory.sampler       = ResourceIndexFromOperand(decoded.src2);
+ 	if (memory.kind == ResourceKind::ScalarBuffer) {
+diff --git a/src/graphics/shader/recompiler/ir/ShaderIR.h b/src/graphics/shader/recompiler/ir/ShaderIR.h
+index d10baa8..e6f88c7 100644
+--- a/src/graphics/shader/recompiler/ir/ShaderIR.h
++++ b/src/graphics/shader/recompiler/ir/ShaderIR.h
+@@ -71,6 +71,7 @@ struct MemoryInfo {
+ 	bool                    slc                                                   = false;
+ 	bool                    idxen                                                 = false;
+ 	bool                    offen                                                 = false;
++	bool                    coherent                                              = false;
+ 	bool                    planning_only                                         = false;
+ 
+ 	bool operator==(const MemoryInfo& other) const = default;
+@@ -451,6 +452,7 @@ struct SpirvRequirements {
+ 	bool function_scratch             = false;
+ 	bool pixel_valid_mask             = false;
+ 	bool buffer_int64_atomics         = false;
++	bool coherent_buffers             = false;
+ };
+ 
+ struct BlockInfo {
