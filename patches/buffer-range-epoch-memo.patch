@@ -1,0 +1,74 @@
+diff --git a/src/graphics/host_gpu/renderer/cache/bufferCache.cpp b/src/graphics/host_gpu/renderer/cache/bufferCache.cpp
+index 1e28ae9..a58b3ae 100644
+--- a/src/graphics/host_gpu/renderer/cache/bufferCache.cpp
++++ b/src/graphics/host_gpu/renderer/cache/bufferCache.cpp
+@@ -374,9 +374,25 @@ BufferId BufferCache::FindBuffer(uint64_t vaddr, uint64_t size) {
+ 		return NULL_BUFFER_ID;
+ 	}
+ #if defined(KYTY_B32_FAST_BIND)
++	const auto slot = ((vaddr >> 12u) ^ (vaddr >> 21u) ^ size) &
++	                  (m_recent_buffers.size() - 1u);
++	auto& recent = m_recent_buffers[slot];
++	const auto remember = [&](BufferId id) {
++		recent = {vaddr, size, m_registration_epoch, id};
++	};
++	// Registration changes invalidate the ownership of every memoized range.
++	// An exact address and size match remains valid throughout one epoch.
++	if (recent.epoch == m_registration_epoch && recent.address == vaddr &&
++	    recent.size == size && recent.id) {
++#if defined(KYTY_B32_BUFFER_LOOKUP_PROFILE)
++		++stats.hits;
++#endif
++		return recent.id;
++	}
+ 	if (m_last_buffer) {
+ 		auto* last = m_slot_buffers.try_get(m_last_buffer);
+ 		if (last != nullptr && !last->is_deleted && last->IsInBounds(vaddr, size)) {
++			remember(m_last_buffer);
+ #if defined(KYTY_B32_BUFFER_LOOKUP_PROFILE)
+ 			++stats.hits;
+ 			++stats.last_id_hits;
+@@ -407,6 +423,7 @@ BufferId BufferCache::FindBuffer(uint64_t vaddr, uint64_t size) {
+ #endif
+ #if defined(KYTY_B32_FAST_BIND)
+ 			m_last_buffer = *owner;
++			remember(*owner);
+ #endif
+ 			return *owner;
+ 		}
+@@ -429,6 +446,7 @@ BufferId BufferCache::FindBuffer(uint64_t vaddr, uint64_t size) {
+ #endif
+ #if defined(KYTY_B32_FAST_BIND)
+ 	m_last_buffer = id;
++	remember(id);
+ #endif
+ 	return id;
+ }
+diff --git a/src/graphics/host_gpu/renderer/cache/bufferCache.h b/src/graphics/host_gpu/renderer/cache/bufferCache.h
+index cc9e511..96e4382 100644
+--- a/src/graphics/host_gpu/renderer/cache/bufferCache.h
++++ b/src/graphics/host_gpu/renderer/cache/bufferCache.h
+@@ -11,6 +11,7 @@
+ #include "graphics/host_gpu/renderer/cache/multiLevelPageTable.h"
+ #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
+ 
++#include <array>
+ #include <map>
+ #include <span>
+ #include <utility>
+@@ -155,6 +156,15 @@ private:
+ 	uint64_t m_trigger_gc_memory  = 1ull * 1024 * 1024 * 1024;
+ 	uint64_t m_critical_gc_memory = 2ull * 1024 * 1024 * 1024;
+ 	uint64_t m_gc_tick            = 0;
++#if defined(KYTY_B32_FAST_BIND)
++	struct RecentBuffer {
++		uint64_t address = 0;
++		uint64_t size = 0;
++		uint64_t epoch = 0;
++		BufferId id {};
++	};
++	std::array<RecentBuffer, 64> m_recent_buffers {};
++#endif
+ };
+ 
+ } // namespace Libs::Graphics
