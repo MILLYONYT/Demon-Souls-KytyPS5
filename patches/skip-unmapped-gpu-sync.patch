@@ -1,0 +1,37 @@
+diff --git a/src/graphics/host_gpu/renderer/cache/gpuResourceManager.cpp b/src/graphics/host_gpu/renderer/cache/gpuResourceManager.cpp
+index 1a95c1e..b1b02c8 100644
+--- a/src/graphics/host_gpu/renderer/cache/gpuResourceManager.cpp
++++ b/src/graphics/host_gpu/renderer/cache/gpuResourceManager.cpp
+@@ -1,6 +1,9 @@
+ #include "graphics/host_gpu/renderer/cache/gpuResourceManager.h"
+ 
+ #include "common/assert.h"
++#include "common/logging/log.h"
++
++#include <atomic>
+ #include "graphics/guest_gpu/graphicsRun.h"
+ #include "graphics/host_gpu/renderer/commandScheduler.h"
+ #include "kernel/memory.h"
+@@ -106,6 +109,22 @@ void GpuResourceManager::MapMemory(uint64_t vaddr, uint64_t size) {
+ }
+ 
+ void GpuResourceManager::UnmapMemory(uint64_t vaddr, uint64_t size) {
++#if defined(KYTY_B32_SKIP_UNMAPPED_GPU_SYNC)
++	// A guest unmap with no GPU-owned pages has nothing to invalidate in either
++	// cache. Avoid queuing a synchronous GPU command and draining its timeline.
++	if (!GuestRange {vaddr, size}.Valid()) return;
++	{
++		std::shared_lock lock(m_mapped_ranges_mutex);
++		if (!m_mapped_ranges.Intersects(vaddr, size)) {
++			static std::atomic<uint64_t> skipped {0};
++			const auto count = skipped.fetch_add(1, std::memory_order_relaxed) + 1;
++			if (count == 1 || count == 4096 || count == 65536) {
++				LOGF("Build32 unmapped GPU sync skipped: count=%" PRIu64 "\n", count);
++			}
++			return;
++		}
++	}
++#endif
+ 	if (CommandScheduler::InDeferredOperation()) {
+ 		EXIT("unsupported memory unmap from an asynchronous GPU completion, "
+ 		     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",

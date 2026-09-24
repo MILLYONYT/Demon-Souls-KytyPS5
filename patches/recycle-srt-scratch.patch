@@ -1,0 +1,67 @@
+diff --git a/src/graphics/shader/recompiler/ir/passes/SrtWalker.cpp b/src/graphics/shader/recompiler/ir/passes/SrtWalker.cpp
+index f25edf6..4ef3672 100644
+--- a/src/graphics/shader/recompiler/ir/passes/SrtWalker.cpp
++++ b/src/graphics/shader/recompiler/ir/passes/SrtWalker.cpp
+@@ -1442,19 +1442,18 @@ static bool EvaluateLinearSrt(const LinearSrtPlan& plan,const SrtRuntime& runtim
+     } recycle{pool,values};
+     values.resize(plan.nodes.size());
+     if(!plan.function(&runtime,values.data())) return false;
+-    std::vector<DescriptorValue> evaluated(plan.descriptor_sizes.size());
++    results.resize(plan.descriptor_sizes.size());
+     size_t cursor=0;
+-    for(size_t i=0;i<evaluated.size();++i) {
+-        auto& output=evaluated[i];output.dword_count=plan.descriptor_sizes[i];
++    for(size_t i=0;i<results.size();++i) {
++        auto& output=results[i];output.dwords.fill(0);output.dword_count=plan.descriptor_sizes[i];
+         for(uint32_t j=0;j<output.dword_count;++j) {
+             const auto node=plan.descriptor_words[cursor++];
+             output.dwords[j]=node==UINT32_MAX ? 0u : static_cast<uint32_t>(values[node]);
+         }
+     }
+-    std::vector<uint32_t> flattened(plan.flat_words.size());
+-    for(size_t i=0;i<flattened.size();++i)
+-        if(plan.flat_words[i]!=UINT32_MAX)flattened[i]=static_cast<uint32_t>(values[plan.flat_words[i]]);
+-    results=std::move(evaluated);flat=std::move(flattened);
++    flat.resize(plan.flat_words.size());
++    for(size_t i=0;i<flat.size();++i)
++        flat[i]=plan.flat_words[i]==UINT32_MAX ? 0u : static_cast<uint32_t>(values[plan.flat_words[i]]);
+     if(plan.active_sources.empty())active_sources.assign(plan.active_count,1u);
+     else active_sources=plan.active_sources;
+     return true;
+diff --git a/src/graphics/shader/recompiler/ir/passes/ResourceMaterialization.cpp b/src/graphics/shader/recompiler/ir/passes/ResourceMaterialization.cpp
+index 37852d0..d0ad7b7 100644
+--- a/src/graphics/shader/recompiler/ir/passes/ResourceMaterialization.cpp
++++ b/src/graphics/shader/recompiler/ir/passes/ResourceMaterialization.cpp
+@@ -575,9 +575,30 @@ static bool MaterializeSnapshot(const ResourcePlan& program, const SrtRuntime& r
+ 	if (program.requires_specialization_memory && runtime.read_specialization_memory == nullptr) {
+ 		return fail("indirect image needs a specialization memory reader");
+ 	}
++	// Recycle per-draw scratch storage; nested reader callbacks lease separate vectors.
++	thread_local std::vector<std::vector<DescriptorValue>> descriptor_pool;
++	thread_local std::vector<std::vector<uint8_t>> source_mask_pool;
+ 	std::vector<DescriptorValue> values;
+-	std::vector<uint32_t>        flattened_srt;
+-	std::vector<uint8_t>         active_sources;
++	std::vector<uint8_t> active_sources;
++	if (!descriptor_pool.empty()) {
++		values = std::move(descriptor_pool.back());
++		descriptor_pool.pop_back();
++	}
++	if (!source_mask_pool.empty()) {
++		active_sources = std::move(source_mask_pool.back());
++		source_mask_pool.pop_back();
++	}
++	struct RecycleScratch {
++		std::vector<std::vector<DescriptorValue>>& descriptors;
++		std::vector<std::vector<uint8_t>>& masks;
++		std::vector<DescriptorValue>& values;
++		std::vector<uint8_t>& active;
++		~RecycleScratch() {
++			if (descriptors.size() < 8) descriptors.push_back(std::move(values));
++			if (masks.size() < 8) masks.push_back(std::move(active));
++		}
++	} recycle {descriptor_pool, source_mask_pool, values, active_sources};
++	std::vector<uint32_t> flattened_srt;
+ 	if (!EvaluateRuntimeSources(program, program.materialization_sources, runtime, values,
+ 	                            flattened_srt, program.clean_flat_slots, active_sources)) {
+ 		return fail("a descriptor source did not evaluate");

@@ -1,4 +1,4 @@
-name: Demon Souls Build 32 fog overlay composite Windows test
+name: Demon Souls Build 32 best 94 CPU overhead experiment Windows test
 # The pinned source already provides fast buffer lookup and bind-time object naming control.
 
 on:
@@ -27,10 +27,8 @@ on:
       - patches/buffer-range-epoch-memo.patch
       - patches/indirect-image-log-dedupe.patch
       - patches/async-pipeline-cache-checkpoint.patch
-      - patches/half-texture-lod-experiment.patch
-      - patches/fog-volume-distance-experiment.patch
-      - patches/postfx-bloom-fog-test.patch
-      - patches/fog-overlay-composite-test.patch
+      - patches/skip-unmapped-gpu-sync.patch
+      - patches/recycle-srt-scratch.patch
   workflow_dispatch:
 
 permissions:
@@ -74,10 +72,8 @@ jobs:
             "$env:GITHUB_WORKSPACE/patches/buffer-range-epoch-memo.patch",
             "$env:GITHUB_WORKSPACE/patches/indirect-image-log-dedupe.patch",
             "$env:GITHUB_WORKSPACE/patches/async-pipeline-cache-checkpoint.patch",
-            "$env:GITHUB_WORKSPACE/patches/half-texture-lod-experiment.patch",
-            "$env:GITHUB_WORKSPACE/patches/fog-volume-distance-experiment.patch",
-            "$env:GITHUB_WORKSPACE/patches/postfx-bloom-fog-test.patch",
-            "$env:GITHUB_WORKSPACE/patches/fog-overlay-composite-test.patch"
+            "$env:GITHUB_WORKSPACE/patches/skip-unmapped-gpu-sync.patch",
+            "$env:GITHUB_WORKSPACE/patches/recycle-srt-scratch.patch"
           )
           foreach ($patch in $patches) {
             git -C source apply --3way --ignore-space-change --ignore-whitespace $patch
@@ -132,7 +128,7 @@ jobs:
       - name: Configure Release LTO
         shell: cmd
         run: |
-          cmake -S source -B _Build/windows -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=ON -DKYTY_BUILD_ORIGIN=Fork -DKYTY_BUILD_REPOSITORY=${{ github.repository }} -DKYTY_RELEASE_TAG=B32-FOG-OVERLAY-TEST-${{ github.sha }} -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl "-DCMAKE_CXX_FLAGS=/DNOMINMAX /EHsc /DKYTY_B32_FRAME_PROFILE /DKYTY_B32_QUIET_HOT_LOGS /DKYTY_B32_BATCH_RESOURCE_GC /DKYTY_B32_FORCE_SILENT_SHADER_DUMPS /DKYTY_B32_PHASE_PROFILE /DKYTY_B32_FAST_CPU_SETS /DKYTY_B32_FAST_BIND /DKYTY_B32_HALF_TEXTURE_LOD /DKYTY_B32_NO_VOLUME_FOG /DKYTY_B32_SHORT_DISTANCE /DKYTY_B32_NO_BLOOM_PYRAMID /DKYTY_B32_SKIP_FOG_OVERLAY" -DCMAKE_PREFIX_PATH="%Qt6_DIR%"
+          cmake -S source -B _Build/windows -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=ON -DKYTY_BUILD_ORIGIN=Fork -DKYTY_BUILD_REPOSITORY=${{ github.repository }} -DKYTY_RELEASE_TAG=B32-B94-CPU-OVERHEAD-${{ github.sha }} -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl "-DCMAKE_CXX_FLAGS=/DNOMINMAX /EHsc /DKYTY_B32_FRAME_PROFILE /DKYTY_B32_QUIET_HOT_LOGS /DKYTY_B32_BATCH_RESOURCE_GC /DKYTY_B32_FORCE_SILENT_SHADER_DUMPS /DKYTY_B32_PHASE_PROFILE /DKYTY_B32_FAST_CPU_SETS /DKYTY_B32_FAST_BIND /DKYTY_B32_SKIP_UNMAPPED_GPU_SYNC" -DCMAKE_PREFIX_PATH="%Qt6_DIR%"
       - name: Verify pinned fast bind and cache markers
         shell: pwsh
         run: |
@@ -169,13 +165,10 @@ jobs:
           $reports = Get-Content "$env:GITHUB_WORKSPACE/source/src/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp" -Raw
           if (!$reports.Contains("static thread_local std::unordered_set<uint64_t> reported")) { throw "Indirect image report deduplication missing." }
           if (!$reports.Contains("std::async(std::launch::async") -or !$reports.Contains("WriteDriverCacheFile(path, prefix, payload)")) { throw "Asynchronous pipeline cache checkpoint missing." }
-          $sampler = Get-Content "$env:GITHUB_WORKSPACE/source/src/graphics/host_gpu/renderer/cache/samplerCache.cpp" -Raw
-          if (!$sampler.Contains("KYTY_B32_HALF_TEXTURE_LOD") -or !$sampler.Contains("PPSA01342") -or !$sampler.Contains("mipLodBias + 1.0f")) { throw "Demon Souls half texture LOD test missing." }
-          $fog = Get-Content "$env:GITHUB_WORKSPACE/source/src/graphics/host_gpu/renderer/renderCompute.cpp" -Raw
-          if (!$fog.Contains("Build32 fog experiment: cleared RGBA16F volume") -or !$fog.Contains("thread_group_z == depth")) { throw "Volume fog bypass missing." }
-          if (!$reports.Contains("Build32 distance experiment: depth bounds") -or !$reports.Contains("distance_test_title")) { throw "Distant scene depth cutoff missing." }
-          if (!$fog.Contains("KYTY_B32_NO_BLOOM_PYRAMID") -or !$fog.Contains("fog_clear.color")) { throw "Postprocessing experiment missing." }
-          if (!$draw.Contains("KYTY_B32_SKIP_FOG_OVERLAY") -or !$draw.Contains("Build32 fog overlay candidate")) { throw "Fog overlay bypass missing." }
+          $gpu = Get-Content "$env:GITHUB_WORKSPACE/source/src/graphics/host_gpu/renderer/cache/gpuResourceManager.cpp" -Raw
+          if (!$gpu.Contains("Build32 unmapped GPU sync skipped")) { throw "Unmapped GPU sync bypass missing." }
+          $mat = Get-Content "$env:GITHUB_WORKSPACE/source/src/graphics/shader/recompiler/ir/passes/ResourceMaterialization.cpp" -Raw
+          if (!$mat.Contains("RecycleScratch") -or !$srt.Contains("results.resize(plan.descriptor_sizes.size())")) { throw "Recycled SRT scratch missing." }
           $view = Get-Content "$env:GITHUB_WORKSPACE/source/src/graphics/host_gpu/renderer/image/imageView.cpp" -Raw
           if (!$view.Contains("ImageViewMinLodCreateInfoEXT")) { throw "Minimum LOD image views missing." }
           $depth = Get-Content "$env:GITHUB_WORKSPACE/source/src/graphics/host_gpu/renderer/renderDraw.cpp" -Raw
@@ -210,6 +203,6 @@ jobs:
       - name: Upload Windows x64 test build
         uses: actions/upload-artifact@v4
         with:
-          name: DemonSouls-B32-FOG-OVERLAY-TEST-Windows-x64-${{ github.run_number }}
+          name: DemonSouls-B32-B94-CPU-OVERHEAD-Windows-x64-${{ github.run_number }}
           path: _Build/windows/install/**
           if-no-files-found: error
