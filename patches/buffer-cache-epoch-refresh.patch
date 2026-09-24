@@ -1,0 +1,54 @@
+diff --git a/src/graphics/host_gpu/renderer/pipeline/descriptors.cpp b/src/graphics/host_gpu/renderer/pipeline/descriptors.cpp
+index 223b70a..4439731 100644
+--- a/src/graphics/host_gpu/renderer/pipeline/descriptors.cpp
++++ b/src/graphics/host_gpu/renderer/pipeline/descriptors.cpp
+@@ -889,15 +889,16 @@ void RenderExecutor::FindBuffers(PreparedBindings& prepared) {
+ 		std::array<uint8_t, 16> next {};
+ 		uint64_t hits = 0;
+ 		uint64_t misses = 0;
++		uint64_t refreshes = 0;
+ 	};
+ 	static thread_local FindReuseStats reuse;
+ 	constexpr size_t FindReuseBucketCount = 16;
+ 	constexpr size_t FindReuseWays = 4;
+ 	if ((reuse.hits + reuse.misses) == 8192) {
+ 		LOGF("Build32 buffer find reuse: hits=%" PRIu64 " misses=%" PRIu64
+-		     " (same program + descriptors + cache epoch)\n",
+-		     reuse.hits, reuse.misses);
+-		reuse.hits = reuse.misses = 0;
++		     " refreshes=%" PRIu64 " (same program + descriptors)\n",
++		     reuse.hits, reuse.misses, reuse.refreshes);
++		reuse.hits = reuse.misses = reuse.refreshes = 0;
+ 	}
+ 	uint64_t fingerprint = program.info.buffers.size();
+ 	for (uint32_t i = 0; i < program.info.buffers.size(); ++i) {
+@@ -912,8 +913,8 @@ void RenderExecutor::FindBuffers(PreparedBindings& prepared) {
+ 	const auto bucket = (fingerprint ^ (reinterpret_cast<uintptr_t>(&program) >> 4u)) &
+ 	                    (FindReuseBucketCount - 1);
+ 	for (size_t way = 0; way < FindReuseWays; ++way) {
+-		const auto& entry = reuse.entries[bucket * FindReuseWays + way];
+-		if (entry.program == &program && entry.buffer_cache == &cache && entry.epoch == epoch &&
++		auto& entry = reuse.entries[bucket * FindReuseWays + way];
++		if (entry.program == &program && entry.buffer_cache == &cache &&
+ 		    entry.fingerprint == fingerprint &&
+ 		    entry.sources.size() == program.info.buffers.size() &&
+ 		    entry.descriptors.size() == snapshot.buffers.size() &&
+@@ -924,6 +925,18 @@ void RenderExecutor::FindBuffers(PreparedBindings& prepared) {
+ 			                      cached[2] == current.dwords[2] &&
+ 			                      cached[3] == current.dwords[3];
+ 		               })) {
++			// A registration elsewhere in the cache does not change the decoded
++			// descriptors. Refresh only their buffer IDs, keeping their clamped
++			// ranges and avoiding another descriptor decode and range clamp.
++			if (entry.epoch != epoch) {
++				for (auto& source: entry.sources) {
++					if (source.address != 0 && source.size != 0) {
++						source.id = cache.FindBuffer(source.address, source.size);
++					}
++				}
++				entry.epoch = cache.RegistrationEpoch();
++				++reuse.refreshes;
++			}
+ 			prepared.buffer_sources = entry.sources;
+ 			++reuse.hits;
+ 			return;
