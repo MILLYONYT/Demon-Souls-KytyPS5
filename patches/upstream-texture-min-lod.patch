@@ -1,0 +1,111 @@
+diff --git a/src/graphics/host_gpu/renderer/image/imageInfo.h b/src/graphics/host_gpu/renderer/image/imageInfo.h
+index e81173f..1aaafb9 100644
+--- a/src/graphics/host_gpu/renderer/image/imageInfo.h
++++ b/src/graphics/host_gpu/renderer/image/imageInfo.h
+@@ -186,6 +186,7 @@ struct ImageViewInfo {
+ 	vk::ImageAspectFlags aspect      = vk::ImageAspectFlagBits::eColor;
+ 	uint32_t             base_level  = 0;
+ 	uint32_t             level_count = 1;
++	uint32_t             min_lod     = 0; // U4.8 clamp relative to base_level.
+ 	uint32_t             base_layer  = 0;
+ 	uint32_t             layer_count = 1;
+ 	vk::ComponentMapping mapping     = {};
+@@ -194,7 +195,8 @@ struct ImageViewInfo {
+ 	[[nodiscard]] bool operator==(const ImageViewInfo& rhs) const noexcept {
+ 		return format == rhs.format && type == rhs.type && aspect == rhs.aspect &&
+ 		       base_level == rhs.base_level && level_count == rhs.level_count &&
+-		       base_layer == rhs.base_layer && layer_count == rhs.layer_count &&
++		       min_lod == rhs.min_lod && base_layer == rhs.base_layer &&
++		       layer_count == rhs.layer_count &&
+ 		       mapping.r == rhs.mapping.r && mapping.g == rhs.mapping.g &&
+ 		       mapping.b == rhs.mapping.b && mapping.a == rhs.mapping.a && usage == rhs.usage;
+ 	}
+diff --git a/src/graphics/host_gpu/renderer/image/imageView.cpp b/src/graphics/host_gpu/renderer/image/imageView.cpp
+index be455f0..b69f53a 100644
+--- a/src/graphics/host_gpu/renderer/image/imageView.cpp
++++ b/src/graphics/host_gpu/renderer/image/imageView.cpp
+@@ -362,6 +362,12 @@ vk::ImageView Image::FindView(const ImageViewInfo& view_info) {
+ 	if (!is_storage) {
+ 		usage.usage &= ~vk::ImageUsageFlagBits::eStorage;
+ 	}
++	vk::ImageViewMinLodCreateInfoEXT min_lod {};
++	if (normalized.min_lod != 0) {
++		min_lod.minLod = static_cast<float>(normalized.base_level) +
++		                 static_cast<float>(normalized.min_lod) / 256.0f;
++		usage.pNext = &min_lod;
++	}
+ 	vk::ImageViewCreateInfo create {};
+ 	create.pNext                           = &usage;
+ 	create.image                           = image.image;
+diff --git a/src/graphics/presentation/window/vulkanWindow.cpp b/src/graphics/presentation/window/vulkanWindow.cpp
+index 67a73f9..0985d18 100644
+--- a/src/graphics/presentation/window/vulkanWindow.cpp
++++ b/src/graphics/presentation/window/vulkanWindow.cpp
+@@ -206,7 +206,8 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
+ 
+ 		vk::PhysicalDeviceColorWriteEnableFeaturesEXT color_write_ext {};
+ 		color_write_ext.sType = vk::StructureType::ePhysicalDeviceColorWriteEnableFeaturesEXT;
+-		color_write_ext.pNext = nullptr;
++		vk::PhysicalDeviceImageViewMinLodFeaturesEXT image_view_min_lod {};
++		color_write_ext.pNext = &image_view_min_lod;
+ 
+ 		vk::PhysicalDeviceDepthClipEnableFeaturesEXT depth_clip_enable {};
+ 		depth_clip_enable.sType = vk::StructureType::ePhysicalDeviceDepthClipEnableFeaturesEXT;
+@@ -248,6 +249,10 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
+ 			skip_device = true;
+ #endif
+ 		}
++		if (image_view_min_lod.minLod != VK_TRUE) {
++			LOGF("image view minLod is not supported\n");
++			skip_device = true;
++		}
+ 
+ 		if (depth_clip_control.depthClipControl != VK_TRUE) {
+ 			LOGF("depthClipControl is not supported\n");
+@@ -583,13 +588,14 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
+ 
+ 	vk::PhysicalDeviceDepthClipControlFeaturesEXT depth_clip_control {};
+ 	depth_clip_control.sType = vk::StructureType::ePhysicalDeviceDepthClipControlFeaturesEXT;
++	vk::PhysicalDeviceImageViewMinLodFeaturesEXT image_view_min_lod {};
++	image_view_min_lod.minLod = VK_TRUE;
++	depth_clip_control.pNext = &image_view_min_lod;
+ 	// MoltenVK lacks VK_EXT_depth_clip_enable and VK_EXT_color_write_enable, so drop those
+ 	// feature structs from the chain on macOS (the renderer falls back to default depth
+ 	// clipping and static color-write masks).
+-#if defined(__APPLE__)
+-	depth_clip_control.pNext = nullptr;
+-#else
+-	depth_clip_control.pNext = &depth_clip_enable;
++#if !defined(__APPLE__)
++	image_view_min_lod.pNext = &depth_clip_enable;
+ #endif
+ 	depth_clip_control.depthClipControl = VK_TRUE;
+ 
+@@ -1097,7 +1103,8 @@ void WindowContext::CreateVulkan() {
+ 
+ 	std::vector<const char*> device_extensions = {
+ 	    VK_KHR_SWAPCHAIN_EXTENSION_NAME, VK_EXT_DEPTH_CLIP_CONTROL_EXTENSION_NAME,
+-	    VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME, "VK_KHR_maintenance1"};
++	    VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME, VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME,
++	    "VK_KHR_maintenance1"};
+ 
+ #if defined(__APPLE__)
+ 	// MoltenVK lacks VK_EXT_depth_clip_enable and VK_EXT_color_write_enable; the renderer
+diff --git a/src/graphics/host_gpu/renderer/pipeline/descriptors.cpp b/src/graphics/host_gpu/renderer/pipeline/descriptors.cpp
+--- a/src/graphics/host_gpu/renderer/pipeline/descriptors.cpp
++++ b/src/graphics/host_gpu/renderer/pipeline/descriptors.cpp
+@@ -524,6 +524,14 @@
+ 	view.aspect      = vk::ImageAspectFlagBits::eColor;
+ 	view.base_level  = descriptor.BaseLevel();
+ 	view.level_count = view_levels;
++	if (descriptor.MinLod() > descriptor.LastLevel() * 256u) {
++		EXIT("texture minimum LOD exceeds last mip level: min_lod=%u last_level=%u\n",
++		     descriptor.MinLod(), descriptor.LastLevel());
++	}
++	const auto base_lod = view.base_level * 256u;
++	if (descriptor.MinLod() > base_lod) {
++		view.min_lod = descriptor.MinLod() - base_lod;
++	}
+ 	view.usage = storage ? vk::ImageUsageFlagBits::eStorage : vk::ImageUsageFlagBits::eSampled;
+ 	view.mapping =
+ 	    storage || surface_format.conversion_format != Prospero::BufferFormat::kInvalid
