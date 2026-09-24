@@ -1,0 +1,211 @@
+diff --git a/src/graphics/guest_gpu/graphicsRun.cpp b/src/graphics/guest_gpu/graphicsRun.cpp
+index 64efe41..b471b23 100644
+--- a/src/graphics/guest_gpu/graphicsRun.cpp
++++ b/src/graphics/guest_gpu/graphicsRun.cpp
+@@ -1331,6 +1331,16 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
+ 		}
+ 	}
+ 
++	uint64_t index_size = 0;
++	if (indexed) {
++		switch (m_index_type_and_size) {
++			case 0: index_size = 2; break;
++			case 1: index_size = 4; break;
++			case 2: index_size = 1; break;
++			default: EXIT("unknown index_type_and_size: %u\n", m_index_type_and_size);
++		}
++	}
++
+ 	for (uint32_t i = 0; i < draw_count; i++) {
+ 		const auto args_addr = m_draw_indirect_args_base_addr + data_offset +
+ 		                       static_cast<uint64_t>(i) * stride_in_bytes;
+@@ -1370,14 +1380,6 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
+ 			}
+ 		}
+ 
+-		uint64_t index_size = 0;
+-		switch (m_index_type_and_size) {
+-			case 0: index_size = 2; break;
+-			case 1: index_size = 4; break;
+-			case 2: index_size = 1; break;
+-			default: EXIT("unknown index_type_and_size: %u\n", m_index_type_and_size);
+-		}
+-
+ 		auto* index_addr = reinterpret_cast<const void*>(
+ 		    m_index_base_addr + static_cast<uint64_t>(args->start_index_location) * index_size);
+ 
+diff --git a/src/graphics/host_gpu/renderer/pipeline/descriptors.cpp b/src/graphics/host_gpu/renderer/pipeline/descriptors.cpp
+index 56fcca2..223b70a 100644
+--- a/src/graphics/host_gpu/renderer/pipeline/descriptors.cpp
++++ b/src/graphics/host_gpu/renderer/pipeline/descriptors.cpp
+@@ -829,18 +829,27 @@ void RenderExecutor::ResetBindings() {
+ 	m_bound_images.clear();
+ }
+ 
+-PreparedBindings RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime) {
++void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
++                                     PreparedBindings& prepared) {
+ 	KYTY_PROFILER_FUNCTION();
+ 	EXIT_IF(!runtime);
+ 	const auto& program  = *runtime.program;
+ 	const auto& snapshot = runtime.resources;
+-	PreparedBindings prepared;
+ 	prepared.runtime = &runtime;
+-	prepared.images.reserve(program.info.images.size());
++	prepared.gds = {nullptr, 0, VK_WHOLE_SIZE};
++	prepared.flattened_srt = {};
++	prepared.shader_data_buffer = {};
++	prepared.buffer_sources.clear();
++	prepared.buffers.clear();
++	prepared.images.resize(program.info.images.size());
++	prepared.samplers.clear();
++	prepared.shader_data.clear();
+ 	for (uint32_t i = 0; i < program.info.images.size(); i++) {
+ 		auto binding = ResolveTexture(program.info.images[i], snapshot.images[i]);
+ 		BindImage(binding.image_id, binding.desc.type == TextureCache::BindingType::Storage);
+-		prepared.images.push_back(std::move(binding));
++		binding.mip_views.swap(prepared.images[i].mip_views);
++		binding.mip_views.clear();
++		prepared.images[i] = std::move(binding);
+ 	}
+ 	prepared.samplers.reserve(program.info.samplers.size());
+ 	for (uint32_t i = 0; i < program.info.samplers.size(); i++) {
+@@ -855,7 +864,6 @@ PreparedBindings RenderExecutor::PrepareBindings(const ShaderStageRuntime& runti
+ 	        program.bindings, ShaderRecompiler::IR::DescriptorBindingKind::Gds) != nullptr) {
+ 		prepared.gds.buffer = m_context.GetBufferCache().GetGdsBuffer()->Handle();
+ 	}
+-	return prepared;
+ }
+ 
+ void RenderExecutor::FindBuffers(PreparedBindings& prepared) {
+@@ -1056,14 +1064,16 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
+ 	}
+ }
+ 
+-RenderExecutor::GraphicsBindings
++RenderExecutor::GraphicsBindings&
+ RenderExecutor::PrepareGraphicsBindings(const ShaderStageRuntime& vertex,
+                                         const ShaderStageRuntime& pixel, bool pixel_active) {
+-	GraphicsBindings bindings {
+-	    .vertex = PrepareBindings(vertex),
+-	};
++	auto& bindings = m_graphics_bindings;
++	PrepareBindings(vertex, bindings.vertex);
+ 	if (pixel_active) {
+-		bindings.pixel.emplace(PrepareBindings(pixel));
++		if (!bindings.pixel) bindings.pixel.emplace();
++		PrepareBindings(pixel, *bindings.pixel);
++	} else {
++		bindings.pixel.reset();
+ 	}
+ 	FindBuffers(bindings.vertex);
+ 	if (bindings.pixel) {
+diff --git a/src/graphics/host_gpu/renderer/render.h b/src/graphics/host_gpu/renderer/render.h
+index e3d7ebe..0928cf0 100644
+--- a/src/graphics/host_gpu/renderer/render.h
++++ b/src/graphics/host_gpu/renderer/render.h
+@@ -167,7 +167,7 @@ public:
+ 	                    uint32_t thread_group_y, uint32_t thread_group_z, uint32_t mode,
+ 	                    uint64_t indirect_args = 0);
+ 
+-	[[nodiscard]] PreparedBindings PrepareBindings(const ShaderStageRuntime& runtime);
++	void PrepareBindings(const ShaderStageRuntime& runtime, PreparedBindings& prepared);
+ 	void                           FindBuffers(PreparedBindings& bindings);
+ 	void PrepareBdaBindings(const PreparedBindings& first, const PreparedBindings* second = nullptr);
+ 	void                           RebindBuffers(PreparedBindings& bindings);
+@@ -189,9 +189,9 @@ private:
+ 
+ 	[[nodiscard]] TextureBinding ResolveTexture(const ShaderRecompiler::IR::ImageResource& resource,
+ 	                                            const ShaderRecompiler::IR::DescriptorValue& value);
+-	[[nodiscard]] GraphicsBindings PrepareGraphicsBindings(const ShaderStageRuntime& vertex,
+-	                                                       const ShaderStageRuntime& pixel,
+-	                                                       bool                      pixel_active);
++	[[nodiscard]] GraphicsBindings& PrepareGraphicsBindings(const ShaderStageRuntime& vertex,
++	                                                        const ShaderStageRuntime& pixel,
++	                                                        bool                      pixel_active);
+ 	void ResolveRenderColorTarget(CommandBuffer& buffer, RenderColorInfo& target,
+ 	                              uint32_t render_target_slice_offset, uint32_t render_target_slot,
+ 	                              bool ignore_target_mask = false, bool exact_format = false);
+@@ -224,6 +224,8 @@ private:
+ 	                                              uint32_t group_y, uint32_t group_z, uint32_t mode);
+ 
+ 	RenderContext&                        m_context;
++	GraphicsBindings                     m_graphics_bindings;
++	PreparedBindings                     m_compute_bindings;
+ 	std::vector<ImageId>                  m_bound_images;
+ 	std::vector<vk::DescriptorBufferInfo> m_descriptor_buffers;
+ 	std::vector<vk::DescriptorImageInfo>  m_descriptor_images;
+diff --git a/src/graphics/host_gpu/renderer/renderCompute.cpp b/src/graphics/host_gpu/renderer/renderCompute.cpp
+index fe2091c..40833cd 100644
+--- a/src/graphics/host_gpu/renderer/renderCompute.cpp
++++ b/src/graphics/host_gpu/renderer/renderCompute.cpp
+@@ -561,7 +561,8 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
+ 		stage_begin = StageClock::now();
+ 	}
+ #endif
+-	auto bindings = PrepareBindings(input_info.stage);
++	auto& bindings = m_compute_bindings;
++	PrepareBindings(input_info.stage, bindings);
+ #if defined(KYTY_B32_DISPATCH_STAGE_PROFILE)
+ 	auto binding_mark = [&] (size_t index) {
+ 		if (sample_stage) {
+diff --git a/src/graphics/host_gpu/renderer/renderDraw.cpp b/src/graphics/host_gpu/renderer/renderDraw.cpp
+index ba2199d..c255e21 100644
+--- a/src/graphics/host_gpu/renderer/renderDraw.cpp
++++ b/src/graphics/host_gpu/renderer/renderDraw.cpp
+@@ -747,11 +747,13 @@ static PreparedVertexBuffers AcquireVertexBuffers(CommandBuffer&               b
+ 	        vs_input_info.buffers_num > ShaderVertexInputInfo::RES_MAX);
+ 
+ 	// Collect the non-empty guest vertex ranges.
++	std::array<uint64_t, ShaderVertexInputInfo::RES_MAX>          sizes {};
+ 	std::array<VertexBufferRange, ShaderVertexInputInfo::RES_MAX> ranges {};
+ 	uint32_t                                                      range_count = 0;
+ 	for (int i = 0; i < vs_input_info.buffers_num; i++) {
+ 		const auto& vertex = vs_input_info.buffers[i];
+ 		const auto  size   = VertexBufferDescriptorSize(vertex, vs_input_info);
++		sizes[i]           = size;
+ 		if (size == 0) {
+ 			continue;
+ 		}
+@@ -800,7 +802,7 @@ static PreparedVertexBuffers AcquireVertexBuffers(CommandBuffer&               b
+ 	vk::Buffer null_buffer = nullptr;
+ 	for (int i = 0; i < vs_input_info.buffers_num; i++) {
+ 		const auto& vertex = vs_input_info.buffers[i];
+-		const auto  size   = VertexBufferDescriptorSize(vertex, vs_input_info);
++		const auto  size   = sizes[i];
+ 		if (size == 0) {
+ 			if (null_buffer == nullptr) {
+ 				null_buffer = cache.GetBuffer(NULL_BUFFER_ID).Handle();
+@@ -1133,8 +1135,8 @@ bool RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
+ 		                              index_source.guest_element_size);
+ 	}
+ 	LogDrawPhase(draw.name, "PrepareBindings");
+-	auto bindings = PrepareGraphicsBindings(state.vs_input_info.stage, state.ps_input_info.stage,
+-	                                        state.ps_active);
++	auto& bindings = PrepareGraphicsBindings(state.vs_input_info.stage, state.ps_input_info.stage,
++	                                         state.ps_active);
+ 	if (!emit.direct_run.empty()) {
+ 		const auto safe_images = [&](const PreparedBindings& prepared) {
+ 			for (size_t index = 0; index < prepared.images.size(); ++index) {
+diff --git a/src/graphics/shader/shader.cpp b/src/graphics/shader/shader.cpp
+index 91e7b15..a638f59 100644
+--- a/src/graphics/shader/shader.cpp
++++ b/src/graphics/shader/shader.cpp
+@@ -418,6 +418,8 @@ static void ShaderApplyAttribSemantics(ShaderVertexInputInfo& info,
+ 
+ 	EXIT_IF(attrib == nullptr || buffer == nullptr);
+ 
++	const bool debug_dump = Config::GraphicsDebugDumpEnabled();
++
+ 	for (uint32_t i = 0; i < num_input_semantics; i++) {
+ 		const auto& in = input_semantics[i];
+ 
+@@ -426,7 +428,7 @@ static void ShaderApplyAttribSemantics(ShaderVertexInputInfo& info,
+ 		uint32_t reg  = in.hardware_mapping;
+ 		uint32_t size = in.size_in_elements;
+ 
+-		if (Config::GraphicsDebugDumpEnabled()) {
++		if (debug_dump) {
+ 			LOGF("reg = %u, size = %u, va[%u] = 0x%08" PRIx32 "\n", reg, size, i,
+ 			     attrib[in.semantic]);
+ 		}
