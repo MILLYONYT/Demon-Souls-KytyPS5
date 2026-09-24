@@ -19,6 +19,7 @@ on:
       - patches/buffer-bind-64-way.patch
       - patches/shader-map-epoch-cache.patch
       - patches/texture-alias-refresh.patch
+      - patches/texture-gc-preserve-modified.patch
   workflow_dispatch:
 
 permissions:
@@ -53,7 +54,8 @@ jobs:
             "$env:GITHUB_WORKSPACE/patches/srt-dense-memo.patch",
             "$env:GITHUB_WORKSPACE/patches/buffer-bind-64-way.patch",
             "$env:GITHUB_WORKSPACE/patches/shader-map-epoch-cache.patch",
-            "$env:GITHUB_WORKSPACE/patches/texture-alias-refresh.patch"
+            "$env:GITHUB_WORKSPACE/patches/texture-alias-refresh.patch",
+            "$env:GITHUB_WORKSPACE/patches/texture-gc-preserve-modified.patch"
           )
           foreach ($patch in $patches) {
             git -C source apply --3way --ignore-space-change --ignore-whitespace $patch
@@ -135,6 +137,7 @@ jobs:
           if (!$shader.Contains("g_shader_map_generation") -or !$shader.Contains("std::array<RecentShader, 64>")) { throw "Shader metadata cache missing." }
           $texture_refresh = Get-Content "$env:GITHUB_WORKSPACE/source/src/graphics/host_gpu/renderer/cache/textureCache.cpp" -Raw
           if (!$texture_refresh.Contains("Build32 texture alias refresh: immediate known-dirty upload")) { throw "Texture alias refresh fix missing." }
+          if (!$texture_refresh.Contains("if (!safe || owner->info.IsTiled())")) { throw "Texture residency safeguard missing." }
           if (!$scheduler.Contains("DispatchesPerSubmission = 128")) { throw "Dispatch batch size missing." }
           $texture = Get-Content "$env:GITHUB_WORKSPACE/source/src/graphics/host_gpu/renderer/cache/textureCache.cpp" -Raw
           if (!$texture.Contains("m_trigger_gc_memory = m_pressure_gc_memory")) { throw "Texture residency change missing." }
