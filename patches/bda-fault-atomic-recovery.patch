@@ -1,0 +1,67 @@
+diff --git a/src/graphics/host_gpu/renderer/cache/faultManager.cpp b/src/graphics/host_gpu/renderer/cache/faultManager.cpp
+index c40b54e..147287a 100644
+--- a/src/graphics/host_gpu/renderer/cache/faultManager.cpp
++++ b/src/graphics/host_gpu/renderer/cache/faultManager.cpp
+@@ -8,6 +8,7 @@
+ #include "graphics/host_gpu/renderer/commandScheduler.h"
+ #include "graphics/host_gpu/vulkanCommon.h"
+ 
++#include <algorithm>
+ #include <bit>
+ #include <cinttypes>
+ #include <cstring>
+@@ -137,14 +138,19 @@ void FaultManager::ProcessFaultBuffer() {
+ 		m_download_buffer.Invalidate(offset, PageFaultAreaSize);
+ 		RangeSet    fault_ranges;
+ 		const auto* faults = std::bit_cast<const uint64_t*>(mapped);
+-		const auto  count  = static_cast<uint32_t>(faults[0]);
++		// The GPU counter includes faults beyond the download buffer's capacity.
++		// Never read beyond its mapped area when a submission faults in many pages.
++		const auto count = static_cast<uint32_t>(
++		    std::min<uint64_t>(faults[0], MaxPageFaults - 1));
+ 		for (uint32_t index = 1; index <= count; ++index) {
+ 			fault_ranges.Add(faults[index], BufferCache::CACHING_PAGESIZE);
+ 			LOGF("Accessed non-GPU cached memory at 0x%016" PRIx64 "\n", faults[index]);
+ 		}
+ 		fault_ranges.ForEach([this](uint64_t start, uint64_t end) {
+ 			EXIT_IF(end - start > std::numeric_limits<uint32_t>::max());
+-			(void)m_buffer_cache.FindBuffer(start, end - start);
++			// A newly registered BDA page must have guest data before the next shader
++			// can read it. Registration alone exposes an uninitialized device buffer.
++			m_buffer_cache.EnsureBufferContents(start, end - start);
+ 		});
+ 		m_fault_areas[area] = 0;
+ 	});
+diff --git a/src/graphics/host_gpu/shaders/fault_buffer_process.comp b/src/graphics/host_gpu/shaders/fault_buffer_process.comp
+index 04a86ba..2940c4e 100644
+--- a/src/graphics/host_gpu/shaders/fault_buffer_process.comp
++++ b/src/graphics/host_gpu/shaders/fault_buffer_process.comp
+@@ -25,6 +25,8 @@ void main() {
+     while (word != 0u) {
+         const uint store_index = atomicAdd(download_buffer32[0], 1u) + 1u;
+         if (store_index >= MAX_PAGE_FAULTS) {
++            // Preserve bits that did not fit for the next fault processing pass.
++            fault_buffer[id] = word;
+             return;
+         }
+         const uint bit = findLSB(word);
+diff --git a/src/graphics/shader/recompiler/backend/spirv/spirvEmitterMemory.cpp b/src/graphics/shader/recompiler/backend/spirv/spirvEmitterMemory.cpp
+index d34aa6c..c80ab39 100644
+--- a/src/graphics/shader/recompiler/backend/spirv/spirvEmitterMemory.cpp
++++ b/src/graphics/shader/recompiler/backend/spirv/spirvEmitterMemory.cpp
+@@ -165,10 +165,11 @@ void RecordBdaFault(EmitterState& state, uint32_t page) {
+ 	    state, OpShiftLeftLogical, TypeU32(state), ConstantU32(state, 1),
+ 	    Binary(state, OpBitwiseAnd, TypeU32(state), page, ConstantU32(state, 31)));
+ 	const auto pointer = FaultElementPointer(state, word);
+-	const auto value   = state.builder.AllocateId();
+-	state.builder.AddFunction({OpLoad, TypeU32(state), value, pointer});
+-	state.builder.AddFunction(
+-	    {OpStore, pointer, Binary(state, OpBitwiseOr, TypeU32(state), value, bit)});
++	// Many shader invocations can fault in different pages of the same word.
++	// A load/OR/store loses bits when two invocations read the old value together.
++	state.builder.AddFunction({OpAtomicOr, TypeU32(state), state.builder.AllocateId(), pointer,
++	                           ConstantU32(state, ScopeDevice),
++	                           ConstantU32(state, MemorySemanticsNone), bit});
+ }
+ 
+ uint32_t GetBdaPointer(ValueEmitContext& ctx, uint32_t address) {
