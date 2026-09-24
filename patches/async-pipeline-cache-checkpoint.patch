@@ -1,0 +1,131 @@
+diff --git a/src/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp b/src/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp
+index 9453eed..92fdf97 100644
+--- a/src/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp
++++ b/src/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp
+@@ -27,6 +27,7 @@
+ #include <cstring>
+ #include <deque>
+ #include <fmt/format.h>
++#include <future>
+ #include <limits>
+ #include <span>
+ #include <spirv-tools/libspirv.hpp>
+@@ -608,6 +609,32 @@ void PipelineCache::InitializeDriverCache() {
+ 	}
+ }
+ 
++static void WriteDriverCacheFile(const std::filesystem::path& path, const std::string& prefix,
++                                 const std::vector<uint8_t>& payload) {
++	if (!Common::File::CreateDirectories(path.parent_path())) {
++		PipelineCacheLog("Vulkan pipeline cache: failed to create cache directory");
++		return;
++	}
++	auto temp_path = path;
++	temp_path += ".tmp";
++	Common::File file;
++	uint32_t prefix_written = 0;
++	uint32_t payload_written = 0;
++	if (file.Create(temp_path)) {
++		file.Write(prefix.data(), static_cast<uint32_t>(prefix.size()), &prefix_written);
++		file.Write(payload.data(), static_cast<uint32_t>(payload.size()), &payload_written);
++	}
++	const bool flushed = !file.IsInvalid() && file.Flush();
++	file.Close();
++	if (prefix_written != prefix.size() || payload_written != payload.size() || !flushed ||
++	    !Common::File::RenameFile(temp_path, path)) {
++		PipelineCacheLog("Vulkan pipeline cache: failed to write {}", Common::PathToString(path));
++		return;
++	}
++	PipelineCacheLog("Vulkan pipeline cache: saved {} bytes to {}", payload.size(),
++	                 Common::PathToString(path));
++}
++
+ void PipelineCache::Save() {
+ 	Common::LockGuard lock(m_mutex);
+ 	SaveDriverCacheLocked(true);
+@@ -621,6 +648,14 @@ void PipelineCache::CheckpointDriverCacheLocked() {
+ 	if (now - m_last_driver_cache_checkpoint < std::chrono::seconds(90)) {
+ 		return;
+ 	}
++	// Never let a second snapshot race the atomic rename or its temporary file.
++	if (m_cache_write_task.valid()) {
++		if (m_cache_write_task.wait_for(std::chrono::seconds(0)) !=
++		    std::future_status::ready) {
++			return;
++		}
++		m_cache_write_task.get();
++	}
+ 	// A cache snapshot can stall the renderer. Limit snapshots to active periods
+ 	// with new pipelines and leave the in-memory cache available for this session.
+ 	m_new_pipelines_since_checkpoint = 0;
+@@ -634,6 +669,9 @@ void PipelineCache::CheckpointDriverCacheLocked() {
+ }
+ 
+ void PipelineCache::SaveDriverCacheLocked(bool final) {
++	if (final && m_cache_write_task.valid()) {
++		m_cache_write_task.get();
++	}
+ 	if (m_driver_cache == nullptr) {
+ 		return;
+ 	}
+@@ -664,29 +702,18 @@ void PipelineCache::SaveDriverCacheLocked(bool final) {
+ 	auto       prefix       = DriverCacheSignature(m_graphics.GetPhysicalDeviceProperties());
+ 	const auto payload_hash = XXH3_64bits(payload.data(), payload.size());
+ 	prefix.append(reinterpret_cast<const char*>(&payload_hash), sizeof(payload_hash));
+-	if (!Common::File::CreateDirectories(m_driver_cache_path.parent_path())) {
+-		PipelineCacheLog("Vulkan pipeline cache: failed to create cache directory");
+-		return;
+-	}
+-	auto temp_path = m_driver_cache_path;
+-	temp_path += ".tmp";
+-	Common::File file;
+-	uint32_t     prefix_written  = 0;
+-	uint32_t     payload_written = 0;
+-	if (file.Create(temp_path)) {
+-		file.Write(prefix.data(), static_cast<uint32_t>(prefix.size()), &prefix_written);
+-		file.Write(payload.data(), static_cast<uint32_t>(payload.size()), &payload_written);
+-	}
+-	const bool flushed = !file.IsInvalid() && file.Flush();
+-	file.Close();
+-	if (prefix_written != prefix.size() || payload_written != payload.size() || !flushed ||
+-	    !Common::File::RenameFile(temp_path, m_driver_cache_path)) {
+-		PipelineCacheLog("Vulkan pipeline cache: failed to write {}",
+-		                 Common::PathToString(m_driver_cache_path));
+-		return;
++	if (final) {
++		WriteDriverCacheFile(m_driver_cache_path, prefix, payload);
++	} else {
++		// Writing and flushing a large cache on the GPU thread pauses every frame.
++		// Only the Vulkan snapshot is taken under the pipeline mutex; the disk write
++		// runs on a worker, while future checkpoints wait for the previous write.
++		m_cache_write_task = std::async(std::launch::async,
++		                                [path = m_driver_cache_path, prefix = std::move(prefix),
++		                                 payload = std::move(payload)]() {
++		                                    WriteDriverCacheFile(path, prefix, payload);
++		                                });
+ 	}
+-	PipelineCacheLog("Vulkan pipeline cache: saved {} bytes to {}", payload.size(),
+-	                 Common::PathToString(m_driver_cache_path));
+ 	if (final) {
+ 		m_graphics.device.destroyPipelineCache(m_driver_cache, nullptr);
+ 		m_driver_cache = nullptr;
+diff --git a/src/graphics/host_gpu/renderer/pipeline/pipelineCache.h b/src/graphics/host_gpu/renderer/pipeline/pipelineCache.h
+index e517c2e..ea59b0f 100644
+--- a/src/graphics/host_gpu/renderer/pipeline/pipelineCache.h
++++ b/src/graphics/host_gpu/renderer/pipeline/pipelineCache.h
+@@ -12,6 +12,7 @@
+ #include <chrono>
+ #include <cstddef>
+ #include <filesystem>
++#include <future>
+ #include <memory>
+ #include <span>
+ #include <type_traits>
+@@ -212,6 +213,7 @@ private:
+ 	std::unique_ptr<ProgramCache> m_program_cache;
+ 	vk::PipelineCache             m_driver_cache = nullptr;
+ 	std::filesystem::path         m_driver_cache_path;
++	std::future<void>             m_cache_write_task;
+ 	uint32_t                      m_new_pipelines_since_checkpoint = 0;
+ 	std::chrono::steady_clock::time_point m_last_driver_cache_checkpoint =
+ 	    std::chrono::steady_clock::now();
