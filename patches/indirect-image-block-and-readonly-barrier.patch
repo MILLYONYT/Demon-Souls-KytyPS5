@@ -1,0 +1,204 @@
+diff --git a/src/graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.cpp b/src/graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.cpp
+index adffbd0..4c5b807 100644
+--- a/src/graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.cpp
++++ b/src/graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.cpp
+@@ -88,8 +88,15 @@ bool HasShaderBufferWrites(const ShaderStageRuntime& runtime) {
+ 	return has_writes;
+ }
+ 
+-void ShaderAccessBarrier(vk::CommandBuffer vk_buffer, vk::PipelineStageFlags source_stages) {
++void ShaderAccessBarrier(vk::CommandBuffer vk_buffer, vk::PipelineStageFlags source_stages,
++                         bool writes_memory) {
+ 	EXIT_IF(vk_buffer == nullptr || !source_stages);
++	if (!writes_memory) {
++		// Execution ordering is sufficient if this shader cannot write memory.
++		vk_buffer.pipelineBarrier(source_stages, vk::PipelineStageFlagBits::eAllCommands,
++		                          vk::DependencyFlags {}, 0, nullptr, 0, nullptr, 0, nullptr);
++		return;
++	}
+ 	const auto barrier = MakeShaderAccessDependency();
+ 	vk_buffer.pipelineBarrier(source_stages, vk::PipelineStageFlagBits::eAllCommands,
+ 	                          vk::DependencyFlags {}, 1, &barrier, 0, nullptr, 0, nullptr);
+diff --git a/src/graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h b/src/graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h
+index 98ab301..32032db 100644
+--- a/src/graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h
++++ b/src/graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h
+@@ -14,7 +14,8 @@ VulkanMemoryBarrier     MakeShaderWriteHazardDependency();
+ VulkanMemoryBarrier     MakeShaderWriteDependency();
+ vk::BufferMemoryBarrier MakeGdsDependency(vk::Buffer buffer);
+ bool HasShaderBufferWrites(const ShaderStageRuntime& runtime);
+-void ShaderAccessBarrier(vk::CommandBuffer vk_buffer, vk::PipelineStageFlags source_stages);
++void ShaderAccessBarrier(vk::CommandBuffer vk_buffer, vk::PipelineStageFlags source_stages,
++                         bool writes_memory = true);
+ void ShaderWriteHazardBarrier(vk::CommandBuffer      vk_buffer,
+                               vk::PipelineStageFlags destination_stages);
+ void ShaderWriteBarrier(vk::CommandBuffer vk_buffer, vk::PipelineStageFlags source_stages);
+diff --git a/src/graphics/host_gpu/renderer/renderCompute.cpp b/src/graphics/host_gpu/renderer/renderCompute.cpp
+index 40833cd..f0b78a3 100644
+--- a/src/graphics/host_gpu/renderer/renderCompute.cpp
++++ b/src/graphics/host_gpu/renderer/renderCompute.cpp
+@@ -658,7 +658,19 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
+ 
+ 	// The removed host fence also ordered read-only dispatches before later writers.
+ 	if (chain) buffer.ContinueComputeChain();
+-	else ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
++	else {
++#if defined(KYTY_B32_READ_ONLY_DISPATCH_BARRIER)
++		const bool writes_memory =
++		    has_storage_writes || program.info.uses_dma || bindings.gds.buffer != nullptr ||
++		    std::any_of(program.info.buffers.begin(), program.info.buffers.end(),
++		                [](const auto& resource) { return resource.written || resource.atomic; }) ||
++		    std::any_of(program.info.images.begin(), program.info.images.end(),
++		                [](const auto& resource) { return resource.written || resource.atomic; });
++		ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader, writes_memory);
++#else
++		ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
++#endif
++	}
+ #if defined(KYTY_B32_DISPATCH_STAGE_PROFILE)
+ 	mark_outer(3);
+ #endif
+diff --git a/src/graphics/shader/recompiler/ir/passes/ResourceMaterialization.cpp b/src/graphics/shader/recompiler/ir/passes/ResourceMaterialization.cpp
+index d0ad7b7..29931c8 100644
+--- a/src/graphics/shader/recompiler/ir/passes/ResourceMaterialization.cpp
++++ b/src/graphics/shader/recompiler/ir/passes/ResourceMaterialization.cpp
+@@ -10,6 +10,7 @@
+ #include <atomic>
+ #include <array>
+ #include <bit>
++#include <cinttypes>
+ #include <cstdio>
+ #include <cstring>
+ #include <fmt/format.h>
+@@ -248,6 +249,25 @@ bool ReadSpecializationWord(const SrtRuntime& runtime, uint64_t address, uint32_
+ 	       runtime.read_specialization_memory(runtime.userdata, address, &word);
+ }
+ 
++#if defined(KYTY_B32_INDIRECT_IMAGE_BLOCK_READ)
++bool TryReadSpecializationWords(const SrtRuntime& runtime, uint64_t address,
++                                uint32_t* words, uint32_t count) {
++	if (runtime.read_specialization_memory == nullptr ||
++	    runtime.try_read_memory_span == nullptr || words == nullptr || count == 0 ||
++	    address > AddressMask || uint64_t {count} * sizeof(uint32_t) - 1 > AddressMask - address)
++		return false;
++	// The existing clean span reader preserves GPU-write synchronization and the
++	// shader read observer. A rejected span falls back to exact scalar reads.
++	const bool read = runtime.try_read_memory_span(runtime.userdata, address, words, count, true);
++	if (read) {
++		static thread_local uint64_t accepted = 0;
++		if (++accepted == 1 || accepted == 65536 || accepted == 1048576)
++			LOGF("Build32 indirect image descriptor block reads: accepted=%" PRIu64 "\n", accepted);
++	}
++	return read;
++}
++#endif
++
+ void MakeRangeReadable(const SrtRuntime& runtime, uint64_t base, uint64_t size) {
+ 	if (runtime.sync_memory != nullptr && size != 0u && base <= AddressMask - size) {
+ 		runtime.sync_memory(runtime.userdata, base, size);
+@@ -379,7 +399,16 @@ bool MaterializeDenseIndirectImage(const DescriptorSource::IndirectImage& indire
+ 		candidate.dword_count = 8u;
+ 		const auto entry      = static_cast<uint64_t>(indirect.table_offset) +
+ 		                   (static_cast<uint64_t>(key) << DenseDescriptorShift);
+-		for (uint32_t dword = 0; key < entries && dword < candidate.dword_count; dword++) {
++#if defined(KYTY_B32_INDIRECT_IMAGE_BLOCK_READ)
++		const bool block_read = key < entries && base <= AddressMask &&
++		                        entry <= AddressMask - base &&
++		                        TryReadSpecializationWords(runtime, base + entry,
++		                                                   candidate.dwords.data(), 8u);
++#else
++		constexpr bool block_read = false;
++#endif
++		for (uint32_t dword = 0; key < entries && !block_read &&
++		                         dword < candidate.dword_count; dword++) {
+ 			const auto address = base + entry + dword * sizeof(uint32_t);
+ 			if (address > AddressMask ||
+ 			    !ReadSpecializationWord(runtime, address, candidate.dwords[dword])) {
+@@ -535,7 +564,19 @@ bool MaterializeIndirectImage(const DescriptorSource::IndirectImage& indirect,
+ 		DescriptorValue candidate;
+ 		candidate.dword_count  = 8u;
+ 		const auto heap_offset = key << 5u;
+-		for (uint32_t dword = 0; dword < candidate.dword_count; dword++) {
++#if defined(KYTY_B32_INDIRECT_IMAGE_BLOCK_READ)
++		const auto heap_size = ScalarBufferSize(heap);
++		const auto heap_base = heap.Base48() & ~uint64_t {3};
++		const bool full_entry = heap_offset <= heap_size &&
++		                        heap_size - heap_offset >= candidate.dword_count * sizeof(uint32_t) &&
++		                        heap_offset <= AddressMask - heap_base;
++		const bool block_read = full_entry &&
++		                        TryReadSpecializationWords(runtime, heap_base + heap_offset,
++		                                                   candidate.dwords.data(), 8u);
++#else
++		constexpr bool block_read = false;
++#endif
++		for (uint32_t dword = 0; !block_read && dword < candidate.dword_count; dword++) {
+ 			if (!ReadScalarBufferWord(heap, heap_offset, dword * sizeof(uint32_t), runtime,
+ 			                          candidate.dwords[dword])) {
+ 				return note("heap entry is not readable");
+diff --git a/tests/ResourceTrackingTests.cpp b/tests/ResourceTrackingTests.cpp
+index ba522be..3311959 100644
+--- a/tests/ResourceTrackingTests.cpp
++++ b/tests/ResourceTrackingTests.cpp
+@@ -10,6 +10,7 @@
+ #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
+ #include "graphics/shader/recompiler/ir/passes/WaterfallDescriptor.h"
+ 
++#include <algorithm>
+ #include <array>
+ #include <bit>
+ #include <cstring>
+@@ -166,6 +167,8 @@ struct LinearTestMemory {
+   uint64_t base = 0x1000;
+   std::vector<uint32_t> words = std::vector<uint32_t>(0x2200 / 4);
+   uint64_t fail_address = UINT64_MAX;
++  uint32_t block_reads = 0;
++  bool reject_blocks = false;
+ };
+ 
+ bool ReadLinearTestMemory(void *userdata, uint64_t address, uint32_t *value) {
+@@ -179,6 +182,19 @@ bool ReadLinearTestMemory(void *userdata, uint64_t address, uint32_t *value) {
+   return true;
+ }
+ 
++bool ReadLinearTestMemoryBlock(void *userdata, uint64_t address, uint32_t *values,
++                               uint32_t count, bool clean) {
++  auto *memory = static_cast<LinearTestMemory *>(userdata);
++  if (memory == nullptr || !clean || memory->reject_blocks || count != 8u ||
++      values == nullptr || address < memory->base || (address & 3u) != 0u ||
++      address - memory->base > memory->words.size() * sizeof(uint32_t) - 32u ||
++      (memory->fail_address >= address && memory->fail_address - address < 32u))
++    return false;
++  std::copy_n(memory->words.begin() + (address - memory->base) / 4u, count, values);
++  ++memory->block_reads;
++  return true;
++}
++
+ std::unique_ptr<Fixture>
+ MakeIndirectImageFixture(bool malformed, uint32_t material_immediate = 0,
+                          bool memory_backed_material = false,
+@@ -1508,6 +1524,25 @@ void TestDenseIndirectImageMaterialization() {
+   ResourceSpecialization specialization;
+   Check(MaterializeResources(resource_plan, runtime, snapshot, specialization),
+         "dense indirect image table did not materialize");
++#if defined(KYTY_B32_INDIRECT_IMAGE_BLOCK_READ)
++  runtime.try_read_memory_span = ReadLinearTestMemoryBlock;
++  ResourceSnapshot block_snapshot;
++  ResourceSpecialization block_specialization;
++  Check(MaterializeResources(resource_plan, runtime, block_snapshot, block_specialization) &&
++            SameResourceSnapshot(snapshot, block_snapshot) &&
++            specialization == block_specialization &&
++            memory_image.block_reads >= kEntries,
++        "clean indirect image block reads changed dense table descriptors");
++  const auto completed_blocks = memory_image.block_reads;
++  memory_image.reject_blocks = true;
++  ResourceSnapshot scalar_snapshot;
++  ResourceSpecialization scalar_specialization;
++  Check(MaterializeResources(resource_plan, runtime, scalar_snapshot, scalar_specialization) &&
++            SameResourceSnapshot(snapshot, scalar_snapshot) &&
++            specialization == scalar_specialization &&
++            memory_image.block_reads == completed_blocks,
++        "rejected indirect image block read did not preserve scalar fallback");
++#endif
+   const auto mapping = specialization.images.empty()
+                            ? UINT32_MAX
+                            : specialization.images[0].indirect_mapping_offset;
