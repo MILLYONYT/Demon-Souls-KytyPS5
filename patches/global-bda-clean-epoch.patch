@@ -1,0 +1,213 @@
+diff --git a/src/graphics/host_gpu/memoryTracker.cpp b/src/graphics/host_gpu/memoryTracker.cpp
+index 2e433e1..923f860 100644
+--- a/src/graphics/host_gpu/memoryTracker.cpp
++++ b/src/graphics/host_gpu/memoryTracker.cpp
+@@ -61,10 +61,19 @@ RegionManager* MemoryTracker::GetOrCreateRegion(uint64_t index) {
+ 	if (auto* manager = m_regions[index].load(std::memory_order_acquire); manager != nullptr) {
+ 		return manager;
+ 	}
+-	auto  manager = std::make_unique<RegionManager>(m_page_manager, index * TRACKER_REGION_SIZE);
++#if defined(KYTY_B32_GLOBAL_BDA_EPOCH)
++	auto manager = std::make_unique<RegionManager>(m_page_manager, index * TRACKER_REGION_SIZE,
++	                                               &m_global_cpu_epoch);
++#else
++	auto manager = std::make_unique<RegionManager>(m_page_manager, index * TRACKER_REGION_SIZE);
++#endif
+ 	auto* ptr     = manager.get();
+ 	m_region_storage.push_back(std::move(manager));
+ 	m_regions[index].store(ptr, std::memory_order_release);
++#if defined(KYTY_B32_GLOBAL_BDA_EPOCH)
++	// A newly tracked region begins CPU dirty even before its first write fault.
++	m_global_cpu_epoch.fetch_add(1, std::memory_order_release);
++#endif
+ 	return ptr;
+ }
+ 
+diff --git a/src/graphics/host_gpu/memoryTracker.h b/src/graphics/host_gpu/memoryTracker.h
+index de387a4..6444e1f 100644
+--- a/src/graphics/host_gpu/memoryTracker.h
++++ b/src/graphics/host_gpu/memoryTracker.h
+@@ -30,6 +30,11 @@ public:
+ 		const auto* manager = m_regions[vaddr / TRACKER_REGION_SIZE].load(std::memory_order_acquire);
+ 		return manager == nullptr ? 0 : manager->CpuModificationEpoch();
+ 	}
++#if defined(KYTY_B32_GLOBAL_BDA_EPOCH)
++	[[nodiscard]] uint64_t GlobalCpuModificationEpoch() const noexcept {
++		return m_global_cpu_epoch.load(std::memory_order_acquire);
++	}
++#endif
+ 	[[nodiscard]] bool IsRegionCpuModified(uint64_t vaddr, uint64_t size);
+ 	[[nodiscard]] bool IsRegionFullyGpuModified(uint64_t vaddr, uint64_t size);
+ 	[[nodiscard]] bool TryInvalidateCpuWriteWindow(uint64_t fault, uint64_t begin,
+@@ -185,6 +190,9 @@ private:
+ 	std::unique_ptr<std::atomic<RegionManager*>[]> m_regions;
+ 	std::vector<std::unique_ptr<RegionManager>>    m_region_storage;
+ 	std::mutex                                     m_region_mutex;
++#if defined(KYTY_B32_GLOBAL_BDA_EPOCH)
++	std::atomic<uint64_t> m_global_cpu_epoch {1};
++#endif
+ 	PageManager&                                   m_page_manager;
+ };
+ 
+diff --git a/src/graphics/host_gpu/regionManager.h b/src/graphics/host_gpu/regionManager.h
+index c2102c3..e790be6 100644
+--- a/src/graphics/host_gpu/regionManager.h
++++ b/src/graphics/host_gpu/regionManager.h
+@@ -71,8 +71,10 @@ static_assert(std::atomic_uint32_t::is_always_lock_free);
+ 
+ class RegionManager final {
+ public:
+-	RegionManager(PageManager& page_manager, uint64_t cpu_addr)
+-	    : m_page_manager(page_manager), m_cpu_addr(cpu_addr) {
++	RegionManager(PageManager& page_manager, uint64_t cpu_addr,
++	              std::atomic<uint64_t>* global_cpu_epoch = nullptr)
++	    : m_page_manager(page_manager), m_cpu_addr(cpu_addr),
++	      m_global_cpu_epoch(global_cpu_epoch) {
+ 		if (m_cpu_addr % TRACKER_REGION_SIZE != 0) {
+ 			EXIT("invalid region tracking manager construction\n");
+ 		}
+@@ -120,6 +122,9 @@ public:
+ 				// Invalidate cached clean proofs before another CPU thread can write
+ 				// through the relaxed host protection. A cache miss takes this lock.
+ 				m_cpu_epoch.fetch_add(1, std::memory_order_release);
++				if (m_global_cpu_epoch != nullptr) {
++					m_global_cpu_epoch->fetch_add(1, std::memory_order_release);
++				}
+ 			}
+ 			UpdateCpuProtection<!enable>();
+ 		} else {
+@@ -211,6 +216,7 @@ private:
+ 
+ 	PageManager& m_page_manager;
+ 	uint64_t     m_cpu_addr = 0;
++	std::atomic<uint64_t>* m_global_cpu_epoch = nullptr;
+ 	std::atomic<uint64_t> m_cpu_epoch {1};
+ 	RegionBits   m_cpu_dirty;
+ 	RegionBits   m_gpu_dirty;
+diff --git a/src/graphics/host_gpu/renderer/cache/bufferCache.h b/src/graphics/host_gpu/renderer/cache/bufferCache.h
+index 5cd0c13..a4b7a85 100644
+--- a/src/graphics/host_gpu/renderer/cache/bufferCache.h
++++ b/src/graphics/host_gpu/renderer/cache/bufferCache.h
+@@ -79,6 +79,11 @@ public:
+ 	};
+ 	void SynchronizeRegionRequest(SyncRegionRequest& request);
+ 	[[nodiscard]] uint64_t RegistrationEpoch() const { return m_registration_epoch; }
++#if defined(KYTY_B32_GLOBAL_BDA_EPOCH)
++	[[nodiscard]] uint64_t GlobalCpuModificationEpoch() const noexcept {
++		return m_memory_tracker.GlobalCpuModificationEpoch();
++	}
++#endif
+ 	void CollectMappedRegisteredRanges(const RangeSet& mapped, std::vector<RangeSet::Range>& ranges) const;
+ 
+ 	void               RunGarbageCollector(uint64_t elapsed_submissions = 1);
+diff --git a/src/graphics/host_gpu/renderer/cache/gpuResourceManager.cpp b/src/graphics/host_gpu/renderer/cache/gpuResourceManager.cpp
+index a97e2b3..e350f9e 100644
+--- a/src/graphics/host_gpu/renderer/cache/gpuResourceManager.cpp
++++ b/src/graphics/host_gpu/renderer/cache/gpuResourceManager.cpp
+@@ -185,7 +185,35 @@ bool GpuResourceManager::PrepareBdaReadRanges(std::span<const GuestRange> ranges
+ void GpuResourceManager::PrepareBda() {
+ 	std::shared_lock lock(m_mapped_ranges_mutex);
+ 	RefreshBdaRanges();
++#if defined(KYTY_B32_GLOBAL_BDA_EPOCH)
++	const auto cpu_epoch = m_buffer_cache.GlobalCpuModificationEpoch();
++	const auto registered = m_buffer_cache.RegistrationEpoch();
++	if (cpu_epoch != 0 && cpu_epoch == m_bda_last_full_cpu_epoch &&
++	    m_mapping_epoch == m_bda_last_full_mapping_epoch &&
++	    registered == m_bda_last_full_registration_epoch) {
++		// This shortcut applies only to a completed full walk. A read-range-only
++		// preparation cannot mark unrelated BDA buffers as synchronized.
++		static std::atomic<uint64_t> skipped {0};
++		const auto count = skipped.fetch_add(1, std::memory_order_relaxed) + 1;
++		if (count == 1 || count == 4096 || count == 65536)
++			LOGF("Build32 full BDA clean walk skipped: count=%" PRIu64 "\n", count);
++		m_fault_process_pending = true;
++		return;
++	}
++#endif
+ 	for (auto& request : m_bda_region_requests) m_buffer_cache.SynchronizeRegionRequest(request);
++#if defined(KYTY_B32_GLOBAL_BDA_EPOCH)
++	// CPU writes and buffer registration can overlap a full walk. Cache its
++	// completion only when both generations remained stable across the scan.
++	if (cpu_epoch != 0 && cpu_epoch == m_buffer_cache.GlobalCpuModificationEpoch() &&
++	    registered == m_buffer_cache.RegistrationEpoch()) {
++		m_bda_last_full_cpu_epoch = cpu_epoch;
++		m_bda_last_full_mapping_epoch = m_mapping_epoch;
++		m_bda_last_full_registration_epoch = registered;
++	} else {
++		m_bda_last_full_cpu_epoch = 0;
++	}
++#endif
+ 	m_fault_process_pending = true;
+ }
+ 
+diff --git a/src/graphics/host_gpu/renderer/cache/gpuResourceManager.h b/src/graphics/host_gpu/renderer/cache/gpuResourceManager.h
+index 72956cb..8707d1a 100644
+--- a/src/graphics/host_gpu/renderer/cache/gpuResourceManager.h
++++ b/src/graphics/host_gpu/renderer/cache/gpuResourceManager.h
+@@ -55,6 +55,11 @@ private:
+ 	mutable std::shared_mutex m_mapped_ranges_mutex;
+ 	RangeSet                  m_mapped_ranges;
+ 	uint64_t m_mapping_epoch = 1, m_bda_mapping_epoch = 0, m_bda_registration_epoch = 0;
++#if defined(KYTY_B32_GLOBAL_BDA_EPOCH)
++	uint64_t m_bda_last_full_cpu_epoch = 0;
++	uint64_t m_bda_last_full_mapping_epoch = 0;
++	uint64_t m_bda_last_full_registration_epoch = 0;
++#endif
+ 	std::vector<BufferCache::SyncRegionRequest> m_bda_region_requests;
+ 	GuestGpu*                 m_gpu = nullptr;
+ 	std::atomic<uint64_t> m_preparation_alias_epoch {uint64_t{1} << 32};
+diff --git a/tests/MemoryTrackerTests.cpp b/tests/MemoryTrackerTests.cpp
+index 057aaa8..f4b420b 100644
+--- a/tests/MemoryTrackerTests.cpp
++++ b/tests/MemoryTrackerTests.cpp
+@@ -316,6 +316,40 @@ void TestCpuDirtyUpload() {
+   Release(memory);
+ }
+ 
++#if defined(KYTY_B32_GLOBAL_BDA_EPOCH)
++void TestGlobalCpuEpoch() {
++  TrackerHarness harness;
++  auto &tracker = harness.tracker;
++  constexpr auto region_size = Libs::Graphics::TRACKER_REGION_SIZE;
++  const auto page_size = harness.page_manager.GetPageSize();
++  auto *memory = Allocate(harness.page_manager, 2 * region_size / page_size);
++  const auto address = reinterpret_cast<uint64_t>(memory);
++  const auto boundary = (address / region_size + 1) * region_size;
++  const auto first = boundary - page_size;
++
++  const auto initial = tracker.GlobalCpuModificationEpoch();
++  Check(tracker.IsRegionCpuModified(first, page_size) &&
++            tracker.GlobalCpuModificationEpoch() > initial,
++        "new region did not invalidate global CPU epoch");
++  const auto after_first = tracker.GlobalCpuModificationEpoch();
++  Check(tracker.IsRegionCpuModified(boundary, page_size) &&
++            tracker.GlobalCpuModificationEpoch() > after_first,
++        "second tracked region did not invalidate global CPU epoch");
++
++  tracker.ForEachUploadRange(first, page_size, false,
++                             [](uint64_t, uint64_t) noexcept {}, []() noexcept {});
++  const auto clean_epoch = tracker.GlobalCpuModificationEpoch();
++  tracker.MarkRegionAsCpuModified(first, page_size);
++  Check(tracker.GlobalCpuModificationEpoch() > clean_epoch &&
++            tracker.IsRegionCpuModified(first, page_size),
++        "CPU write did not invalidate global CPU epoch");
++
++  tracker.UntrackMemory(first, page_size);
++  tracker.UntrackMemory(boundary, page_size);
++  Release(memory);
++}
++#endif
++
+ void TestLocalCpuEpochs() {
+   TrackerHarness harness;
+   auto &tracker = harness.tracker;
+@@ -1082,6 +1116,9 @@ int main(int argc, char **argv) {
+   TestQueriesDoNotRequireMappedOwnership();
+   TestConcurrentRegionPublication();
+   TestCpuDirtyUpload();
++#if defined(KYTY_B32_GLOBAL_BDA_EPOCH)
++  TestGlobalCpuEpoch();
++#endif
+   TestLocalCpuEpochs();
+   TestFullGpuOwnership();
+   TestCpuWriteWindow();
