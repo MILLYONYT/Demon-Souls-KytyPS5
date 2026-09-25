@@ -1,4 +1,4 @@
-name: Demon Souls Build 32 best 94 shader replay Windows test
+name: Demon Souls Build 32 best 102 shader throughput Windows test
 # The pinned source already provides fast buffer lookup and bind-time object naming control.
 
 on:
@@ -31,6 +31,7 @@ on:
       - patches/recycle-srt-scratch.patch
       - patches/gc-and-fault-submit-overhead.patch
       - patches/shader-permutation-replay.patch
+      - patches/shader-frontend-throughput.patch
   workflow_dispatch:
 
 permissions:
@@ -77,7 +78,8 @@ jobs:
             "$env:GITHUB_WORKSPACE/patches/skip-unmapped-gpu-sync.patch",
             "$env:GITHUB_WORKSPACE/patches/recycle-srt-scratch.patch",
             "$env:GITHUB_WORKSPACE/patches/gc-and-fault-submit-overhead.patch",
-            "$env:GITHUB_WORKSPACE/patches/shader-permutation-replay.patch"
+            "$env:GITHUB_WORKSPACE/patches/shader-permutation-replay.patch",
+            "$env:GITHUB_WORKSPACE/patches/shader-frontend-throughput.patch"
           )
           foreach ($patch in $patches) {
             git -C source apply --3way --ignore-space-change --ignore-whitespace $patch
@@ -132,7 +134,7 @@ jobs:
       - name: Configure Release LTO
         shell: cmd
         run: |
-          cmake -S source -B _Build/windows -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=ON -DKYTY_BUILD_ORIGIN=Fork -DKYTY_BUILD_REPOSITORY=${{ github.repository }} -DKYTY_RELEASE_TAG=B32-B94-SHADER-REPLAY-${{ github.sha }} -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl "-DCMAKE_CXX_FLAGS=/DNOMINMAX /EHsc /DKYTY_B32_FRAME_PROFILE /DKYTY_B32_QUIET_HOT_LOGS /DKYTY_B32_BATCH_RESOURCE_GC /DKYTY_B32_FORCE_SILENT_SHADER_DUMPS /DKYTY_B32_PHASE_PROFILE /DKYTY_B32_FAST_CPU_SETS /DKYTY_B32_FAST_BIND /DKYTY_B32_SKIP_UNMAPPED_GPU_SYNC /DKYTY_B32_DRAW_AUTO_PROFILE /DKYTY_B32_DISPATCH_STAGE_PROFILE" -DCMAKE_PREFIX_PATH="%Qt6_DIR%"
+          cmake -S source -B _Build/windows -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=ON -DKYTY_BUILD_ORIGIN=Fork -DKYTY_BUILD_REPOSITORY=${{ github.repository }} -DKYTY_RELEASE_TAG=B32-B102-CPU-FEED-${{ github.sha }} -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl "-DCMAKE_CXX_FLAGS=/DNOMINMAX /EHsc /DKYTY_B32_FRAME_PROFILE /DKYTY_B32_QUIET_HOT_LOGS /DKYTY_B32_BATCH_RESOURCE_GC /DKYTY_B32_FORCE_SILENT_SHADER_DUMPS /DKYTY_B32_PHASE_PROFILE /DKYTY_B32_FAST_CPU_SETS /DKYTY_B32_FAST_BIND /DKYTY_B32_SKIP_UNMAPPED_GPU_SYNC /DKYTY_B32_QUIET_SHADER_PHASES /DKYTY_B32_LARGE_COMPUTE_FRONTEND_CACHE" -DCMAKE_PREFIX_PATH="%Qt6_DIR%"
       - name: Verify pinned fast bind and cache markers
         shell: pwsh
         run: |
@@ -140,6 +142,8 @@ jobs:
           if (!$src.Contains("FindReuseStats")) { throw "Pinned buffer find reuse code missing." }
           if (!$src.Contains("#if !defined(KYTY_B32_FAST_BIND)")) { throw "Pinned fast bind code missing." }
           if (!$src.Contains("RegistrationEpoch()")) { throw "Pinned buffer lookup epoch guard missing." }
+          $shaderCore = Get-Content "$env:GITHUB_WORKSPACE/source/src/graphics/shader/recompiler/ShaderRecompiler.cpp" -Raw
+          if (!$shaderCore.Contains("MaxCachedComputeFrontends = 512") -or !$shaderCore.Contains("B32_PHASE_LOG")) { throw "Shader frontend throughput patch missing." }
           $dispatch = Get-Content "$env:GITHUB_WORKSPACE/source/src/graphics/host_gpu/renderer/renderCompute.cpp" -Raw
           if (!$dispatch.Contains("Once diagnostics are capped, avoid scanning image resources")) { throw "Dispatch diagnostics fast path missing." }
           $scheduler = Get-Content "$env:GITHUB_WORKSPACE/source/src/graphics/host_gpu/renderer/commandScheduler.cpp" -Raw
@@ -211,6 +215,6 @@ jobs:
       - name: Upload Windows x64 test build
         uses: actions/upload-artifact@v4
         with:
-          name: DemonSouls-B32-B94-SHADER-REPLAY-Windows-x64-${{ github.run_number }}
+          name: DemonSouls-B32-B102-CPU-FEED-Windows-x64-${{ github.run_number }}
           path: _Build/windows/install/**
           if-no-files-found: error

@@ -1,0 +1,115 @@
+diff --git a/src/graphics/shader/recompiler/ShaderRecompiler.cpp b/src/graphics/shader/recompiler/ShaderRecompiler.cpp
+index 4c7bb07..46b435b 100644
+--- a/src/graphics/shader/recompiler/ShaderRecompiler.cpp
++++ b/src/graphics/shader/recompiler/ShaderRecompiler.cpp
+@@ -28,6 +28,14 @@
+ #include <span>
+ #include <utility>
+ 
++#if defined(KYTY_B32_QUIET_SHADER_PHASES)
++// Keep actual shader errors and slow-pass diagnostics, while avoiding a dozen
++// synchronous log writes on every newly compiled permutation.
++#define B32_PHASE_LOG(...) ((void)0)
++#else
++#define B32_PHASE_LOG(...) LOGF(__VA_ARGS__)
++#endif
++
+ namespace Libs::Graphics::ShaderRecompiler {
+ 
+ namespace {
+@@ -519,8 +527,16 @@ struct CachedComputeFrontend {
+ 
+ std::mutex g_compute_frontend_mutex;
+ std::deque<CachedComputeFrontend> g_compute_frontends;
++#if defined(KYTY_B32_LARGE_COMPUTE_FRONTEND_CACHE)
++// Demon's Souls revisits the same compute source with different resource
++// specializations. Retain more decoded instruction streams and CFGs so these
++// permutations do not redo the serial shader frontend work.
++constexpr size_t MaxCachedComputeFrontends = 512;
++constexpr size_t MaxCachedComputeFrontendBytes = 256ull * 1024 * 1024;
++#else
+ constexpr size_t MaxCachedComputeFrontends = 64;
+ constexpr size_t MaxCachedComputeFrontendBytes = 96ull * 1024 * 1024;
++#endif
+ size_t g_compute_frontend_bytes = 0;
+ 
+ bool FindCachedComputeFrontend(std::span<const uint32_t> code, uint64_t hash,
+@@ -585,7 +601,7 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
+ 		                                 .count());
+ 	};
+ 
+-	LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " code_words=%" PRIu64 " decode\n",
++	B32_PHASE_LOG("%s phase begin: stage=%s hash=0x%016" PRIx64 " code_words=%" PRIu64 " decode\n",
+ 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
+ 	     static_cast<uint64_t>(code.size()));
+ 
+@@ -604,7 +620,7 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
+ 			Decoder::DecodeProgram(code, decoded);
+ 		}
+ 	}
+-	LOGF("%s phase end: stage=%s hash=0x%016" PRIx64 " decode instructions=%" PRIu64
++	B32_PHASE_LOG("%s phase end: stage=%s hash=0x%016" PRIx64 " decode instructions=%" PRIu64
+ 	     " elapsed_ms=%" PRIu64 "\n",
+ 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
+ 	     static_cast<uint64_t>(decoded.instructions.size()), phase_ms());
+@@ -617,10 +633,10 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
+ 		}
+ 	}
+ 
+-	LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " CFG BuildGraph\n", GetDumpLabel(options),
++	B32_PHASE_LOG("%s phase begin: stage=%s hash=0x%016" PRIx64 " CFG BuildGraph\n", GetDumpLabel(options),
+ 	     StageName(options.stage), options.shader_hash);
+ 	if (!frontend_hit) cfg = CFG::BuildGraph(decoded);
+-	LOGF("%s phase end: stage=%s hash=0x%016" PRIx64 " CFG BuildGraph blocks=%" PRIu64
++	B32_PHASE_LOG("%s phase end: stage=%s hash=0x%016" PRIx64 " CFG BuildGraph blocks=%" PRIu64
+ 	     " loops=%" PRIu64 " back_edges=%" PRIu64 " elapsed_ms=%" PRIu64 "\n",
+ 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
+ 	     static_cast<uint64_t>(cfg.blocks.size()), static_cast<uint64_t>(cfg.natural_loops.size()),
+@@ -634,7 +650,7 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
+ 		LogDispatcherFallback(options, cfg, "build", dispatcher_reason);
+ 	} else {
+ 		const auto unstructured_cfg = cfg;
+-		LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " CFG Structurize\n",
++		B32_PHASE_LOG("%s phase begin: stage=%s hash=0x%016" PRIx64 " CFG Structurize\n",
+ 		     GetDumpLabel(options), StageName(options.stage), options.shader_hash);
+ 		if (!CFG::Structurize(cfg)) {
+ 			dispatcher_fallback      = true;
+@@ -648,10 +664,10 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
+ 			cfg.failure_block      = failure_block;
+ 			cfg.unsupported_reason = dispatcher_reason;
+ 		} else {
+-			LOGF("%s structured CFG success: blocks=%" PRIu64 "\n", GetDumpLabel(options),
++			B32_PHASE_LOG("%s structured CFG success: blocks=%" PRIu64 "\n", GetDumpLabel(options),
+ 			     static_cast<uint64_t>(cfg.blocks.size()));
+ 		}
+-		LOGF("%s phase end: stage=%s hash=0x%016" PRIx64 " CFG Structurize blocks=%" PRIu64
++		B32_PHASE_LOG("%s phase end: stage=%s hash=0x%016" PRIx64 " CFG Structurize blocks=%" PRIu64
+ 		     " loops=%" PRIu64 " elapsed_ms=%" PRIu64 "\n",
+ 		     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
+ 		     static_cast<uint64_t>(cfg.blocks.size()),
+@@ -698,10 +714,10 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
+ 	    .compute             = compute,
+ 	    .embedded_fetch      = embedded_fetch.loads.empty() ? nullptr : &embedded_fetch,
+ 	};
+-	LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " IR TranslateProgram\n",
++	B32_PHASE_LOG("%s phase begin: stage=%s hash=0x%016" PRIx64 " IR TranslateProgram\n",
+ 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash);
+ 	auto ir = Frontend::TranslateProgram(decoded, cfg, translate_options);
+-	LOGF("%s phase end: stage=%s hash=0x%016" PRIx64 " IR TranslateProgram blocks=%" PRIu64
++	B32_PHASE_LOG("%s phase end: stage=%s hash=0x%016" PRIx64 " IR TranslateProgram blocks=%" PRIu64
+ 	     " elapsed_ms=%" PRIu64 "\n",
+ 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
+ 	     static_cast<uint64_t>(ir.blocks.size()), phase_ms());
+@@ -802,10 +818,10 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
+ 		}
+ 	}
+ 
+-	LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " SPIR-V EmitProgram\n",
++	B32_PHASE_LOG("%s phase begin: stage=%s hash=0x%016" PRIx64 " SPIR-V EmitProgram\n",
+ 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash);
+ 	auto spirv = Spirv::EmitProgram(ir, options.input_info);
+-	LOGF("%s phase end: stage=%s hash=0x%016" PRIx64 " SPIR-V EmitProgram words=%" PRIu64
++	B32_PHASE_LOG("%s phase end: stage=%s hash=0x%016" PRIx64 " SPIR-V EmitProgram words=%" PRIu64
+ 	     " elapsed_ms=%" PRIu64 "\n",
+ 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
+ 	     static_cast<uint64_t>(spirv.size()),
