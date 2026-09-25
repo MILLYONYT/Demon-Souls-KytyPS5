@@ -1,0 +1,166 @@
+diff --git a/src/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp b/src/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp
+index 664e558..fe94c15 100644
+--- a/src/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp
++++ b/src/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp
+@@ -380,6 +380,26 @@ struct PipelineCache::ProgramCache {
+ 		BuildStageStaticKey(input_info, lookup_key.static_state);
+ 		auto                                         entry = programs.find(lookup_key);
+ 		ShaderRecompiler::IR::ResourceSnapshot       resources;
++#if defined(KYTY_B32_COMPUTE_SNAPSHOT_REUSE)
++		if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
++			static thread_local uint32_t calls = 0, retained = 0;
++			auto& old = input_info.stage.resources;
++			retained += old.buffers.capacity() != 0 || old.images.capacity() != 0 ||
++			            old.samplers.capacity() != 0 || old.flattened_srt.capacity() != 0 ||
++			            old.user_data.capacity() != 0;
++			if (++calls == 32768) {
++				LOGF("Build32 compute snapshot reuse: retained=%u calls=%u\n", retained, calls);
++				calls = retained = 0;
++			}
++			old.buffers.clear();
++			old.images.clear();
++			old.samplers.clear();
++			old.flattened_srt.clear();
++			old.user_data.clear();
++			old.uniform_fill = {};
++			resources = std::move(input_info.stage.resources);
++		}
++#endif
+ 		ShaderRecompiler::IR::ResourceSpecialization specialization;
+ 		const ShaderRecompiler::IR::SrtRuntime       input_runtime {
+ 		          .user_data                  = params.user_data,
+diff --git a/src/graphics/host_gpu/renderer/renderCompute.cpp b/src/graphics/host_gpu/renderer/renderCompute.cpp
+index 40833cd..b94dd3a 100644
+--- a/src/graphics/host_gpu/renderer/renderCompute.cpp
++++ b/src/graphics/host_gpu/renderer/renderCompute.cpp
+@@ -387,6 +387,17 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
+ 	const auto& sh_regs = ctx.GetShaderRegisters();
+ 
+ 	ShaderComputeInputInfo input_info {};
++#if defined(KYTY_B32_COMPUTE_SNAPSHOT_REUSE)
++	// The shader stage owns this snapshot until the dispatch finishes. Return its
++	// vector capacity on every exit path, including recognized compute clears.
++	static thread_local ShaderRecompiler::IR::ResourceSnapshot recycled_snapshot;
++	input_info.stage.resources = std::move(recycled_snapshot);
++	struct ReturnSnapshot {
++		ShaderComputeInputInfo& input;
++		ShaderRecompiler::IR::ResourceSnapshot& recycled;
++		~ReturnSnapshot() { recycled = std::move(input.stage.resources); }
++	} return_snapshot {input_info, recycled_snapshot};
++#endif
+ 	const bool use_thread_dimensions = (mode & DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0;
+ 	input_info.dispatch_thread_dimensions = use_thread_dimensions;
+ #if defined(KYTY_B32_DISPATCH_STAGE_PROFILE)
+diff --git a/src/graphics/shader/recompiler/ir/passes/ResourceMaterialization.cpp b/src/graphics/shader/recompiler/ir/passes/ResourceMaterialization.cpp
+index d0ad7b7..252e772 100644
+--- a/src/graphics/shader/recompiler/ir/passes/ResourceMaterialization.cpp
++++ b/src/graphics/shader/recompiler/ir/passes/ResourceMaterialization.cpp
+@@ -598,13 +598,15 @@ static bool MaterializeSnapshot(const ResourcePlan& program, const SrtRuntime& r
+ 			if (masks.size() < 8) masks.push_back(std::move(active));
+ 		}
+ 	} recycle {descriptor_pool, source_mask_pool, values, active_sources};
+-	std::vector<uint32_t> flattened_srt;
++	auto& flattened_srt = snapshot.resources.flattened_srt;
++	flattened_srt.clear();
+ 	if (!EvaluateRuntimeSources(program, program.materialization_sources, runtime, values,
+ 	                            flattened_srt, program.clean_flat_slots, active_sources)) {
+ 		return fail("a descriptor source did not evaluate");
+ 	}
+ 
+ 	auto&                   next  = snapshot.resources;
++	next.uniform_fill = {};
+ 	const auto&             fill  = program.uniform_fill;
+ 	const auto              words = fill.fill.words;
+ 	std::array<uint32_t, 4> stored {};
+@@ -619,8 +621,9 @@ static bool MaterializeSnapshot(const ResourcePlan& program, const SrtRuntime& r
+ 	auto cursor = values.begin();
+ 	next.buffers.assign(cursor, cursor + program.info.buffers.size());
+ 	cursor += program.info.buffers.size();
+-	next.flattened_srt = std::move(flattened_srt);
+ 	next.images.resize(program.info.images.size());
++	// Inactive indirect images must be null even when the storage was recycled.
++	std::fill(next.images.begin(), next.images.end(), DescriptorValue {});
+ 	for (uint32_t image_index = 0; image_index < program.info.images.size(); image_index++) {
+ 		const auto& image  = program.info.images[image_index];
+ 		const auto* source = Source(program, image.source);
+@@ -1332,6 +1335,14 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
+ 		*report = {};
+ 	}
+ 	MaterializedSnapshot materialized;
++#if defined(KYTY_B32_COMPUTE_SNAPSHOT_REUSE)
++	// Preserve the public API's previous output on failure. Only borrow the
++	// capacity of an explicitly emptied snapshot supplied by the compute pool.
++	if (snapshot.buffers.empty() && snapshot.images.empty() && snapshot.samplers.empty() &&
++	    snapshot.flattened_srt.empty() && snapshot.user_data.empty() &&
++	    snapshot.uniform_fill.kind == UniformFillKind::None)
++		materialized.resources = std::move(snapshot);
++#endif
+ 	if (!MaterializeSnapshot(program, runtime, materialized, report)) {
+ 		return false;
+ 	}
+diff --git a/tests/ResourceTrackingTests.cpp b/tests/ResourceTrackingTests.cpp
+index ba522be..0b4b7e8 100644
+--- a/tests/ResourceTrackingTests.cpp
++++ b/tests/ResourceTrackingTests.cpp
+@@ -1,3 +1,4 @@
++#include "common/logging/log.h"
+ #include "graphics/shader/recompiler/ir/passes/LinearSrt.h"
+ #include "graphics/guest_gpu/gpu_defs.h"
+ #include "graphics/shader/recompiler/ir/ShaderIR.h"
+@@ -19,8 +20,16 @@
+ #include <memory>
+ #include <stdexcept>
+ #include <string>
++#include <string_view>
+ #include <vector>
+ 
++#if defined(KYTY_B32_COMPUTE_SNAPSHOT_REUSE)
++namespace Log {
++bool IsSilent() { return true; }
++void Write(std::string_view) {}
++} // namespace Log
++#endif
++
+ namespace {
+ 
+ using namespace Libs::Graphics::ShaderRecompiler::IR;
+@@ -1508,6 +1517,20 @@ void TestDenseIndirectImageMaterialization() {
+   ResourceSpecialization specialization;
+   Check(MaterializeResources(resource_plan, runtime, snapshot, specialization),
+         "dense indirect image table did not materialize");
++#if defined(KYTY_B32_COMPUTE_SNAPSHOT_REUSE)
++  const ResourceSnapshot first_snapshot = snapshot;
++  const ResourceSpecialization first_specialization = specialization;
++  snapshot.buffers.clear();
++  snapshot.images.clear();
++  snapshot.samplers.clear();
++  snapshot.flattened_srt.clear();
++  snapshot.user_data.clear();
++  snapshot.uniform_fill = {};
++  Check(MaterializeResources(resource_plan, runtime, snapshot, specialization) &&
++            SameResourceSnapshot(first_snapshot, snapshot) &&
++            first_specialization == specialization,
++        "recycled dense image snapshot changed the descriptor table");
++#endif
+   const auto mapping = specialization.images.empty()
+                            ? UINT32_MAX
+                            : specialization.images[0].indirect_mapping_offset;
+@@ -2535,6 +2558,18 @@ void TestConditionalIndirectImageMaterialization() {
+             reads == 0 && snapshot.images.size() == 1 &&
+             snapshot.images[0].dwords == std::array<uint32_t, 8>{},
+         "untaken indirect image branch probed its descriptor table");
++#if defined(KYTY_B32_COMPUTE_SNAPSHOT_REUSE)
++  snapshot.images[0].dwords.fill(0xffffffffu);
++  snapshot.images.clear();
++  snapshot.buffers.clear();
++  snapshot.samplers.clear();
++  snapshot.flattened_srt.clear();
++  snapshot.user_data.clear();
++  snapshot.uniform_fill = {};
++  Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
++            reads == 0 && snapshot.images[0].dwords == std::array<uint32_t, 8>{},
++        "recycled inactive image retained stale descriptor words");
++#endif
+   user_data[8] = 1;
+   Check(!MaterializeResources(plan, runtime, snapshot, specialization) && reads != 0,
+         "taken indirect image branch did not require its descriptor table");
