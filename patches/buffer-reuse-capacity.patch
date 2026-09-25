@@ -1,0 +1,31 @@
+diff --git a/src/graphics/host_gpu/renderer/pipeline/descriptors.cpp b/src/graphics/host_gpu/renderer/pipeline/descriptors.cpp
+index a4d44e3..cd44d87 100644
+--- a/src/graphics/host_gpu/renderer/pipeline/descriptors.cpp
++++ b/src/graphics/host_gpu/renderer/pipeline/descriptors.cpp
+@@ -896,14 +896,26 @@ void RenderExecutor::FindBuffers(PreparedBindings& prepared) {
+ 	struct FindReuseStats {
+ 		// Four ways per bucket let many active shaders coexist without
+ 		// searching every cached descriptor list on each draw.
++		// Keep four probes per lookup, but retain more distinct shader bindings.
++		// This avoids repeated buffer lookups when the game's active set exceeds
++		// sixteen buckets, without changing exact descriptor or epoch validation.
++#if defined(KYTY_B32_BUFFER_REUSE_512)
++		std::array<FindReuseEntry, 512> entries;
++		std::array<uint8_t, 128> next {};
++#else
+ 		std::array<FindReuseEntry, 64> entries;
+ 		std::array<uint8_t, 16> next {};
++#endif
+ 		uint64_t hits = 0;
+ 		uint64_t misses = 0;
+ 		uint64_t refreshes = 0;
+ 	};
+ 	static thread_local FindReuseStats reuse;
++#if defined(KYTY_B32_BUFFER_REUSE_512)
++	constexpr size_t FindReuseBucketCount = 128;
++#else
+ 	constexpr size_t FindReuseBucketCount = 16;
++#endif
+ 	constexpr size_t FindReuseWays = 4;
+ 	if ((reuse.hits + reuse.misses) == 8192) {
+ 		LOGF("Build32 buffer find reuse: hits=%" PRIu64 " misses=%" PRIu64
