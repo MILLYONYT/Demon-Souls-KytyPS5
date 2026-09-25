@@ -85,10 +85,9 @@ index c2102c3..e790be6 100644
  	RegionBits   m_cpu_dirty;
  	RegionBits   m_gpu_dirty;
 diff --git a/src/graphics/host_gpu/renderer/cache/bufferCache.h b/src/graphics/host_gpu/renderer/cache/bufferCache.h
-index 5cd0c13..a4b7a85 100644
 --- a/src/graphics/host_gpu/renderer/cache/bufferCache.h
 +++ b/src/graphics/host_gpu/renderer/cache/bufferCache.h
-@@ -79,6 +79,11 @@ public:
+@@ -79,6 +79,11 @@
  	};
  	void SynchronizeRegionRequest(SyncRegionRequest& request);
  	[[nodiscard]] uint64_t RegistrationEpoch() const { return m_registration_epoch; }
@@ -99,7 +98,7 @@ index 5cd0c13..a4b7a85 100644
 +#endif
  	void CollectMappedRegisteredRanges(const RangeSet& mapped, std::vector<RangeSet::Range>& ranges) const;
  
- 	void               RunGarbageCollector(uint64_t elapsed_submissions = 1);
+ 	void               RunGarbageCollector();
 diff --git a/src/graphics/host_gpu/renderer/cache/gpuResourceManager.cpp b/src/graphics/host_gpu/renderer/cache/gpuResourceManager.cpp
 index a97e2b3..e350f9e 100644
 --- a/src/graphics/host_gpu/renderer/cache/gpuResourceManager.cpp
