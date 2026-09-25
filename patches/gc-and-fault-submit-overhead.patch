@@ -1,0 +1,50 @@
+diff --git a/src/graphics/host_gpu/renderer/cache/gpuResourceManager.cpp b/src/graphics/host_gpu/renderer/cache/gpuResourceManager.cpp
+--- a/src/graphics/host_gpu/renderer/cache/gpuResourceManager.cpp
++++ b/src/graphics/host_gpu/renderer/cache/gpuResourceManager.cpp
+@@ -197,13 +197,15 @@
+ 	m_texture_cache.ProcessDownloadImages();
+ #if defined(KYTY_B32_BATCH_RESOURCE_GC)
+ 	// A full device-memory query and two cache sweeps per GPU submission are costly.
+-	// Keep fault and download handling immediate; sweep at most 16 submissions later.
+-	if (++m_gc_submissions < 16) {
++	// Keep fault and download handling immediate; amortize heap-budget queries
++	// and LRU sweeps over 64 submissions. The GC age advances by the same number
++	// of submissions, so this does not pin entries in the LRU indefinitely.
++	if (++m_gc_submissions < 64) {
+ 		return;
+ 	}
+ 	m_gc_submissions = 0;
+-	m_texture_cache.RunGarbageCollector(16);
+-	m_buffer_cache.RunGarbageCollector(16);
++	m_texture_cache.RunGarbageCollector(64);
++	m_buffer_cache.RunGarbageCollector(64);
+ #else
+ 	m_texture_cache.RunGarbageCollector();
+ 	m_buffer_cache.RunGarbageCollector();
+diff --git a/src/graphics/host_gpu/renderer/cache/faultManager.cpp b/src/graphics/host_gpu/renderer/cache/faultManager.cpp
+--- a/src/graphics/host_gpu/renderer/cache/faultManager.cpp
++++ b/src/graphics/host_gpu/renderer/cache/faultManager.cpp
+@@ -8,6 +8,7 @@
+ #include "graphics/host_gpu/renderer/commandScheduler.h"
+ #include "graphics/host_gpu/vulkanCommon.h"
+ 
++#include <atomic>
+ #include <bit>
+ #include <cinttypes>
+ #include <cstring>
+@@ -140,7 +141,14 @@
+ 		const auto  count  = static_cast<uint32_t>(faults[0]);
+ 		for (uint32_t index = 1; index <= count; ++index) {
+ 			fault_ranges.Add(faults[index], BufferCache::CACHING_PAGESIZE);
+-			LOGF("Accessed non-GPU cached memory at 0x%016" PRIx64 "\n", faults[index]);
++			// An address may recur thousands of times in a game session. Preserve
++			// fault handling, but avoid flushing a log line for every GPU hit.
++			static std::atomic<uint64_t> reported_faults {0};
++			const auto seen = reported_faults.fetch_add(1, std::memory_order_relaxed) + 1;
++			if (seen <= 32 || (seen & (seen - 1)) == 0) {
++				LOGF("Accessed non-GPU cached memory at 0x%016" PRIx64
++				     " (total=%" PRIu64 ")\n", faults[index], seen);
++			}
+ 		}
+ 		fault_ranges.ForEach([this](uint64_t start, uint64_t end) {
+ 			EXIT_IF(end - start > std::numeric_limits<uint32_t>::max());
