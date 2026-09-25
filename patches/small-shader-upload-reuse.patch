@@ -1,0 +1,110 @@
+diff --git a/src/graphics/host_gpu/renderer/cache/streamBuffer.cpp b/src/graphics/host_gpu/renderer/cache/streamBuffer.cpp
+index e2ed1b7..ec6baee 100644
+--- a/src/graphics/host_gpu/renderer/cache/streamBuffer.cpp
++++ b/src/graphics/host_gpu/renderer/cache/streamBuffer.cpp
+@@ -285,6 +285,9 @@ std::pair<uint8_t*, uint64_t> StreamBuffer::Map(uint64_t size, uint64_t alignmen
+ 		m_invalidation_mark    = invalidation_mark;
+ 		m_current_watch_cursor = 0;
+ 		std::swap(m_previous_watches, m_current_watches);
++#if defined(KYTY_B32_SMALL_UPLOAD_REUSE)
++		++m_wrap_generation;
++#endif
+ 	}
+ 	m_wait_cursor = wait_cursor;
+ 	m_wait_bound  = wait_bound;
+diff --git a/src/graphics/host_gpu/renderer/cache/streamBuffer.h b/src/graphics/host_gpu/renderer/cache/streamBuffer.h
+index 7817047..e00ebdf 100644
+--- a/src/graphics/host_gpu/renderer/cache/streamBuffer.h
++++ b/src/graphics/host_gpu/renderer/cache/streamBuffer.h
+@@ -104,6 +104,9 @@ public:
+ 	                                                bool allow_wait = true);
+ 	void                                        Commit();
+ 	[[nodiscard]] uint64_t Copy(const void* source, uint64_t size, uint64_t alignment = 0);
++#if defined(KYTY_B32_SMALL_UPLOAD_REUSE)
++	[[nodiscard]] uint64_t WrapGeneration() const noexcept { return m_wrap_generation; }
++#endif
+ 
+ private:
+ 	friend struct StreamBufferTestAccess;
+@@ -128,6 +131,9 @@ private:
+ 	std::vector<Watch>    m_previous_watches;
+ 	size_t                m_wait_cursor = 0;
+ 	uint64_t              m_wait_bound  = 0;
++#if defined(KYTY_B32_SMALL_UPLOAD_REUSE)
++	uint64_t              m_wrap_generation = 0;
++#endif
+ };
+ 
+ } // namespace Libs::Graphics
+diff --git a/src/graphics/host_gpu/renderer/pipeline/descriptors.cpp b/src/graphics/host_gpu/renderer/pipeline/descriptors.cpp
+index a4d44e3..f4f8c58 100644
+--- a/src/graphics/host_gpu/renderer/pipeline/descriptors.cpp
++++ b/src/graphics/host_gpu/renderer/pipeline/descriptors.cpp
+@@ -798,9 +798,66 @@ static vk::Sampler NativeSampler(RenderContext&                       context,
+ static vk::DescriptorBufferInfo NativeUpload(RenderContext&            context,
+                                              std::span<const uint32_t> data) {
+ 	EXIT_IF(data.empty());
+-	auto& command_buffer = context.GetCommandScheduler().Current();
++	auto& scheduler = context.GetCommandScheduler();
++	auto& command_buffer = scheduler.Current();
+ 	EXIT_IF(command_buffer.IsInvalid());
+ 	auto&      buffer = context.GetBufferCache().GetUtilityBuffer(MemoryUsage::Stream);
++#if defined(KYTY_B32_SMALL_UPLOAD_REUSE)
++	// Repeated shader-data and flattened-SRT uploads can share an immutable stream
++	// slice only while the same submit tick and stream-buffer pass are alive.
++	// A stream wrap may overwrite old offsets, so compare its generation too.
++	if (data.size() <= 128) {
++		struct Entry {
++			const RenderContext* context = nullptr;
++			const StreamBuffer* buffer = nullptr;
++			uint64_t tick = 0;
++			uint64_t generation = 0;
++			uint64_t fingerprint = 0;
++			std::vector<uint32_t> words;
++			vk::DescriptorBufferInfo descriptor {};
++		};
++		struct Cache {
++			std::array<Entry, 64> entries;
++			std::array<uint8_t, 16> next {};
++			uint32_t calls = 0, hits = 0, misses = 0;
++		};
++		static thread_local Cache cache;
++		if (++cache.calls == 16384) {
++			LOGF("Build32 small shader upload reuse: hits=%u misses=%u (64 slots)\n",
++			     cache.hits, cache.misses);
++			cache.calls = cache.hits = cache.misses = 0;
++		}
++		uint64_t fingerprint = 0xcbf29ce484222325ULL;
++		for (const auto word: data) {
++			fingerprint = (fingerprint ^ word) * 0x100000001b3ULL;
++		}
++		fingerprint = (fingerprint ^ data.size()) * 0x100000001b3ULL;
++		const auto bucket = fingerprint & 15u;
++		const auto tick = scheduler.CurrentTick();
++		const auto generation = buffer.WrapGeneration();
++		for (size_t way = 0; way < 4; ++way) {
++			const auto& entry = cache.entries[bucket * 4 + way];
++			if (entry.context == &context && entry.buffer == &buffer && entry.tick == tick &&
++			    entry.generation == generation && entry.fingerprint == fingerprint &&
++			    entry.words.size() == data.size() &&
++			    std::equal(entry.words.begin(), entry.words.end(), data.begin())) {
++				++cache.hits;
++				return entry.descriptor;
++			}
++		}
++		const auto offset = buffer.Copy(data.data(), data.size_bytes(), 256);
++		auto& entry = cache.entries[bucket * 4 + (cache.next[bucket]++ & 3u)];
++		entry.context = &context;
++		entry.buffer = &buffer;
++		entry.tick = scheduler.CurrentTick();
++		entry.generation = buffer.WrapGeneration();
++		entry.fingerprint = fingerprint;
++		entry.words.assign(data.begin(), data.end());
++		entry.descriptor = {buffer.Handle(), offset, data.size_bytes()};
++		++cache.misses;
++		return entry.descriptor;
++	}
++#endif
+ 	const auto offset = buffer.Copy(data.data(), data.size_bytes(), 256);
+ 	return {buffer.Handle(), offset, data.size_bytes()};
+ }
