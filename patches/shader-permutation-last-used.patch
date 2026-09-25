@@ -1,0 +1,80 @@
+diff --git a/src/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp b/src/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp
+index 664e558..36d1315 100644
+--- a/src/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp
++++ b/src/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp
+@@ -278,6 +278,11 @@ struct PipelineCache::ProgramCache {
+ 		// ShaderStageRuntime keeps a pointer into a compiled permutation. Later
+ 		// specializations of the same source must not invalidate an earlier draw.
+ 		std::deque<Permutation> permutations;
++#if defined(KYTY_B32_RECENT_SHADER_PERMUTATION)
++		// deque::push_back preserves references to existing permutations. The
++		// most recently used variant is a safe first probe on the GPU thread.
++		const Permutation* last_used = nullptr;
++#endif
+ 	};
+ 
+ 	struct ProgramKeyHash {
+@@ -397,15 +402,44 @@ struct PipelineCache::ProgramCache {
+ 			                      ShaderRecompiler::IR::MaterializeResources(
+ 			                          entry->second.resource_plan, runtime, resources,
+ 			                          specialization, &report));
+-			if (const auto permutation = std::ranges::find_if(
+-			        entry->second.permutations, [&](const Permutation& candidate) {
+-				        const auto& layout = candidate.program.bindings;
+-				        return layout.push_data_start_dword ==
+-				                   ShaderRecompiler::IR::PushData::StartFor(
+-				                       push_data_cursor, layout.ShaderDataDwords()) &&
+-				               candidate.specialization == specialization;
+-			        });
+-			    permutation != entry->second.permutations.end()) {
++			const auto matches = [&](const Permutation& candidate) {
++			        const auto& layout = candidate.program.bindings;
++			        return layout.push_data_start_dword ==
++			                   ShaderRecompiler::IR::PushData::StartFor(
++			                       push_data_cursor, layout.ShaderDataDwords()) &&
++			               candidate.specialization == specialization;
++			};
++			const Permutation* permutation = nullptr;
++#if defined(KYTY_B32_RECENT_SHADER_PERMUTATION)
++			struct RecentStats {
++				uint64_t recent = 0, fallback = 0, missing = 0;
++			};
++			static thread_local RecentStats stats;
++			if (stats.recent + stats.fallback + stats.missing == 65536) {
++				PipelineCacheLog("Build32 shader permutation reuse: recent={} fallback={} "
++				                 "missing={} (exact specialization and push-data layout)",
++				                 stats.recent, stats.fallback, stats.missing);
++				stats = {};
++			}
++			if (entry->second.last_used && matches(*entry->second.last_used)) {
++				permutation = entry->second.last_used;
++				++stats.recent;
++			}
++#endif
++			if (!permutation) {
++				const auto found = std::ranges::find_if(entry->second.permutations, matches);
++				if (found != entry->second.permutations.end()) {
++					permutation = &*found;
++#if defined(KYTY_B32_RECENT_SHADER_PERMUTATION)
++					entry->second.last_used = permutation;
++					++stats.fallback;
++#endif
++				}
++#if defined(KYTY_B32_RECENT_SHADER_PERMUTATION)
++				else ++stats.missing;
++#endif
++			}
++			if (permutation) {
+ 				input_info.stage = {.program   = &permutation->program,
+ 				                    .resources = std::move(resources)};
+ 				permutation->program.bindings.AdvancePushData(push_data_cursor);
+@@ -472,6 +506,9 @@ struct PipelineCache::ProgramCache {
+ 		entry->second.permutations.push_back(CompilePermutation(
+ 		    params, options, std::move(translated), std::move(specialization), push_data_cursor));
+ 		const auto& permutation = entry->second.permutations.back();
++#if defined(KYTY_B32_RECENT_SHADER_PERMUTATION)
++		entry->second.last_used = &permutation;
++#endif
+ 		input_info.stage = {.program = &permutation.program, .resources = std::move(resources)};
+ 		ShaderPrecompile::Record(params, options, permutation.specialization, push_data_cursor,
+ 		                         input_info);
