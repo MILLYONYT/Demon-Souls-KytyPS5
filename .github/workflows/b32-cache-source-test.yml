@@ -60,6 +60,18 @@ jobs:
             if ($LASTEXITCODE) { throw 'glslang install failed' }
           }
           "$root\installed\x64-windows\tools\glslang" >> $env:GITHUB_PATH
+      - name: Link recording regression test platform helpers
+        shell: pwsh
+        run: |
+          $path = 'source/CMakeLists.txt'
+          $text = Get-Content $path -Raw
+          $anchor = 'target_link_libraries(vulkan_recording_tests PRIVATE Threads::Threads Vulkan::Headers)'
+          $addition = 'target_sources(vulkan_recording_tests PRIVATE "${KYTY_SOURCE_DIR}/local/local-platform.cpp")'
+          if (!$text.Contains($anchor)) { throw 'Recording test linkage anchor missing' }
+          if (!$text.Contains($addition)) {
+            $text = $text.Replace($anchor, $anchor + [Environment]::NewLine + $addition)
+            Set-Content $path $text -NoNewline
+          }
       - name: Configure portable optimized build
         shell: cmd
         run: >
