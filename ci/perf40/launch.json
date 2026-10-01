@@ -1,5 +1,5 @@
 {
-  "checkpoint": "public-perf40-bb0fbe7",
+  "checkpoint": "public-perf40-normal-draw-recovery",
   "environment": {
     "KYTY_SRT_NATIVE": "1",
     "KYTY_SRT_PREDICATES": "1",
@@ -36,11 +36,11 @@
     "KYTY_PENDING_DRAIN": "1",
     "KYTY_VULKAN_RECORDING": "1",
     "KYTY_DEFERRED_SUBMIT": "1",
-    "KYTY_NATIVE_XPR": "1",
-    "KYTY_DRAW_PACKETS": "1",
-    "KYTY_NATIVE_XPR_PREDICT": "1",
-    "KYTY_NATIVE_IMAGE_PROOF": "1",
-    "KYTY_ASYNC_XPR_PIPELINES": "1",
+    "KYTY_NATIVE_XPR": "0",
+    "KYTY_DRAW_PACKETS": "0",
+    "KYTY_NATIVE_XPR_PREDICT": "0",
+    "KYTY_NATIVE_IMAGE_PROOF": "0",
+    "KYTY_ASYNC_XPR_PIPELINES": "0",
     "KYTY_GPU_BUFFER_PAGES": "1",
     "KYTY_IMAGE_GRANULES": "2",
     "KYTY_ASYNC_UPLOAD": "2",
