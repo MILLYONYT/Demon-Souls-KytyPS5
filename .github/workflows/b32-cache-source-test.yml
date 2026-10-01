@@ -1,235 +1,113 @@
-name: Demon Souls Build 32 best 103 recycled compute snapshot test
-# The pinned source already provides fast buffer lookup and bind-time object naming control.
-
+name: Demon Souls public perf40 Windows candidate
 on:
   push:
     branches: [best32-texture-alias-refresh-test]
     paths:
       - .github/workflows/b32-cache-source-test.yml
-      - patches/enable-vulkan-cache.patch
-      - patches/dispatch-diagnostics-fastpath.patch
-      - patches/dispatch-hotpath.patch
-      - patches/draw-auto-profile.patch
-      - patches/srt-planner-visited-set.patch
-      - patches/quiet-frame-hotlogs.patch
-      - patches/buffer-binding-associative-cache.patch
-      - patches/dispatch-batch-128.patch
-      - patches/texture-residency-pressure-gc.patch
-      - patches/srt-dense-memo.patch
-      - patches/buffer-bind-64-way.patch
-      - patches/shader-map-epoch-cache.patch
-      - patches/upstream-draw-binding-reuse.patch
-      - patches/buffer-cache-epoch-refresh.patch
-      - patches/upstream-storage-mip-view.patch
-      - patches/upstream-texture-min-lod.patch
-      - patches/upstream-depth-feedback.patch
-      - patches/upstream-buffer-cache-policy.patch
-      - patches/buffer-range-epoch-memo.patch
-      - patches/indirect-image-log-dedupe.patch
-      - patches/async-pipeline-cache-checkpoint.patch
-      - patches/skip-unmapped-gpu-sync.patch
-      - patches/recycle-srt-scratch.patch
-      - patches/gc-and-fault-submit-overhead.patch
-      - patches/shader-permutation-replay.patch
-      - patches/shader-frontend-throughput.patch
-      - patches/small-shader-upload-reuse.patch
-      - patches/recycle-compute-resource-snapshot.patch
+      - ci/perf40/**
   workflow_dispatch:
-
 permissions:
   contents: read
-
 jobs:
   windows-x64:
-    name: Build 32 cache test Windows x64
+    name: Build public perf40 Windows x64
     runs-on: windows-2022
     steps:
-      - name: Checkout test branch
-        uses: actions/checkout@v4
-      - name: Checkout Build 32 source revision
+      - uses: actions/checkout@v4
+      - name: Checkout public performance source
         uses: actions/checkout@v4
         with:
-          ref: fbcc0c6914a9e76ae5dc52358b935657dcfcb7d7
+          repository: chenxiao07/KytyPS5
+          ref: bb0fbe7e9f22d9bf2455f486fbf1a9aa33a6354d
           path: source
           submodules: recursive
-      - name: Apply aggressive cache and shader-bind optimizations
-        shell: pwsh
-        run: |
-          $patches = @(
-            "$env:GITHUB_WORKSPACE/patches/enable-vulkan-cache.patch",
-            "$env:GITHUB_WORKSPACE/patches/dispatch-diagnostics-fastpath.patch",
-            "$env:GITHUB_WORKSPACE/patches/dispatch-hotpath.patch",
-            "$env:GITHUB_WORKSPACE/patches/draw-auto-profile.patch",
-            "$env:GITHUB_WORKSPACE/patches/srt-planner-visited-set.patch",
-            "$env:GITHUB_WORKSPACE/patches/quiet-frame-hotlogs.patch",
-            "$env:GITHUB_WORKSPACE/patches/buffer-binding-associative-cache.patch",
-            "$env:GITHUB_WORKSPACE/patches/dispatch-batch-128.patch",
-            "$env:GITHUB_WORKSPACE/patches/texture-residency-pressure-gc.patch",
-            "$env:GITHUB_WORKSPACE/patches/srt-dense-memo.patch",
-            "$env:GITHUB_WORKSPACE/patches/buffer-bind-64-way.patch",
-            "$env:GITHUB_WORKSPACE/patches/shader-map-epoch-cache.patch",
-            "$env:GITHUB_WORKSPACE/patches/upstream-draw-binding-reuse.patch",
-            "$env:GITHUB_WORKSPACE/patches/buffer-cache-epoch-refresh.patch",
-            "$env:GITHUB_WORKSPACE/patches/upstream-storage-mip-view.patch",
-            "$env:GITHUB_WORKSPACE/patches/upstream-texture-min-lod.patch",
-            "$env:GITHUB_WORKSPACE/patches/upstream-depth-feedback.patch",
-            "$env:GITHUB_WORKSPACE/patches/upstream-buffer-cache-policy.patch",
-            "$env:GITHUB_WORKSPACE/patches/buffer-range-epoch-memo.patch",
-            "$env:GITHUB_WORKSPACE/patches/indirect-image-log-dedupe.patch",
-            "$env:GITHUB_WORKSPACE/patches/async-pipeline-cache-checkpoint.patch",
-            "$env:GITHUB_WORKSPACE/patches/skip-unmapped-gpu-sync.patch",
-            "$env:GITHUB_WORKSPACE/patches/recycle-srt-scratch.patch",
-            "$env:GITHUB_WORKSPACE/patches/gc-and-fault-submit-overhead.patch",
-            "$env:GITHUB_WORKSPACE/patches/shader-permutation-replay.patch",
-            "$env:GITHUB_WORKSPACE/patches/shader-frontend-throughput.patch",
-            "$env:GITHUB_WORKSPACE/patches/small-shader-upload-reuse.patch",
-            "$env:GITHUB_WORKSPACE/patches/recycle-compute-resource-snapshot.patch"
-          )
-          foreach ($patch in $patches) {
-            git -C source apply --3way --ignore-space-change --ignore-whitespace $patch
-            if ($LASTEXITCODE -ne 0) {
-              throw "Patch application failed for $patch; refusing to compile partial changes."
-            }
-          }
-          $header = "$env:GITHUB_WORKSPACE/source/src/graphics/host_gpu/renderer/cache/bufferCache.h"
-          $text = Get-Content $header -Raw
-          $old_gc = "void               RunGarbageCollector();"
-          $new_gc = "void               RunGarbageCollector(uint64_t elapsed_submissions = 1);"
-          if ($text.Contains($old_gc)) { $text = $text.Replace($old_gc, $new_gc) }
-          $old_buffer = "uint64_t m_gc_tick            = 0;"
-          $new_buffer = "uint64_t m_gc_tick            = 0;`r`n#if defined(KYTY_B32_FAST_BIND)`r`n`tBufferId m_last_buffer {};`r`n#endif"
-          if (!$text.Contains("BufferId m_last_buffer")) {
-            if (!$text.Contains($old_buffer)) { throw "Expected Build 32 buffer cache anchor was not found." }
-            $text = $text.Replace($old_buffer, $new_buffer)
-          }
-          Set-Content -Path $header -Value $text -NoNewline
-      - name: Setup Visual Studio environment
-        uses: ilammy/msvc-dev-cmd@v1
-      - name: Setup Ninja
-        uses: seanmiddleditch/gha-setup-ninja@v5
+      - uses: ilammy/msvc-dev-cmd@v1
+      - uses: seanmiddleditch/gha-setup-ninja@v5
+      - name: Install tested LLVM compiler
+        uses: KyleMayes/install-llvm-action@v2
+        with:
+          version: '19.1.7'
       - name: Locate vcpkg
         id: vcpkg
         shell: pwsh
         run: |
-          $vcpkgRoot = Split-Path (Get-Command vcpkg).Source
-          $portHash = (Get-FileHash "$vcpkgRoot\ports\glslang\vcpkg.json" -Algorithm SHA256).Hash
-          "root=$vcpkgRoot" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
-          "port_hash=$($portHash.ToLowerInvariant())" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
-      - name: Cache glslang
+          $root = Split-Path (Get-Command vcpkg).Source
+          $hash = (Get-FileHash "$root\ports\glslang\vcpkg.json" -Algorithm SHA256).Hash.ToLowerInvariant()
+          "root=$root" >> $env:GITHUB_OUTPUT
+          "port_hash=$hash" >> $env:GITHUB_OUTPUT
+      - uses: actions/cache@v4
         id: glslang_cache
-        uses: actions/cache@v4
         with:
           path: ${{ steps.vcpkg.outputs.root }}\installed\x64-windows
           key: glslang-${{ runner.os }}-${{ runner.arch }}-${{ steps.vcpkg.outputs.port_hash }}-tools-opt
       - name: Install glslang
         shell: pwsh
         run: |
-          $vcpkgRoot = "${{ steps.vcpkg.outputs.root }}"
-          if ("${{ steps.glslang_cache.outputs.cache-hit }}" -ne "true") { vcpkg install glslang[tools,opt]:x64-windows }
-          "$vcpkgRoot\installed\x64-windows\tools\glslang" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-      - name: Install Qt 6.10.3
-        uses: jurplel/install-qt-action@v4
-        with:
-          version: '6.10.3'
-          host: windows
-          target: desktop
-          arch: win64_msvc2022_64
-          cache: true
-      - name: Configure Release LTO
+          $root = "${{ steps.vcpkg.outputs.root }}"
+          if ("${{ steps.glslang_cache.outputs.cache-hit }}" -ne "true") {
+            vcpkg install glslang[tools,opt]:x64-windows
+            if ($LASTEXITCODE) { throw 'glslang install failed' }
+          }
+          "$root\installed\x64-windows\tools\glslang" >> $env:GITHUB_PATH
+      - name: Configure portable optimized build
         shell: cmd
-        run: |
-          cmake -S source -B _Build/windows -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=ON -DKYTY_BUILD_ORIGIN=Fork -DKYTY_BUILD_REPOSITORY=${{ github.repository }} -DKYTY_RELEASE_TAG=B32-B103-RECYCLED-SNAPSHOT-${{ github.sha }} -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl "-DCMAKE_CXX_FLAGS=/DNOMINMAX /EHsc /DKYTY_B32_FRAME_PROFILE /DKYTY_B32_QUIET_HOT_LOGS /DKYTY_B32_BATCH_RESOURCE_GC /DKYTY_B32_FORCE_SILENT_SHADER_DUMPS /DKYTY_B32_PHASE_PROFILE /DKYTY_B32_FAST_CPU_SETS /DKYTY_B32_FAST_BIND /DKYTY_B32_SKIP_UNMAPPED_GPU_SYNC /DKYTY_B32_QUIET_SHADER_PHASES /DKYTY_B32_LARGE_COMPUTE_FRONTEND_CACHE /DKYTY_B32_SMALL_UPLOAD_REUSE /DKYTY_B32_COMPUTE_SNAPSHOT_REUSE" -DCMAKE_PREFIX_PATH="%Qt6_DIR%"
-      - name: Verify pinned fast bind and cache markers
+        run: >
+          cmake -S source -B _Build/windows -G Ninja
+          -DCMAKE_BUILD_TYPE=Release -DKYTY_BUILD_LAUNCHER=OFF
+          -DKYTY_MARCH=x86-64-v3 -DKYTY_THIN_LTO=ON
+          -DKYTY_BUILD_ORIGIN=Fork -DKYTY_BUILD_REPOSITORY=${{ github.repository }}
+          -DKYTY_RELEASE_TAG=PUBLIC-PERF40-${{ github.run_number }}
+          -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl
+      - name: Build emulator and shader preparation
+        run: cmake --build _Build/windows --target kyty_emulator kyty_shader_precompile --parallel 4
+      - name: Build CPU resource and recording regression checks
+        run: cmake --build _Build/windows --target resource_tracking_tests resource_materialization_tests vulkan_recording_tests --parallel 4
+      - name: Run CPU regression checks
+        run: ctest --test-dir _Build/windows --output-on-failure -R "^(resource_tracking|resource_materialization|vulkan_recording)$"
+      - name: Package portable candidate
         shell: pwsh
         run: |
-          $src = Get-Content "$env:GITHUB_WORKSPACE/source/src/graphics/host_gpu/renderer/pipeline/descriptors.cpp" -Raw
-          if (!$src.Contains("FindReuseStats")) { throw "Pinned buffer find reuse code missing." }
-          if (!$src.Contains("#if !defined(KYTY_B32_FAST_BIND)")) { throw "Pinned fast bind code missing." }
-          if (!$src.Contains("RegistrationEpoch()")) { throw "Pinned buffer lookup epoch guard missing." }
-          if (!$src.Contains("Build32 small shader upload reuse:") -or !$src.Contains("WrapGeneration()")) { throw "Guarded small shader upload reuse missing." }
-          $pipeline = Get-Content "$env:GITHUB_WORKSPACE/source/src/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp" -Raw
-          if (!$pipeline.Contains("Build32 compute snapshot reuse:")) { throw "Compute snapshot recycling missing." }
-          $shaderCore = Get-Content "$env:GITHUB_WORKSPACE/source/src/graphics/shader/recompiler/ShaderRecompiler.cpp" -Raw
-          if (!$shaderCore.Contains("MaxCachedComputeFrontends = 512") -or !$shaderCore.Contains("B32_PHASE_LOG")) { throw "Shader frontend throughput patch missing." }
-          $dispatch = Get-Content "$env:GITHUB_WORKSPACE/source/src/graphics/host_gpu/renderer/renderCompute.cpp" -Raw
-          if (!$dispatch.Contains("Once diagnostics are capped, avoid scanning image resources")) { throw "Dispatch diagnostics fast path missing." }
-          $scheduler = Get-Content "$env:GITHUB_WORKSPACE/source/src/graphics/host_gpu/renderer/commandScheduler.cpp" -Raw
-          if (!$scheduler.Contains("if (m_pending_operations.empty()) return;")) { throw "Empty deferred queue fast path missing." }
-          if (!$scheduler.Contains("HandleForFullBarrier().pipelineBarrier")) { throw "Batch barrier coalescing missing." }
-          $draw = Get-Content "$env:GITHUB_WORKSPACE/source/src/graphics/host_gpu/renderer/renderDraw.cpp" -Raw
-          if (!$draw.Contains("Build32 draw auto stages:")) { throw "Draw stage profiler missing." }
-          $srt = Get-Content "$env:GITHUB_WORKSPACE/source/src/graphics/shader/recompiler/ir/passes/SrtWalker.cpp" -Raw
-          if (!$srt.Contains("m_visited.contains(inst)")) { throw "SRT planner visited set missing." }
-          $memory = Get-Content "$env:GITHUB_WORKSPACE/source/src/kernel/memory.cpp" -Raw
-          if (!$memory.Contains("MEMORY_HOT_LOG")) { throw "Quiet mapping path missing." }
-          $agc = Get-Content "$env:GITHUB_WORKSPACE/source/src/libs/agc.cpp" -Raw
-          if (!$agc.Contains("AGC_ROUTINE_LOG(")) { throw "Quiet shader creation path missing." }
-          $bindings = Get-Content "$env:GITHUB_WORKSPACE/source/src/graphics/host_gpu/renderer/pipeline/descriptors.cpp" -Raw
-          if (!$bindings.Contains("std::array<FindReuseEntry, 64> entries") -or !$bindings.Contains("FindReuseWays = 4")) { throw "Grouped binding cache entries missing." }
-          $shader = Get-Content "$env:GITHUB_WORKSPACE/source/src/graphics/shader/shader.cpp" -Raw
-          if (!$shader.Contains("g_shader_map_generation") -or !$shader.Contains("std::array<RecentShader, 64>")) { throw "Shader metadata cache missing." }
-          $reuse = Get-Content "$env:GITHUB_WORKSPACE/source/src/graphics/host_gpu/renderer/pipeline/descriptors.cpp" -Raw
-          if (!$reuse.Contains("prepared.images.resize(program.info.images.size())")) { throw "Reusable shader binding storage missing." }
-          if (!$reuse.Contains("entry.epoch = cache.RegistrationEpoch();") -or !$reuse.Contains("++reuse.refreshes;")) { throw "Buffer cache epoch refresh missing." }
-          if (!$reuse.Contains("single_storage_mip") -or !$reuse.Contains("std::max(physical_levels, base_level + view_levels)")) { throw "Upstream storage mip view fix missing." }
-          if (!$reuse.Contains("view.min_lod = descriptor.MinLod() - base_lod")) { throw "Streamed texture minimum LOD missing." }
-          $buffer = Get-Content "$env:GITHUB_WORKSPACE/source/src/graphics/host_gpu/renderer/cache/bufferCache.cpp" -Raw
-          if (!$buffer.Contains("m_recent_buffers[slot]") -or !$buffer.Contains("recent.epoch == m_registration_epoch")) { throw "Epoch-checked recent buffer range lookup missing." }
-          $spirv = Get-Content "$env:GITHUB_WORKSPACE/source/src/graphics/shader/recompiler/backend/spirv/spirvEmitterModule.cpp" -Raw
-          if (!$spirv.Contains("DecorationCoherent")) { throw "Upstream coherent buffer policy missing." }
-          $reports = Get-Content "$env:GITHUB_WORKSPACE/source/src/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp" -Raw
-          if (!$reports.Contains("ShaderPrecompile::Record") -or !$reports.Contains("ReplayPrecompiled")) { throw "Shader precompile and replay missing." }
-          if (!$reports.Contains("static thread_local std::unordered_set<uint64_t> reported")) { throw "Indirect image report deduplication missing." }
-          if (!$reports.Contains("std::async(std::launch::async") -or !$reports.Contains("WriteDriverCacheFile(path, prefix, payload)")) { throw "Asynchronous pipeline cache checkpoint missing." }
-          $gpu = Get-Content "$env:GITHUB_WORKSPACE/source/src/graphics/host_gpu/renderer/cache/gpuResourceManager.cpp" -Raw
-          if (!$gpu.Contains("Build32 unmapped GPU sync skipped")) { throw "Unmapped GPU sync bypass missing." }
-          if (!$gpu.Contains("m_gc_submissions < 64") -or !$gpu.Contains("RunGarbageCollector(64)")) { throw "Batched device-memory GC missing." }
-          $fault = Get-Content "$env:GITHUB_WORKSPACE/source/src/graphics/host_gpu/renderer/cache/faultManager.cpp" -Raw
-          if (!$fault.Contains("reported_faults.fetch_add")) { throw "Fault log throttling missing." }
-          $mat = Get-Content "$env:GITHUB_WORKSPACE/source/src/graphics/shader/recompiler/ir/passes/ResourceMaterialization.cpp" -Raw
-          if (!$mat.Contains("RecycleScratch") -or !$srt.Contains("results.resize(plan.descriptor_sizes.size())")) { throw "Recycled SRT scratch missing." }
-          $view = Get-Content "$env:GITHUB_WORKSPACE/source/src/graphics/host_gpu/renderer/image/imageView.cpp" -Raw
-          if (!$view.Contains("ImageViewMinLodCreateInfoEXT")) { throw "Minimum LOD image views missing." }
-          $depth = Get-Content "$env:GITHUB_WORKSPACE/source/src/graphics/host_gpu/renderer/renderDraw.cpp" -Raw
-          if (!$depth.Contains("DepthFeedbackAspects(draw_writes") -or !$depth.Contains("setAttachmentFeedbackLoopEnableEXT(feedback_aspects)")) { throw "Cross-stage depth feedback missing." }
-
-          $draw = Get-Content "$env:GITHUB_WORKSPACE/source/src/graphics/host_gpu/renderer/renderDraw.cpp" -Raw
-          if (!$draw.Contains("const auto  size   = sizes[i]")) { throw "Vertex descriptor size reuse missing." }
-          if (!$scheduler.Contains("DispatchesPerSubmission = 128")) { throw "Dispatch batch size missing." }
-          $texture = Get-Content "$env:GITHUB_WORKSPACE/source/src/graphics/host_gpu/renderer/cache/textureCache.cpp" -Raw
-          if (!$texture.Contains("m_trigger_gc_memory = m_pressure_gc_memory")) { throw "Texture residency change missing." }
-          if (!$srt.Contains("DenseMemoLease") -or !$srt.Contains("m_cache.Insert(inst, out)")) { throw "Dense SRT memo and guarded fallback missing." }
-          $srt_ir = Get-Content "$env:GITHUB_WORKSPACE/source/src/graphics/shader/recompiler/ir/ShaderIR.h" -Raw
-          if (!$srt_ir.Contains("memo_slot_count")) { throw "Dense SRT plan slot count missing." }
-      - name: Build Windows app
-        shell: cmd
-        run: cmake --build _Build/windows --target launcher --parallel
-      - name: Build resource tracking tests
-        shell: cmd
-        run: cmake --build _Build/windows --target resource_tracking_tests --parallel
-      - name: Test resource tracking and recycled snapshots
-        shell: cmd
-        run: ctest --test-dir _Build/windows --output-on-failure -R "^resource_tracking$"
-      - name: Install Windows app
-        shell: cmd
-        run: cmake --install _Build/windows --prefix _Build/windows/install
-      - name: Confirm cache code is in the executable
+          $out = '_Build/package'
+          New-Item -ItemType Directory -Force $out | Out-Null
+          Copy-Item _Build/windows/kyty_emulator.exe,_Build/windows/kyty_shader_precompile.exe,_Build/windows/libwinpthread-1.dll $out
+          Copy-Item source/run-windows.ps1,source/precompile-windows.ps1 $out
+          Copy-Item ci/perf40/* $out
+          New-Item -ItemType Directory -Force "$out/tools/local" | Out-Null
+          Copy-Item source/tools/local/static-precompile "$out/tools/local/" -Recurse
+          New-Item -ItemType Directory -Force "$out/3rdparty/Vulkan-Headers/include/vulkan","$out/src/graphics/guest_gpu" | Out-Null
+          Copy-Item source/3rdparty/Vulkan-Headers/include/vulkan/vulkan_core.h "$out/3rdparty/Vulkan-Headers/include/vulkan/"
+          Copy-Item source/src/graphics/guest_gpu/gpu_defs.h "$out/src/graphics/guest_gpu/"
+          Copy-Item source/3rdparty/winpthread/COPYING "$out/WINPTHREAD-COPYING.txt"
+          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -property installationPath
+          $crt = Get-Item "$vs\VC\Redist\MSVC\*\x64\Microsoft.VC14*.CRT" |
+            Where-Object { $_.Parent.Parent.Name -match '^\d+\.' } |
+            Sort-Object { [version]$_.Parent.Parent.Name } | Select-Object -Last 1
+          if (!$crt) { throw 'VC runtime redistributables missing' }
+          Copy-Item "$($crt.FullName)\msvcp140*.dll","$($crt.FullName)\vcruntime140*.dll" $out
+          Copy-Item source/LICENSE "$out/LICENSE.txt"
+          Copy-Item source/LICENSES "$out/LICENSES" -Recurse
+          @{
+            source_repository='chenxiao07/KytyPS5'
+            source_commit='bb0fbe7e9f22d9bf2455f486fbf1a9aa33a6354d'
+            packaging_commit=$env:GITHUB_SHA
+            frozen_baseline='786b5982e44ba0eacff828839d0bb484039e1b94'
+            pgo_included=$false
+            srt_aot_dll_included=$false
+            game_shader_seeds_included=$false
+          } | ConvertTo-Json | Set-Content "$out/build-receipt.json"
+          Get-ChildItem $out -File | ForEach-Object {
+            "$((Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant())  $($_.Name)"
+          } | Set-Content "$out/SHA256SUMS.txt"
+      - name: Verify packaged shader preparation imports
         shell: pwsh
         run: |
-          @'
-          from pathlib import Path
-          exe = Path('_Build/windows/install/kyty_emulator.exe').read_bytes()
-          assert b'Vulkan pipeline cache: initialized empty' in exe
-          assert b'Vulkan pipeline cache: disabled (dirty build)' not in exe
-          assert b'Build32 small shader upload reuse:' in exe
-          assert b'Build32 compute snapshot reuse:' in exe
-          assert b'Build32 GPU thread profile:' in exe
-          assert b'Build32 GPU worker priority: requested=highest' in exe
-          print('Compatible cache and GPU optimization code compiled into executable')
-          '@ | python -
-      - name: Upload Windows x64 test build
+          python -m pip install numpy
+          if ($LASTEXITCODE) { throw 'Python dependency install failed' }
+          python _Build/package/tools/local/static-precompile/precompile.py --help
+          if ($LASTEXITCODE) { throw 'Packaged shader extraction dependencies missing' }
+      - name: Upload Windows public perf40 candidate
         uses: actions/upload-artifact@v4
         with:
-          name: DemonSouls-B32-B103-RECYCLED-SNAPSHOT-Windows-x64-${{ github.run_number }}
-          path: _Build/windows/install/**
+          name: DemonSouls-PUBLIC-PERF40-Windows-x64-${{ github.run_number }}
+          path: _Build/package/**
           if-no-files-found: error
