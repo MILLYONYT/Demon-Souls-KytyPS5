@@ -1,16 +1,15 @@
-name: Demon Souls public perf40 Windows candidate
+name: KytyPS5 clean public fork standalone
 on:
   push:
-    branches: [best32-texture-alias-refresh-test]
+    branches: [public-fork-clean-standalone]
     paths:
       - .github/workflows/b32-cache-source-test.yml
-      - ci/perf40/**
   workflow_dispatch:
 permissions:
   contents: read
 jobs:
   windows-x64:
-    name: Build public perf40 Windows x64
+    name: Build unchanged public fork Windows x64
     runs-on: windows-2022
     steps:
       - uses: actions/checkout@v4
@@ -25,7 +24,7 @@ jobs:
         shell: pwsh
         run: |
           # The fork's ATRAC9 gitlink points to an unpublished commit.
-          # Use the exact public library revision from the frozen B112 source instead.
+          # Use an available public ATRAC9 revision; no emulator patches are applied.
           git -C source update-index --cacheinfo 160000,ec8899dadf393f655f2871a94e0fe4b3d6220c9a,3rdparty/LibAtrac9
           if ($LASTEXITCODE) { throw 'Audio dependency pin failed' }
           git -C source submodule update --init --force --depth=1 --recursive
@@ -60,29 +59,6 @@ jobs:
             if ($LASTEXITCODE) { throw 'glslang install failed' }
           }
           "$root\installed\x64-windows\tools\glslang" >> $env:GITHUB_PATH
-      - name: Link recording regression test platform helpers
-        shell: pwsh
-        run: |
-          $path = 'source/CMakeLists.txt'
-          $text = Get-Content $path -Raw
-          $anchor = 'target_link_libraries(vulkan_recording_tests PRIVATE Threads::Threads Vulkan::Headers)'
-          $addition = 'target_sources(vulkan_recording_tests PRIVATE "${KYTY_SOURCE_DIR}/local/local-platform.cpp")'
-          if (!$text.Contains($anchor)) { throw 'Recording test linkage anchor missing' }
-          if (!$text.Contains($addition)) {
-            $text = $text.Replace($anchor, $anchor + [Environment]::NewLine + $addition)
-            Set-Content $path $text -NoNewline
-          }
-      - name: Check resource tracking in legacy and portable modes
-        shell: pwsh
-        run: |
-          git -C source apply ../ci/perf40/portable-resource-tests.patch
-          if ($LASTEXITCODE) { throw 'Resource test adaptation failed' }
-          $settings = @(
-            'set_tests_properties(resource_tracking PROPERTIES ENVIRONMENT "KYTY_PORTABLE_SHADERS=0")',
-            'add_test(NAME resource_tracking_portable COMMAND resource_tracking_tests --portable-indirect-only)',
-            'set_tests_properties(resource_tracking_portable PROPERTIES ENVIRONMENT "KYTY_PORTABLE_SHADERS=1")'
-          )
-          Add-Content source/CMakeLists.txt ($settings -join [Environment]::NewLine)
       - name: Configure portable optimized build
         shell: cmd
         run: >
@@ -90,14 +66,25 @@ jobs:
           -DCMAKE_BUILD_TYPE=Release -DKYTY_BUILD_LAUNCHER=OFF
           -DKYTY_MARCH=x86-64-v3 -DKYTY_THIN_LTO=ON
           -DKYTY_BUILD_ORIGIN=Fork -DKYTY_BUILD_REPOSITORY=${{ github.repository }}
-          -DKYTY_RELEASE_TAG=PUBLIC-PERF40-${{ github.run_number }}
+          -DKYTY_RELEASE_TAG=CLEAN-PUBLIC-FORK-${{ github.run_number }}
           -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl
       - name: Build emulator and shader preparation
         run: cmake --build _Build/windows --target kyty_emulator kyty_shader_precompile --parallel 4
-      - name: Build CPU resource and recording regression checks
-        run: cmake --build _Build/windows --target resource_tracking_tests resource_materialization_tests vulkan_recording_tests --parallel 4
-      - name: Run CPU regression checks
-        run: ctest --test-dir _Build/windows --output-on-failure -R "^(resource_tracking(_portable)?|resource_materialization|vulkan_recording)$"
+      - name: Build unchanged resource regression checks
+        run: cmake --build _Build/windows --target resource_tracking_tests resource_materialization_tests --parallel 4
+      - name: Run unchanged resource regression checks
+        shell: pwsh
+        run: |
+          # Upstream's full resource fixture assumes the legacy layout.
+          # Test that layout without modifying its tests or production defaults.
+          $env:KYTY_PORTABLE_SHADERS = '0'
+          ctest --test-dir _Build/windows --output-on-failure -R "^(resource_tracking|resource_materialization)$"
+          if ($LASTEXITCODE) { throw 'Upstream resource regression checks failed' }
+      - name: Verify production source is unchanged
+        shell: pwsh
+        run: |
+          git -C source diff --exit-code -- src local CMakeLists.txt
+          if ($LASTEXITCODE) { throw 'Unexpected production source modification' }
       - name: Package portable candidate
         shell: pwsh
         run: |
@@ -105,7 +92,27 @@ jobs:
           New-Item -ItemType Directory -Force $out | Out-Null
           Copy-Item _Build/windows/kyty_emulator.exe,_Build/windows/kyty_shader_precompile.exe,_Build/windows/libwinpthread-1.dll $out
           Copy-Item source/run-windows.ps1,source/precompile-windows.ps1 $out
-          Copy-Item ci/perf40/* $out
+          # No files, patches, or configuration from ci/perf40 or the user's builds.
+          @{ checkpoint='clean-public-fork-baseline'; environment=@{}; command=@('--','kyty_emulator.exe') } |
+            ConvertTo-Json -Depth 4 | Set-Content "$out/launch.json" -Encoding UTF8
+          Set-Content "$out/run.cmd" -Encoding ASCII -Value @(
+            '@echo off',
+            'powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0run-windows.ps1" -Baseline -Prompt %*',
+            'if errorlevel 1 pause')
+          Set-Content "$out/precompile.cmd" -Encoding ASCII -Value @(
+            '@echo off',
+            'powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0precompile-windows.ps1" %*',
+            'if errorlevel 1 pause')
+          Set-Content "$out/README.txt" -Value @(
+            'Clean public chenxiao07/KytyPS5 source, not based on the user emulator.',
+            'Extract into a NEW empty folder. Do not copy old launch.json, caches, patches, or DLLs.',
+            'Run run.cmd and choose the folder containing eboot.bin.',
+            'Uses the upstream -Baseline mode with no performance environment configuration.',
+            'The upstream Windows red-zone protection, cache handling and logs remain enabled.',
+            'This is not the private benchmark package. No private PGO, SRT AOT or game shader seeds.',
+            'ATRAC9 uses public revision ec8899dadf393f655f2871a94e0fe4b3d6220c9a because the source gitlink is unavailable.',
+            'Unchanged legacy resource tracking and materialization tests run in CI.',
+            'Portable-specific and recording tests are not certified by this standalone workflow.')
           New-Item -ItemType Directory -Force "$out/tools/local" | Out-Null
           Copy-Item source/tools/local/static-precompile "$out/tools/local/" -Recurse
           New-Item -ItemType Directory -Force "$out/3rdparty/Vulkan-Headers/include/vulkan","$out/src/graphics/guest_gpu" | Out-Null
@@ -126,7 +133,11 @@ jobs:
             atrac9_commit='ec8899dadf393f655f2871a94e0fe4b3d6220c9a'
             unpublished_atrac9_optimization_included=$false
             packaging_commit=$env:GITHUB_SHA
-            frozen_baseline='786b5982e44ba0eacff828839d0bb484039e1b94'
+            user_emulator_patches_included=$false
+            prior_candidate_configuration_included=$false
+            source_modifications=@('ATRAC9 public dependency substitution only')
+            launcher_mode='upstream -Baseline'
+            test_modes=@('resource_tracking legacy','resource_materialization')
             pgo_included=$false
             srt_aot_dll_included=$false
             game_shader_seeds_included=$false
@@ -141,9 +152,9 @@ jobs:
           if ($LASTEXITCODE) { throw 'Python dependency install failed' }
           python _Build/package/tools/local/static-precompile/precompile.py --help
           if ($LASTEXITCODE) { throw 'Packaged shader extraction dependencies missing' }
-      - name: Upload Windows public perf40 candidate
+      - name: Upload clean standalone public fork
         uses: actions/upload-artifact@v4
         with:
-          name: DemonSouls-PUBLIC-PERF40-Windows-x64-${{ github.run_number }}
+          name: KytyPS5-CLEAN-PUBLIC-FORK-Windows-x64-${{ github.run_number }}
           path: _Build/package/**
           if-no-files-found: error
