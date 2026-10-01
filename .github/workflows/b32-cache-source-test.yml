@@ -20,7 +20,18 @@ jobs:
           repository: chenxiao07/KytyPS5
           ref: bb0fbe7e9f22d9bf2455f486fbf1a9aa33a6354d
           path: source
-          submodules: recursive
+          submodules: false
+      - name: Pin available audio dependency and fetch submodules
+        shell: pwsh
+        run: |
+          # The fork's ATRAC9 gitlink points to an unpublished commit.
+          # Use the exact public library revision from the frozen B112 source instead.
+          git -C source update-index --cacheinfo 160000,ec8899dadf393f655f2871a94e0fe4b3d6220c9a,3rdparty/LibAtrac9
+          if ($LASTEXITCODE) { throw 'Audio dependency pin failed' }
+          git -C source submodule update --init --force --depth=1 --recursive
+          if ($LASTEXITCODE) { throw 'Source dependency checkout failed' }
+          $actual = git -C source/3rdparty/LibAtrac9 rev-parse HEAD
+          if ($actual -ne 'ec8899dadf393f655f2871a94e0fe4b3d6220c9a') { throw 'Unexpected ATRAC9 revision' }
       - uses: ilammy/msvc-dev-cmd@v1
       - uses: seanmiddleditch/gha-setup-ninja@v5
       - name: Install tested LLVM compiler
@@ -89,6 +100,8 @@ jobs:
           @{
             source_repository='chenxiao07/KytyPS5'
             source_commit='bb0fbe7e9f22d9bf2455f486fbf1a9aa33a6354d'
+            atrac9_commit='ec8899dadf393f655f2871a94e0fe4b3d6220c9a'
+            unpublished_atrac9_optimization_included=$false
             packaging_commit=$env:GITHUB_SHA
             frozen_baseline='786b5982e44ba0eacff828839d0bb484039e1b94'
             pgo_included=$false

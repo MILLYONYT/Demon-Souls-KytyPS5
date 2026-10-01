@@ -32,3 +32,9 @@ Use the same save, location and camera as #112. Let the background preparation f
 Report steady FPS, walking stalls, texture flicker, and newest logs/*.out.log and *.err.log.
 A 1080p window affects presentation size and does not establish that the game's internal rendering is 1080p.
 Native game FPS is the comparison metric; frame generation is disabled.
+
+## Public dependency repair
+The source fork references an unpublished ATRAC9 submodule commit. This package instead uses
+public ATRAC9 revision ec8899dadf393f655f2871a94e0fe4b3d6220c9a, the revision in #112.
+The fork's unpublished audio-table initialization optimization is therefore not included.
+The new renderer, shader, readback and low-VRAM optimizations remain intact.
