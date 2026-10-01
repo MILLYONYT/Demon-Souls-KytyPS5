@@ -72,6 +72,17 @@ jobs:
             $text = $text.Replace($anchor, $anchor + [Environment]::NewLine + $addition)
             Set-Content $path $text -NoNewline
           }
+      - name: Check resource tracking in legacy and portable modes
+        shell: pwsh
+        run: |
+          git -C source apply ../ci/perf40/portable-resource-tests.patch
+          if ($LASTEXITCODE) { throw 'Resource test adaptation failed' }
+          $settings = @(
+            'set_tests_properties(resource_tracking PROPERTIES ENVIRONMENT "KYTY_PORTABLE_SHADERS=0")',
+            'add_test(NAME resource_tracking_portable COMMAND resource_tracking_tests --portable-indirect-only)',
+            'set_tests_properties(resource_tracking_portable PROPERTIES ENVIRONMENT "KYTY_PORTABLE_SHADERS=1")'
+          )
+          Add-Content source/CMakeLists.txt ($settings -join [Environment]::NewLine)
       - name: Configure portable optimized build
         shell: cmd
         run: >
@@ -86,7 +97,7 @@ jobs:
       - name: Build CPU resource and recording regression checks
         run: cmake --build _Build/windows --target resource_tracking_tests resource_materialization_tests vulkan_recording_tests --parallel 4
       - name: Run CPU regression checks
-        run: ctest --test-dir _Build/windows --output-on-failure -R "^(resource_tracking|resource_materialization|vulkan_recording)$"
+        run: ctest --test-dir _Build/windows --output-on-failure -R "^(resource_tracking(_portable)?|resource_materialization|vulkan_recording)$"
       - name: Package portable candidate
         shell: pwsh
         run: |

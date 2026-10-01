@@ -1,0 +1,37 @@
+diff --git a/tests/ResourceTrackingTests.cpp b/tests/ResourceTrackingTests.cpp
+index 8eddcaa..2a8f214 100644
+--- a/tests/ResourceTrackingTests.cpp
++++ b/tests/ResourceTrackingTests.cpp
+@@ -374,9 +374,14 @@ void TestInvariantIndirectImageMaterialization() {
+             dynamic_snapshot.images.size() == 2,
+         "dynamic indirect image table was not specialized transactionally");
+   const auto &mapping = dynamic_specialization.images[0];
+-  const auto key_count = dynamic_snapshot.flattened_srt[mapping.indirect_mapping_offset];
+-  Check(mapping.indirect_search_iterations == std::bit_width(key_count) &&
+-            mapping.indirect_mapping_offset + 1u + key_count * 2u ==
++  const bool portable = PortableShaders();
++  const auto mapping_offset = portable
++      ? dynamic_snapshot.flattened_srt.at(mapping.indirect_mapping_offset)
++      : mapping.indirect_mapping_offset;
++  const auto key_count = dynamic_snapshot.flattened_srt.at(mapping_offset);
++  Check(mapping.indirect_search_iterations ==
++            (portable ? ImageResource::RuntimeIndirectSearch : std::bit_width(key_count)) &&
++            mapping_offset + 1u + key_count * 2u ==
+                 dynamic_snapshot.flattened_srt.size(),
+         "indirect image mapping retained worst-case padding");
+ 
+@@ -3528,6 +3533,14 @@ int main(int argc, char** argv) {
+   }
+ 
+   try {
++    // The full suite below checks the legacy descriptor-specialization ABI.
++    // Exercise portable indirect mappings independently, with their runtime header.
++    if (argc == 2 && std::strcmp(argv[1], "--portable-indirect-only") == 0) {
++      Check(PortableShaders(), "portable indirect test requires portable shaders");
++      TestInvariantIndirectImageMaterialization();
++      std::cout << "portable indirect image mapping tests passed\n";
++      return 0;
++    }
+     const auto Run = [](const char *name, auto test) {
+       try {
+         test();
