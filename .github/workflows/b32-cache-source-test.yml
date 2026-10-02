@@ -9,7 +9,7 @@ permissions:
   contents: read
 jobs:
   windows-x64:
-    name: Build unchanged public fork Windows x64
+    name: Build standalone public fork with indexed draw crash fix
     runs-on: windows-2022
     steps:
       - uses: actions/checkout@v4
@@ -24,7 +24,7 @@ jobs:
         shell: pwsh
         run: |
           # The fork's ATRAC9 gitlink points to an unpublished commit.
-          # Use an available public ATRAC9 revision; no emulator patches are applied.
+          # Use an available public ATRAC9 revision; no user emulator patches are applied.
           git -C source update-index --cacheinfo 160000,ec8899dadf393f655f2871a94e0fe4b3d6220c9a,3rdparty/LibAtrac9
           if ($LASTEXITCODE) { throw 'Audio dependency pin failed' }
           git -C source submodule update --init --force --depth=1 --recursive
@@ -59,6 +59,14 @@ jobs:
             if ($LASTEXITCODE) { throw 'glslang install failed' }
           }
           "$root\installed\x64-windows\tools\glslang" >> $env:GITHUB_PATH
+      - name: Fix indexed draw shader initialization order
+        shell: pwsh
+        run: |
+          [IO.File]::WriteAllBytes('indexed-shader-init.patch', [Convert]::FromBase64String('LS0tIGEvc3JjL2dyYXBoaWNzL2hvc3RfZ3B1L3JlbmRlcmVyL3JlbmRlckRyYXcuY3BwCisrKyBiL3NyYy9ncmFwaGljcy9ob3N0X2dwdS9yZW5kZXJlci9yZW5kZXJEcmF3LmNwcApAQCAtMjA4MywxMSArMjA4Myw2IEBACiAJCVJlc2V0QmluZGluZ3MoKTsKIAkJcmV0dXJuIHRydWU7CiAJfQotCWlmIChhcmdzLmdwdV9hcmdzICE9IDAgJiYgc3RhdGUudnNfaW5wdXRfaW5mby5zdGFnZS5wcm9ncmFtLT5zdGFnZSA9PSBTaGFkZXJUeXBlOjpNZXNoKSB7Ci0JCS8vIEEgbWVzaCBkcmF3IHNpemVzIGl0cyB0YXNrIGdyaWQgZnJvbSB0aGUgY291bnRzLgotCQlSZXNldEJpbmRpbmdzKCk7Ci0JCXJldHVybiBmYWxzZTsKLQl9CiAKIAlpZiAoWHByQ2FwdHVyZTo6RW5hYmxlZCgpICYmIFhwckNhcHR1cmU6Omdfc3RhdGUuY3VycmVudF94cHIgJiYKIAkgICAgWHByQ2FwdHVyZTo6Z19zdGF0ZS5jYXB0dXJlX3RoaXMpIHsKQEAgLTIxMDcsNiArMjEwMiwxMyBAQAogCQlSZWZyZXNoU2hhZGVycyhidWZmZXIsIGRyYXcsIHRydWUsIHN0YXRlKTsKIAl9CiAKKwkvLyBSZWZyZXNoU2hhZGVycyBpbml0aWFsaXplcyBzdGFnZS5wcm9ncmFtOyBuZXZlciBpbnNwZWN0IGl0IGJlZm9yZSB0aGF0IGNhbGwuCisJaWYgKGFyZ3MuZ3B1X2FyZ3MgIT0gMCAmJiBzdGF0ZS52c19pbnB1dF9pbmZvLnN0YWdlLnByb2dyYW0tPnN0YWdlID09IFNoYWRlclR5cGU6Ok1lc2gpIHsKKwkJLy8gQSBtZXNoIGRyYXcgc2l6ZXMgaXRzIHRhc2sgZ3JpZCBmcm9tIHRoZSBjb3VudHMuCisJCVJlc2V0QmluZGluZ3MoKTsKKwkJcmV0dXJuIGZhbHNlOworCX0KKwogCUxvZ0RyYXdTdGF0ZUlmTmVlZGVkKGJ1ZmZlciwgZHJhdywgc3RhdGUsIHRydWUsIGZhbHNlLCBhcmdzLmluZGV4X3R5cGVfYW5kX3NpemUsCiAJICAgICAgICAgICAgICAgICAgICAgYXJncy5pbmRleF9hZGRyKTsKIAo='))
+          git -C source apply --check ../indexed-shader-init.patch
+          if ($LASTEXITCODE) { throw 'Indexed shader initialization patch does not match upstream' }
+          git -C source apply ../indexed-shader-init.patch
+          if ($LASTEXITCODE) { throw 'Indexed shader initialization patch failed' }
       - name: Configure portable optimized build
         shell: cmd
         run: >
@@ -80,11 +88,15 @@ jobs:
           $env:KYTY_PORTABLE_SHADERS = '0'
           ctest --test-dir _Build/windows --output-on-failure -R "^(resource_tracking|resource_materialization)$"
           if ($LASTEXITCODE) { throw 'Upstream resource regression checks failed' }
-      - name: Verify production source is unchanged
+      - name: Verify only the indexed draw crash fix is applied
         shell: pwsh
         run: |
-          git -C source diff --exit-code -- src local CMakeLists.txt
-          if ($LASTEXITCODE) { throw 'Unexpected production source modification' }
+          $changed = @(git -C source diff --name-only -- src local CMakeLists.txt)
+          if ($LASTEXITCODE -or $changed.Count -ne 1 -or $changed[0] -ne 'src/graphics/host_gpu/renderer/renderDraw.cpp') {
+            throw 'Unexpected production source modification'
+          }
+          git -C source apply --reverse --check ../indexed-shader-init.patch
+          if ($LASTEXITCODE) { throw 'Indexed shader fix differs from the verified patch' }
       - name: Package portable candidate
         shell: pwsh
         run: |
@@ -93,7 +105,7 @@ jobs:
           Copy-Item _Build/windows/kyty_emulator.exe,_Build/windows/kyty_shader_precompile.exe,_Build/windows/libwinpthread-1.dll $out
           Copy-Item source/run-windows.ps1,source/precompile-windows.ps1 $out
           # No files, patches, or configuration from ci/perf40 or the user's builds.
-          @{ checkpoint='clean-public-fork-baseline'; environment=@{}; command=@('--','kyty_emulator.exe') } |
+          @{ checkpoint='clean-public-fork-indexed-shader-init'; environment=@{}; command=@('--','kyty_emulator.exe') } |
             ConvertTo-Json -Depth 4 | Set-Content "$out/launch.json" -Encoding UTF8
           Set-Content "$out/run.cmd" -Encoding ASCII -Value @(
             '@echo off',
@@ -104,7 +116,8 @@ jobs:
             'powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0precompile-windows.ps1" %*',
             'if errorlevel 1 pause')
           Set-Content "$out/README.txt" -Value @(
-            'Clean public chenxiao07/KytyPS5 source, not based on the user emulator.',
+            'Public chenxiao07/KytyPS5 source, not based on the user emulator.',
+            'Fix: indexed indirect draws initialize the shader before checking its mesh stage.',
             'Extract into a NEW empty folder. Do not copy old launch.json, caches, patches, or DLLs.',
             'Run run.cmd and choose the folder containing eboot.bin.',
             'Uses the upstream -Baseline mode with no performance environment configuration.',
@@ -135,7 +148,7 @@ jobs:
             packaging_commit=$env:GITHUB_SHA
             user_emulator_patches_included=$false
             prior_candidate_configuration_included=$false
-            source_modifications=@('ATRAC9 public dependency substitution only')
+            source_modifications=@('ATRAC9 public dependency substitution','Initialize indexed shader before mesh-stage inspection')
             launcher_mode='upstream -Baseline'
             test_modes=@('resource_tracking legacy','resource_materialization')
             pgo_included=$false
