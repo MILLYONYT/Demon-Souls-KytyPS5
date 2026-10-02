@@ -75,6 +75,14 @@ jobs:
           if ($LASTEXITCODE) { throw 'Proven FPS ports do not match pinned source' }
           git -C source apply ../patches/b123-combined-renderer-performance.patch
           if ($LASTEXITCODE) { throw 'Proven FPS port failed; refusing a partial build' }
+      - name: Expose existing CPU draw argument checks without a Vulkan device
+        shell: pwsh
+        run: |
+          [IO.File]::WriteAllBytes('draw-run-cpu-selector.patch', [Convert]::FromBase64String('ZGlmZiAtLWdpdCBhL3Rlc3RzL1NoYWRlclJlY29tcGlsZXJDb21wdXRlVGVzdHMuY3BwIGIvdGVzdHMvU2hhZGVyUmVjb21waWxlckNvbXB1dGVUZXN0cy5jcHAKLS0tIGEvdGVzdHMvU2hhZGVyUmVjb21waWxlckNvbXB1dGVUZXN0cy5jcHAKKysrIGIvdGVzdHMvU2hhZGVyUmVjb21waWxlckNvbXB1dGVUZXN0cy5jcHAKQEAgLTMxOTQ4LDYgKzMxOTQ4LDEwIEBAIGludCBtYWluKGludCBhcmdjLCBjaGFyICoqYXJndikgewogICB9CiAgIENoZWNrTGVhc3RSZWNlbnRseVVzZWRDYWNoZU9yZGVyaW5nKCk7CiAgIENoZWNrRHJhd1J1bkFyZ3VtZW50cygpOworICBpZiAoYXJnYyA9PSAyICYmIHN0ZDo6c3RyY21wKGFyZ3ZbMV0sICItLWRyYXctcnVuLWFyZ3VtZW50cy1vbmx5IikgPT0gMCkgeworICAgIHN0ZDo6cHJpbnRmKCJbaG9zdF0gICAgRHJhd1J1bkFyZ3VtZW50cyBDUFUgYm91bmRzL3JlamVjdGlvbiBjaGVja3Mgb2tcbiIpOworICAgIHJldHVybiAwOworICB9CiAjaWZkZWYgS1lUWV9MT0NBTF9OQVRJVkVfUkVTT1VSQ0VTCiAgIGlmIChhcmdjID09IDIgJiYgc3RkOjpzdHJjbXAoYXJndlsxXSwgIi0tbmF0aXZlLXBpcGVsaW5lLWluZGV4LW9ubHkiKSA9PSAwKSB7CiAgICAgVnVsa2FuSGFybmVzcyB2dWxrYW47Cgo='))
+          git -C source apply --check ../draw-run-cpu-selector.patch
+          if ($LASTEXITCODE) { throw 'CPU draw argument selector does not match source' }
+          git -C source apply ../draw-run-cpu-selector.patch
+          if ($LASTEXITCODE) { throw 'CPU draw argument selector patch failed' }
       - name: Configure portable optimized build
         shell: cmd
         run: >
@@ -110,14 +118,16 @@ jobs:
           if ($LASTEXITCODE) { throw 'Release compiler regression checks failed' }
           & _Build/windows/shader_recompiler_compute_tests.exe --gpu-math-emission-only
           if ($LASTEXITCODE) { throw 'GPU math SPIR-V emission checks failed' }
-          & _Build/windows/shader_recompiler_compute_tests.exe --draw-run-ranges-only
-          if ($LASTEXITCODE) { throw 'Native draw range checks failed' }
+          & _Build/windows/shader_recompiler_compute_tests.exe --draw-run-arguments-only
+          if ($LASTEXITCODE) { throw 'CPU draw argument checks failed' }
 
       - name: Verify frozen rendering fix and exact performance patch
         shell: pwsh
         run: |
           git -C source apply --reverse --check ../indexed-shader-init.patch
           if ($LASTEXITCODE) { throw 'Frozen indexed shader fix missing' }
+          git -C source apply --reverse --check ../draw-run-cpu-selector.patch
+          if ($LASTEXITCODE) { throw 'CPU draw argument selector missing' }
           git -C source apply --reverse --check ../patches/b123-combined-renderer-performance.patch
           if ($LASTEXITCODE) { throw 'Compiled source differs from the reviewed performance port' }
       - name: Package portable candidate
@@ -176,7 +186,7 @@ jobs:
             'This is not the private benchmark package. No private PGO, SRT AOT or game shader seeds.',
             'ATRAC9 uses public revision ec8899dadf393f655f2871a94e0fe4b3d6220c9a because the source gitlink is unavailable.',
             'Legacy resource tracking, materialization scratch/reentrancy checks and frontend cache lifetime/collision/concurrency/eviction checks run in CI.',
-            'Portable-specific and recording tests are not certified by this standalone workflow.')
+            'GPU execution, draw-range rasterization and recording tests require a Vulkan-capable machine and are not certified by CI.')
           New-Item -ItemType Directory -Force "$out/tools/local" | Out-Null
           Copy-Item source/tools/local/static-precompile "$out/tools/local/" -Recurse
           New-Item -ItemType Directory -Force "$out/3rdparty/Vulkan-Headers/include/vulkan","$out/src/graphics/guest_gpu" | Out-Null
@@ -223,8 +233,10 @@ jobs:
             frame_pipeline_enabled=$true
             readback_queue_mode=1
             async_upload_mode=2
-            additional_tests=@('guest_readback_packing dirty-byte parity','GPU math SPIR-V emission','draw_run_ranges')
+            additional_tests=@('guest_readback_packing dirty-byte parity','GPU math SPIR-V emission','draw_run_arguments CPU')
             incompatible_ports_not_included=@('BryKytyPS5 texture binding memo and draw speculation require different renderer APIs','Hardware buffer bounds require a separate shader/backend port')
+            ci_test_adaptation='Existing CPU draw argument checks isolated from Vulkan harness; GPU draw-range and rasterization tests remain available and are not certified by this runner'
+            gpu_runtime_checks_in_ci=$false
             pgo_included=$false
             srt_aot_dll_included=$false
             game_shader_seeds_included=$false
