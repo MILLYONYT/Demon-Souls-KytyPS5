@@ -83,8 +83,15 @@ jobs:
           -DKYTY_MARCH=x86-64-v3 -DKYTY_THIN_LTO=ON
           -DKYTY_BUILD_ORIGIN=Fork -DKYTY_BUILD_REPOSITORY=${{ github.repository }}
           -DKYTY_RELEASE_TAG=B121-PROVEN-FPS-${{ github.run_number }}
-          "-DCMAKE_CXX_FLAGS=/DKYTY_B32_FAST_CPU_SETS /DKYTY_B32_QUIET_SHADER_PHASES"
+          "-DCMAKE_CXX_FLAGS=/DWIN32 /D_WINDOWS /W3 /GR /EHsc /DKYTY_B32_FAST_CPU_SETS /DKYTY_B32_QUIET_SHADER_PHASES"
           -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl
+      - name: Verify required Windows compiler flags
+        shell: pwsh
+        run: |
+          $flags = (Select-String -Path _Build/windows/CMakeCache.txt -Pattern '^CMAKE_CXX_FLAGS:STRING=').Line
+          foreach ($required in @('/EHsc','/GR','/DWIN32','/D_WINDOWS','/DKYTY_B32_FAST_CPU_SETS','/DKYTY_B32_QUIET_SHADER_PHASES')) {
+            if (!$flags.Contains($required)) { throw "Required compiler setting missing: $required" }
+          }
       - name: Build emulator and shader preparation
         run: cmake --build _Build/windows --target kyty_emulator kyty_shader_precompile --parallel 4
       - name: Build unchanged resource regression checks
