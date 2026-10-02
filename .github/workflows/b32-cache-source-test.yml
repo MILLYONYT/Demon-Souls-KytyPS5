@@ -1,15 +1,16 @@
-name: KytyPS5 clean public fork standalone
+name: KytyPS5 B121 proven performance ports
 on:
   push:
-    branches: [public-fork-clean-standalone]
+    branches: [best121-proven-fps-ports]
     paths:
       - .github/workflows/b32-cache-source-test.yml
+      - patches/proven-fps-ports-on-b121.patch
   workflow_dispatch:
 permissions:
   contents: read
 jobs:
   windows-x64:
-    name: Build standalone public fork with indexed draw crash fix
+    name: Build frozen B121 with restored proven performance paths
     runs-on: windows-2022
     steps:
       - uses: actions/checkout@v4
@@ -67,6 +68,13 @@ jobs:
           if ($LASTEXITCODE) { throw 'Indexed shader initialization patch does not match upstream' }
           git -C source apply ../indexed-shader-init.patch
           if ($LASTEXITCODE) { throw 'Indexed shader initialization patch failed' }
+      - name: Apply compatible proven performance ports
+        shell: pwsh
+        run: |
+          git -C source apply --check ../patches/proven-fps-ports-on-b121.patch
+          if ($LASTEXITCODE) { throw 'Proven FPS ports do not match pinned source' }
+          git -C source apply ../patches/proven-fps-ports-on-b121.patch
+          if ($LASTEXITCODE) { throw 'Proven FPS port failed; refusing a partial build' }
       - name: Configure portable optimized build
         shell: cmd
         run: >
@@ -74,29 +82,28 @@ jobs:
           -DCMAKE_BUILD_TYPE=Release -DKYTY_BUILD_LAUNCHER=OFF
           -DKYTY_MARCH=x86-64-v3 -DKYTY_THIN_LTO=ON
           -DKYTY_BUILD_ORIGIN=Fork -DKYTY_BUILD_REPOSITORY=${{ github.repository }}
-          -DKYTY_RELEASE_TAG=CLEAN-PUBLIC-FORK-${{ github.run_number }}
+          -DKYTY_RELEASE_TAG=B121-PROVEN-FPS-${{ github.run_number }}
+          "-DCMAKE_CXX_FLAGS=/DKYTY_B32_FAST_CPU_SETS /DKYTY_B32_QUIET_SHADER_PHASES"
           -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl
       - name: Build emulator and shader preparation
         run: cmake --build _Build/windows --target kyty_emulator kyty_shader_precompile --parallel 4
       - name: Build unchanged resource regression checks
-        run: cmake --build _Build/windows --target resource_tracking_tests resource_materialization_tests --parallel 4
+        run: cmake --build _Build/windows --target resource_tracking_tests resource_materialization_tests compute_frontend_cache_tests --parallel 4
       - name: Run unchanged resource regression checks
         shell: pwsh
         run: |
           # Upstream's full resource fixture assumes the legacy layout.
           # Test that layout without modifying its tests or production defaults.
           $env:KYTY_PORTABLE_SHADERS = '0'
-          ctest --test-dir _Build/windows --output-on-failure -R "^(resource_tracking|resource_materialization)$"
+          ctest --test-dir _Build/windows --output-on-failure -R "^(resource_tracking|resource_materialization|compute_frontend_cache)$"
           if ($LASTEXITCODE) { throw 'Upstream resource regression checks failed' }
-      - name: Verify only the indexed draw crash fix is applied
+      - name: Verify frozen rendering fix and exact performance patch
         shell: pwsh
         run: |
-          $changed = @(git -C source diff --name-only -- src local CMakeLists.txt)
-          if ($LASTEXITCODE -or $changed.Count -ne 1 -or $changed[0] -ne 'src/graphics/host_gpu/renderer/renderDraw.cpp') {
-            throw 'Unexpected production source modification'
-          }
           git -C source apply --reverse --check ../indexed-shader-init.patch
-          if ($LASTEXITCODE) { throw 'Indexed shader fix differs from the verified patch' }
+          if ($LASTEXITCODE) { throw 'Frozen indexed shader fix missing' }
+          git -C source apply --reverse --check ../patches/proven-fps-ports-on-b121.patch
+          if ($LASTEXITCODE) { throw 'Compiled source differs from the reviewed performance port' }
       - name: Package portable candidate
         shell: pwsh
         run: |
@@ -110,12 +117,12 @@ jobs:
             'powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0settings.ps1"',
             'if errorlevel 1 pause')
           # No files, patches, or configuration from ci/perf40 or the user's builds.
-          @{ checkpoint='standalone-legacy-shader-bindings'; environment=@{}; command=@('--','kyty_emulator.exe') } |
+          @{ checkpoint='b121-restored-proven-performance'; environment=@{}; command=@('--','kyty_emulator.exe','--shader-optimization-type','Performance','--shader-log-direction','Silent','--printf-direction','Silent') } |
             ConvertTo-Json -Depth 4 | Set-Content "$out/launch.json" -Encoding UTF8
           Set-Content "$out/run.cmd" -Encoding ASCII -Value @(
             '@echo off',
             'if /I "%~1"=="settings" goto settings',
-            'powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0run-windows.ps1" -Baseline -Prompt -Set KYTY_PORTABLE_SHADERS=0,KYTY_DRIVER_CACHE_KEY=ae183c1a3e4b1da3fe960d72f6884df438b72c79f4e0ca955d9e71b569c75ce9 %*',
+            'powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0run-windows.ps1" -Baseline -Prompt -Set KYTY_PORTABLE_SHADERS=0,KYTY_DRIVER_CACHE_KEY=ae183c1a3e4b1da3fe960d72f6884df438b72c79f4e0ca955d9e71b569c75ce9,KYTY_SHADER_WARMUP=1,KYTY_SHADER_WARMUP_THREADS=12,KYTY_SHADER_WARMUP_SECONDS=60,KYTY_SHADER_WARMUP_FILE=_PipelineCache/warmup-legacy/recording.shaders,KYTY_PREPARATION_SCRATCH=1,KYTY_DISPATCH_BATCH=128 %*',
             'goto finish',
             ':settings',
             'powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0settings.ps1"',
@@ -126,19 +133,23 @@ jobs:
             'powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0precompile-windows.ps1" %*',
             'if errorlevel 1 pause')
           Set-Content "$out/README.txt" -Value @(
-            'Public chenxiao07/KytyPS5 source, not based on the user emulator.',
+            'Public fork using frozen B121 rendering and audio, plus compatible accepted performance code.',
+            'B121 is frozen separately at best121-frozen-clean-textures-audio.',
+            'Shader replay records on first use; judge smoothness on a second launch through the same scene.',
+            'Restores B102 replay, B103 compute frontend reuse and quiet logging, GPU worker CPU sets/priority/QoS, SRT visited-set lookup, scratch capacity reuse and 128-dispatch batching.',
             'Fix: indexed indirect draws initialize the shader before checking its mesh stage.',
             'Extract into a NEW empty folder. Do not copy old launch.json, caches, patches, or DLLs.',
             'Run run.cmd and choose the folder containing eboot.bin.',
             'Open settings.cmd (or run.cmd settings) to change display, GPU, shader optimization and logging settings.',
             'Click Save, then relaunch the game. Settings are stored in launch.json.',
-            'Uses the upstream -Baseline mode with no performance environment configuration.',
+            'Uses upstream baseline drawing with only the documented accepted performance overrides.',
             'The upstream Windows red-zone protection and logs remain enabled.',
             'Texture compatibility test: legacy shader bindings (KYTY_PORTABLE_SHADERS=0) with a separate driver cache key.',
-            'The fork default portable binding path is disabled by run.cmd. Rendering still requires a gameplay test.',
+            'Portable shaders stay disabled. Native XPR, draw packets and image dirty/readback experiments remain at B121 defaults.',
+            'B121 texture/audio correctness is user-confirmed. This new combination still needs gameplay validation.',
             'This is not the private benchmark package. No private PGO, SRT AOT or game shader seeds.',
             'ATRAC9 uses public revision ec8899dadf393f655f2871a94e0fe4b3d6220c9a because the source gitlink is unavailable.',
-            'Unchanged legacy resource tracking and materialization tests run in CI.',
+            'Legacy resource tracking, materialization scratch/reentrancy checks and frontend cache lifetime/collision/concurrency/eviction checks run in CI.',
             'Portable-specific and recording tests are not certified by this standalone workflow.')
           New-Item -ItemType Directory -Force "$out/tools/local" | Out-Null
           Copy-Item source/tools/local/static-precompile "$out/tools/local/" -Recurse
@@ -160,14 +171,19 @@ jobs:
             atrac9_commit='ec8899dadf393f655f2871a94e0fe4b3d6220c9a'
             unpublished_atrac9_optimization_included=$false
             packaging_commit=$env:GITHUB_SHA
-            user_emulator_patches_included=$false
+            user_emulator_patches_included=$true
             prior_candidate_configuration_included=$false
-            source_modifications=@('ATRAC9 public dependency substitution','Initialize indexed shader before mesh-stage inspection')
+            source_modifications=@('ATRAC9 public dependency substitution','Initialize indexed shader before mesh-stage inspection','Reviewed performance ports from accepted B102/B103 lineage')
             launcher_mode='upstream -Baseline'
             settings_window_included=$true
             portable_shaders_enabled=$false
             driver_cache_key='ae183c1a3e4b1da3fe960d72f6884df438b72c79f4e0ca955d9e71b569c75ce9'
-            rendering_fix_confirmed=$false
+            frozen_baseline_commit='eea447d86b1245060488099ca289920bc242c939'
+            frozen_baseline_branch='best121-frozen-clean-textures-audio'
+            frozen_base_rendering_and_audio_user_confirmed=$true
+            new_performance_result_confirmed=$false
+            restored_performance=@('B102 shader recording and replay','B103 512-entry compute frontend cache','B103 quiet phase logs','accepted GPU worker CPU sets priority and QoS','SRT visited set','legacy resource scratch reuse','128 dispatch batch')
+            obsolete_old_gc_patch_not_applied='public fork uses per-frame GC with BDA-aware collection'
             test_modes=@('resource_tracking legacy','resource_materialization')
             pgo_included=$false
             srt_aot_dll_included=$false
@@ -194,12 +210,15 @@ jobs:
           $config.command = @('--','kyty_emulator.exe','--screen-width','1920','--screen-height','1080','--fullscreen','--present-mode','Mailbox','--shader-optimization-type','Performance')
           $testConfig = Join-Path $env:RUNNER_TEMP 'launcher-test.json'
           $config | ConvertTo-Json -Depth 4 | Set-Content $testConfig -Encoding UTF8
-          $text = (& "$out/run-windows.ps1" -Config $testConfig -Game $fake -Baseline -Set KYTY_PORTABLE_SHADERS=0,KYTY_DRIVER_CACHE_KEY=ae183c1a3e4b1da3fe960d72f6884df438b72c79f4e0ca955d9e71b569c75ce9 -DryRun 6>&1 | Out-String)
+          $text = (& "$out/run-windows.ps1" -Config $testConfig -Game $fake -Baseline -Set KYTY_PORTABLE_SHADERS=0,KYTY_DRIVER_CACHE_KEY=ae183c1a3e4b1da3fe960d72f6884df438b72c79f4e0ca955d9e71b569c75ce9,KYTY_SHADER_WARMUP=1,KYTY_SHADER_WARMUP_THREADS=12,KYTY_SHADER_WARMUP_SECONDS=60,KYTY_SHADER_WARMUP_FILE=_PipelineCache/warmup-legacy/recording.shaders,KYTY_PREPARATION_SCRATCH=1,KYTY_DISPATCH_BATCH=128 -DryRun 6>&1 | Out-String)
           foreach ($expected in @('--screen-width 1920','--screen-height 1080','--fullscreen','--present-mode Mailbox','--shader-optimization-type Performance')) {
             if (!$text.Contains($expected)) { throw "Launcher ignored setting: $expected" }
           }
           if (!$text.Contains('KYTY_PORTABLE_SHADERS=0') -or !$text.Contains('KYTY_DRIVER_CACHE_KEY=ae183c1a3e4b1da3fe960d72f6884df438b72c79f4e0ca955d9e71b569c75ce9')) {
             throw 'Launcher ignored the legacy binding or isolated cache override'
+          }
+          foreach ($expected in @('KYTY_SHADER_WARMUP=1','KYTY_PREPARATION_SCRATCH=1','KYTY_DISPATCH_BATCH=128')) {
+            if (!$text.Contains($expected)) { throw "Launcher ignored proven performance override: $expected" }
           }
           Remove-Item "$out/game-path.txt" -ErrorAction SilentlyContinue
           Write-Host 'Settings syntax, option construction and upstream launcher consumption passed.'
@@ -213,6 +232,6 @@ jobs:
       - name: Upload clean standalone public fork
         uses: actions/upload-artifact@v4
         with:
-          name: KytyPS5-CLEAN-PUBLIC-FORK-Windows-x64-${{ github.run_number }}
+          name: KytyPS5-B121-PROVEN-FPS-Windows-x64-${{ github.run_number }}
           path: _Build/package/**
           if-no-files-found: error
