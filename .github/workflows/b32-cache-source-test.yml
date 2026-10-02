@@ -1,4 +1,4 @@
-name: KytyPS5 B127 recording worker and native resource reuse
+name: KytyPS5 B127 index and descriptor reuse without recording worker
 on:
   push:
     branches: [best127-worker-index-descriptors]
@@ -11,7 +11,7 @@ permissions:
   contents: read
 jobs:
   windows-x64:
-    name: Build frozen B127 plus recording worker, index and descriptor reuse
+    name: Build frozen B127 plus index and descriptor reuse; recording worker disabled
     runs-on: windows-2022
     steps:
       - uses: actions/checkout@v4
@@ -98,7 +98,7 @@ jobs:
           -DCMAKE_BUILD_TYPE=Release -DKYTY_BUILD_LAUNCHER=OFF
           -DKYTY_MARCH=x86-64-v3 -DKYTY_THIN_LTO=ON
           -DKYTY_BUILD_ORIGIN=Fork -DKYTY_BUILD_REPOSITORY=${{ github.repository }}
-          -DKYTY_RELEASE_TAG=B127-WORKER-REUSE-${{ github.run_number }}
+          -DKYTY_RELEASE_TAG=B127-RESOURCE-REUSE-${{ github.run_number }}
           "-DCMAKE_CXX_FLAGS=/DWIN32 /D_WINDOWS /W3 /GR /EHsc /DKYTY_B32_FAST_CPU_SETS /DKYTY_B32_QUIET_SHADER_PHASES"
           -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl
       - name: Verify required Windows compiler flags
@@ -159,12 +159,12 @@ jobs:
             'powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0settings.ps1"',
             'if errorlevel 1 pause')
           # No files, patches, or configuration from ci/perf40 or the user's builds.
-          @{ checkpoint='b127-worker-index-descriptors'; environment=@{}; command=@('--','kyty_emulator.exe','--shader-optimization-type','Performance','--shader-log-direction','Silent','--printf-direction','Silent') } |
+          @{ checkpoint='b127-index-descriptors-worker-off'; environment=@{}; command=@('--','kyty_emulator.exe','--shader-optimization-type','Performance','--shader-log-direction','Silent','--printf-direction','Silent') } |
             ConvertTo-Json -Depth 4 | Set-Content "$out/launch.json" -Encoding UTF8
           Set-Content "$out/run.cmd" -Encoding ASCII -Value @(
             '@echo off',
             'if /I "%~1"=="settings" goto settings',
-            'powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0run-windows.ps1" -Baseline -Prompt -Set KYTY_PORTABLE_SHADERS=0,KYTY_DRIVER_CACHE_KEY=98edcf312ef7ea126af9bb5a876005fc746955313ea0535ba2563c766289753b,KYTY_SHADER_WARMUP=1,KYTY_SHADER_WARMUP_THREADS=12,KYTY_SHADER_WARMUP_SECONDS=60,KYTY_SHADER_WARMUP_FILE=_PipelineCache/warmup-legacy/recording.shaders,KYTY_PREPARATION_SCRATCH=1,KYTY_DISPATCH_BATCH=128,KYTY_BACKING_READ=1,KYTY_FRAME_PIPELINE=1,KYTY_READBACK_QUEUE=1,KYTY_READBACK_SLOTS=1,KYTY_ASYNC_UPLOAD=2,KYTY_BDA_DIRTY_REGIONS=1,KYTY_NATIVE_XPR=1,KYTY_NATIVE_XPR_RELOCATE=1,KYTY_NATIVE_XPR_STORE_BUDGET=256,KYTY_NATIVE_XPR_KEEP_FRAMES=600,KYTY_NATIVE_IMAGE_PROOF=1,KYTY_ASYNC_XPR_PIPELINES=1,KYTY_VULKAN_RECORDING=1,KYTY_DEFERRED_SUBMIT=1 %*',
+            'powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0run-windows.ps1" -Baseline -Prompt -Set KYTY_PORTABLE_SHADERS=0,KYTY_DRIVER_CACHE_KEY=98edcf312ef7ea126af9bb5a876005fc746955313ea0535ba2563c766289753b,KYTY_SHADER_WARMUP=1,KYTY_SHADER_WARMUP_THREADS=12,KYTY_SHADER_WARMUP_SECONDS=60,KYTY_SHADER_WARMUP_FILE=_PipelineCache/warmup-legacy/recording.shaders,KYTY_PREPARATION_SCRATCH=1,KYTY_DISPATCH_BATCH=128,KYTY_BACKING_READ=1,KYTY_FRAME_PIPELINE=1,KYTY_READBACK_QUEUE=1,KYTY_READBACK_SLOTS=1,KYTY_ASYNC_UPLOAD=2,KYTY_BDA_DIRTY_REGIONS=1,KYTY_NATIVE_XPR=1,KYTY_NATIVE_XPR_RELOCATE=1,KYTY_NATIVE_XPR_STORE_BUDGET=256,KYTY_NATIVE_XPR_KEEP_FRAMES=600,KYTY_NATIVE_IMAGE_PROOF=1,KYTY_ASYNC_XPR_PIPELINES=1,KYTY_VULKAN_RECORDING=0,KYTY_DEFERRED_SUBMIT=0 %*',
             'goto finish',
             ':settings',
             'powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0settings.ps1"',
@@ -177,8 +177,8 @@ jobs:
           $verify = (Get-Content "$out/run.cmd" -Raw).Replace('KYTY_NATIVE_XPR=1','KYTY_NATIVE_XPR=2')
           [IO.File]::WriteAllText("$out/run-verify.cmd", $verify, [Text.ASCIIEncoding]::new())
           Set-Content "$out/README.txt" -Value @(
-            'Frozen user-confirmed B127 plus recording worker, deferred submit, index cleanup and descriptor reuse.',
-            'Vulkan recording and deferred submission move driver work off the render thread.',
+            'Frozen user-confirmed B127 plus index cleanup and descriptor reuse. Recording worker and deferred submission disabled after the user reported regression in B129.',
+            'Uses B127 synchronous recording/submission; KYTY_VULKAN_RECORDING=0 and KYTY_DEFERRED_SUBMIT=0 are explicitly enforced.',
             'CPU-dirty small index ranges synchronize once until the next guest write.',
             'GPU-completed descriptor reuse retains up to 2048 per layout and 16384 total.',
             'Preserves the exact B127 legacy cache key and shader code; keep your working B127 cache.',
@@ -204,11 +204,11 @@ jobs:
             'The upstream Windows red-zone protection and logs remain enabled.',
             'Texture compatibility test: legacy shader bindings (KYTY_PORTABLE_SHADERS=0) with a separate driver cache key.',
             'Portable shaders stay disabled. Native XPR and async readback enabled; draw packets and partial image dirty experiments stay off.',
-            'B127 has user-confirmed warmed-cache FPS gains. This worker/index/descriptor candidate requires gameplay validation.',
+            'B127 has user-confirmed warmed-cache FPS gains. This index/descriptor-only candidate requires gameplay validation.',
             'This is not the private benchmark package. No private PGO, SRT AOT or game shader seeds.',
             'ATRAC9 uses public revision ec8899dadf393f655f2871a94e0fe4b3d6220c9a because the source gitlink is unavailable.',
             'Legacy resource tracking, materialization scratch/reentrancy checks and frontend cache lifetime/collision/concurrency/eviction checks run in CI.',
-            'GPU execution, draw-range rasterization and recording tests require a Vulkan-capable machine and are not certified by CI.')
+            'Mocked recording/submission checks run in CI. GPU execution and draw-range rasterization require a Vulkan-capable machine and are not certified by CI.')
           New-Item -ItemType Directory -Force "$out/tools/local" | Out-Null
           Copy-Item source/tools/local/static-precompile "$out/tools/local/" -Recurse
           New-Item -ItemType Directory -Force "$out/3rdparty/Vulkan-Headers/include/vulkan","$out/src/graphics/guest_gpu" | Out-Null
@@ -231,7 +231,7 @@ jobs:
             packaging_commit=$env:GITHUB_SHA
             user_emulator_patches_included=$true
             prior_candidate_configuration_included=$false
-            source_modifications=@('ATRAC9 public dependency substitution','Initialize indexed shader before mesh-stage inspection','Reviewed performance ports from accepted B102/B103 lineage','Driver cache survives Save','Hash-bucketed SRT planning and shader compiler optimizations','GPU readback batching','Native XPR relocation retention and rebinding','Per-region BDA proofs and range-scoped upload waits','BryKytyPS5 BDA suballocation and exact fp32 math','Small CPU index range synchronization','GPU-completed descriptor reuse pool expansion','Recording worker and deferred submission enabled')
+            source_modifications=@('ATRAC9 public dependency substitution','Initialize indexed shader before mesh-stage inspection','Reviewed performance ports from accepted B102/B103 lineage','Driver cache survives Save','Hash-bucketed SRT planning and shader compiler optimizations','GPU readback batching','Native XPR relocation retention and rebinding','Per-region BDA proofs and range-scoped upload waits','BryKytyPS5 BDA suballocation and exact fp32 math','Small CPU index range synchronization','GPU-completed descriptor reuse pool expansion','Recording worker and deferred submission disabled after B129 regression')
             launcher_mode='upstream -Baseline'
             settings_window_included=$true
             portable_shaders_enabled=$false
@@ -246,12 +246,13 @@ jobs:
             upstream_fix_commits=@('e5738defa60a579dd076563f83d104b6d33be399','5a12d808ce9384db464484943ca0fb80bef3a4f8','a28de66fe2f431bcd3ee50c20c1388e00935e82b')
             cache_save_adaptation='Retain cache lifetime fix; always save content without size-only unchanged heuristic'
             upstream_renderer_commit='60a012f2852cbff1b825dac6ea373b9d6e432268'
-            previous_candidate_commit='4da4f8c5c49688abc0d0df05507fdb0ae496aca0'
+            previous_candidate_commit='7958023136e36fede2c06218eb0024f57f6c27a1'
+            previous_candidate_performance_user_report='worse; isolate resource reuse with recording and deferred submission disabled'
             previous_candidate_ci_passed=$true
             brykyty_ports=@('4068f4ac886dcd25acc52b6e3fa3e3800dc576a9 BDA suballocation adapted','5e224812df1354f89c7451e58fc540c476843dc0 exact fp32 helpers adapted')
             baseline_warmed_cache_performance_user_confirmed=$true
-            vulkan_recording_enabled=$true
-            deferred_submit_enabled=$true
+            vulkan_recording_enabled=$false
+            deferred_submit_enabled=$false
             native_index_cleanup_commit='989af67edd0f9a94f763b44520ba849eebe8c16a'
             descriptor_pool_reuse_commit='540f97bd4d5f68f2c35bf00ce6cbf53540e83163'
             free_descriptor_sets_per_layout=2048
@@ -292,14 +293,14 @@ jobs:
           $config.command = @('--','kyty_emulator.exe','--screen-width','1920','--screen-height','1080','--fullscreen','--present-mode','Mailbox','--shader-optimization-type','Performance')
           $testConfig = Join-Path $env:RUNNER_TEMP 'launcher-test.json'
           $config | ConvertTo-Json -Depth 4 | Set-Content $testConfig -Encoding UTF8
-          $text = (& "$out/run-windows.ps1" -Config $testConfig -Game $fake -Baseline -Set KYTY_PORTABLE_SHADERS=0,KYTY_DRIVER_CACHE_KEY=98edcf312ef7ea126af9bb5a876005fc746955313ea0535ba2563c766289753b,KYTY_SHADER_WARMUP=1,KYTY_SHADER_WARMUP_THREADS=12,KYTY_SHADER_WARMUP_SECONDS=60,KYTY_SHADER_WARMUP_FILE=_PipelineCache/warmup-legacy/recording.shaders,KYTY_PREPARATION_SCRATCH=1,KYTY_DISPATCH_BATCH=128,KYTY_BACKING_READ=1,KYTY_FRAME_PIPELINE=1,KYTY_READBACK_QUEUE=1,KYTY_READBACK_SLOTS=1,KYTY_ASYNC_UPLOAD=2,KYTY_BDA_DIRTY_REGIONS=1,KYTY_NATIVE_XPR=1,KYTY_NATIVE_XPR_RELOCATE=1,KYTY_NATIVE_XPR_STORE_BUDGET=256,KYTY_NATIVE_XPR_KEEP_FRAMES=600,KYTY_NATIVE_IMAGE_PROOF=1,KYTY_ASYNC_XPR_PIPELINES=1,KYTY_VULKAN_RECORDING=1,KYTY_DEFERRED_SUBMIT=1 -DryRun 6>&1 | Out-String)
+          $text = (& "$out/run-windows.ps1" -Config $testConfig -Game $fake -Baseline -Set KYTY_PORTABLE_SHADERS=0,KYTY_DRIVER_CACHE_KEY=98edcf312ef7ea126af9bb5a876005fc746955313ea0535ba2563c766289753b,KYTY_SHADER_WARMUP=1,KYTY_SHADER_WARMUP_THREADS=12,KYTY_SHADER_WARMUP_SECONDS=60,KYTY_SHADER_WARMUP_FILE=_PipelineCache/warmup-legacy/recording.shaders,KYTY_PREPARATION_SCRATCH=1,KYTY_DISPATCH_BATCH=128,KYTY_BACKING_READ=1,KYTY_FRAME_PIPELINE=1,KYTY_READBACK_QUEUE=1,KYTY_READBACK_SLOTS=1,KYTY_ASYNC_UPLOAD=2,KYTY_BDA_DIRTY_REGIONS=1,KYTY_NATIVE_XPR=1,KYTY_NATIVE_XPR_RELOCATE=1,KYTY_NATIVE_XPR_STORE_BUDGET=256,KYTY_NATIVE_XPR_KEEP_FRAMES=600,KYTY_NATIVE_IMAGE_PROOF=1,KYTY_ASYNC_XPR_PIPELINES=1,KYTY_VULKAN_RECORDING=0,KYTY_DEFERRED_SUBMIT=0 -DryRun 6>&1 | Out-String)
           foreach ($expected in @('--screen-width 1920','--screen-height 1080','--fullscreen','--present-mode Mailbox','--shader-optimization-type Performance')) {
             if (!$text.Contains($expected)) { throw "Launcher ignored setting: $expected" }
           }
           if (!$text.Contains('KYTY_PORTABLE_SHADERS=0') -or !$text.Contains('KYTY_DRIVER_CACHE_KEY=98edcf312ef7ea126af9bb5a876005fc746955313ea0535ba2563c766289753b')) {
             throw 'Launcher ignored the legacy binding or isolated cache override'
           }
-          foreach ($expected in @('KYTY_VULKAN_RECORDING=1','KYTY_DEFERRED_SUBMIT=1','KYTY_FRAME_PIPELINE=1','KYTY_NATIVE_XPR=1','KYTY_NATIVE_XPR_STORE_BUDGET=256','KYTY_BDA_DIRTY_REGIONS=1','KYTY_ASYNC_UPLOAD=2','KYTY_READBACK_QUEUE=1','KYTY_SHADER_WARMUP=1','KYTY_PREPARATION_SCRATCH=1','KYTY_DISPATCH_BATCH=128')) {
+          foreach ($expected in @('KYTY_VULKAN_RECORDING=0','KYTY_DEFERRED_SUBMIT=0','KYTY_FRAME_PIPELINE=1','KYTY_NATIVE_XPR=1','KYTY_NATIVE_XPR_STORE_BUDGET=256','KYTY_BDA_DIRTY_REGIONS=1','KYTY_ASYNC_UPLOAD=2','KYTY_READBACK_QUEUE=1','KYTY_SHADER_WARMUP=1','KYTY_PREPARATION_SCRATCH=1','KYTY_DISPATCH_BATCH=128')) {
             if (!$text.Contains($expected)) { throw "Launcher ignored proven performance override: $expected" }
           }
           Remove-Item "$out/game-path.txt" -ErrorAction SilentlyContinue
@@ -314,7 +315,7 @@ jobs:
       - name: Upload clean standalone public fork
         uses: actions/upload-artifact@v4
         with:
-          name: KytyPS5-B127-WORKER-REUSE-Windows-x64-${{ github.run_number }}
+          name: KytyPS5-B127-RESOURCE-REUSE-Windows-x64-${{ github.run_number }}
           path: _Build/package/**
           if-no-files-found: error
 
