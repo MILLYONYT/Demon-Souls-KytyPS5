@@ -1,0 +1,3741 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 9dbd00e..1e05795 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -868,3 +868,13 @@ endif()
+ if(KYTY_CLANG_CL)
+ 	install(FILES "${KYTY_THIRD_PARTY_DIR}/winpthread/bin/libwinpthread-1.dll" DESTINATION .)
+ endif()
++
++# Ported #103 frontend cache: CPU-only lifetime, identity and eviction checks.
++find_package(Threads REQUIRED)
++add_executable(compute_frontend_cache_tests EXCLUDE_FROM_ALL tests/ComputeFrontendCacheTests.cpp)
++target_link_libraries(compute_frontend_cache_tests PRIVATE Threads::Threads)
++add_test(NAME compute_frontend_cache COMMAND compute_frontend_cache_tests)
++
++add_executable(guest_readback_packing_tests EXCLUDE_FROM_ALL tests/GuestReadbackPackingTests.cpp)
++target_include_directories(guest_readback_packing_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
++add_test(NAME guest_readback_packing COMMAND guest_readback_packing_tests)
+diff --git a/src/graphics/guest_gpu/graphicsRun.cpp b/src/graphics/guest_gpu/graphicsRun.cpp
+index 23159fa..81bb606 100644
+--- a/src/graphics/guest_gpu/graphicsRun.cpp
++++ b/src/graphics/guest_gpu/graphicsRun.cpp
+@@ -28,6 +28,7 @@
+ #include "frame-capture.h"
+ #include "live-control.h"
+ #include "performance-switches.h"
++#include "proven-gpu-worker.h"
+ #include "xpr-capture.h"
+ #ifdef KYTY_LOCAL_VULKAN_RECORDING
+ #include "vulkan-recording.h"
+@@ -543,6 +544,9 @@ void GuestGpu::ThreadRun(void* data) {
+ 	g_gpu_state  = gpu;
+ 	LiveTrace::g_mark_thread = true;
+ 	InitializePerformanceSwitches();
++#if defined(_WIN32) && defined(KYTY_B32_FAST_CPU_SETS)
++	PreferFastCpuSetsForGpuWorker();
++#endif
+ 	LiveControl::Start();
+ 	XprCapture::Initialize();
+ #ifdef KYTY_LOCAL_VULKAN_RECORDING
+@@ -1164,9 +1168,15 @@ uint32_t CommandProcessor::TryNativeXprDraws(std::span<const uint32_t> packets,
+ uint32_t CommandProcessor::TryNativeDirectDraw(std::span<const uint32_t> packet) {
+ 	LiveCensus::Scope census(LiveCensus::NativeXpr, 1);
+ #ifdef KYTY_LOCAL_VULKAN_RECORDING
++	auto& executor = m_renderer.GetRenderExecutor();
++	// A draw never tried leaves the cached draw-state key behind: the next clean draw would take it.
++	const auto skip = [&] {
++		executor.NativeXprForgetState();
++		return 0u;
++	};
+ 	if (FrameCapture::Active() || XprCapture::Enabled() || m_index_type_and_size > 1 ||
+ 	    m_ucfg.GetPrimType() != Prospero::PrimitiveType::kTriList)
+-		return 0;
++		return skip();
+ 	// What CpOpDrawIndex / CpOpDrawIndexOffset accept (anything else takes them).
+ 	const uint64_t element = m_index_type_and_size == 0 ? 2 : 4;
+ 	uint64_t       index_address = 0;
+@@ -1175,23 +1185,22 @@ uint32_t CommandProcessor::TryNativeDirectDraw(std::span<const uint32_t> packet)
+ 		index_address = packet[2] | (uint64_t {packet[3]} << 32u);
+ 		index_count   = packet[4];
+ 		size          = 6;
+-		if (index_count > packet[1] || (packet[5] & ~0x20u) != 0) return 0;
++		if (index_count > packet[1] || (packet[5] & ~0x20u) != 0) return skip();
+ 	} else if (packet.size() >= 5 && packet[0] == 0xc0033500u && m_index_base_addr != 0) {
+ 		index_address = m_index_base_addr + uint64_t {packet[2]} * element;
+ 		index_count   = packet[3];
+ 		size          = 5;
+-		if (index_count > packet[1] || (packet[4] & ~0x20u) != 0) return 0;
++		if (index_count > packet[1] || (packet[4] & ~0x20u) != 0) return skip();
+ 	} else {
+-		return 0;
++		return skip();
+ 	}
+ 	// A zero-sized draw draws nothing on the normal path either (it returns first).
+-	if (index_count == 0 || index_address == 0 || index_address % element != 0) return 0;
++	if (index_count == 0 || index_address == 0 || index_address % element != 0) return skip();
+ 	CheckBuffer();
+ 	const RenderExecutor::NativeXprDirectDraw draw {index_address, index_count, m_num_instances};
+-	// The state key is hashed again: the observer's chain covers indexed indirect draws only.
+-	if (!m_renderer.GetRenderExecutor().NativeXprTry(
+-	        CurrentBuffer(), false, {}, index_address, uint64_t {index_count} * element,
+-	        m_index_type_and_size == 0 ? vk::IndexType::eUint16 : vk::IndexType::eUint32, &draw))
++	if (!executor.NativeXprTry(CurrentBuffer(), DrawStateObserver::g_shadow.last_clean, {}, index_address,
++	                           uint64_t {index_count} * element,
++	                           m_index_type_and_size == 0 ? vk::IndexType::eUint16 : vk::IndexType::eUint32, &draw))
+ 		return 0;
+ 	return size;
+ #else
+diff --git a/src/graphics/host_gpu/renderer/cache/GuestReadbackPacking.h b/src/graphics/host_gpu/renderer/cache/GuestReadbackPacking.h
+new file mode 100644
+index 0000000..2621766
+--- /dev/null
++++ b/src/graphics/host_gpu/renderer/cache/GuestReadbackPacking.h
+@@ -0,0 +1,49 @@
++#pragma once
++
++#include <algorithm>
++#include <cstdint>
++#include <limits>
++#include <vector>
++
++namespace Libs::Graphics::ReadbackPacking {
++struct Envelope { uint64_t source, size, cursor; };
++struct Part { uint64_t address, size, offset; };
++
++// Copy nearby GPU ranges together, but publish only the original dirty bytes.
++class Packing {
++public:
++    std::vector<Envelope> envelopes;
++    std::vector<Part> parts;
++    uint64_t size = 0;
++
++    bool Add(uint64_t source, uint64_t bytes, uint64_t offset,
++             uint64_t address, uint64_t dirty_bytes, uint64_t capacity) {
++        constexpr auto Max = std::numeric_limits<uint64_t>::max();
++        constexpr uint64_t Gap = 64 * 1024;
++        if (!bytes || !dirty_bytes || source > Max - bytes || offset < source ||
++            offset - source > bytes || dirty_bytes > bytes - (offset - source) ||
++            bytes > Max - 63) return false;
++        const auto align = [](uint64_t n) { return (n + 63) & ~uint64_t{63}; };
++        bool merge = false;
++        uint64_t end = source + bytes, extra = align(bytes);
++        if (!envelopes.empty()) {
++            const auto& last = envelopes.back();
++            if (source < last.source) return false;
++            const auto last_end = last.source + last.size;
++            merge = source <= last_end || source - last_end <= Gap;
++            if (merge) {
++                end = std::max(end, last_end);
++                if (end - last.source > Max - 63) return false;
++                extra = align(end - last.source) - align(last.size);
++            }
++        }
++        if (size > capacity || extra > capacity - size) return false;
++        if (merge) envelopes.back().size = end - envelopes.back().source;
++        else envelopes.push_back({source, bytes, size});
++        size += extra;
++        parts.push_back({address, dirty_bytes,
++                         envelopes.back().cursor + offset - envelopes.back().source});
++        return true;
++    }
++};
++} // namespace Libs::Graphics::ReadbackPacking
+diff --git a/src/graphics/host_gpu/renderer/cache/bufferCache.cpp b/src/graphics/host_gpu/renderer/cache/bufferCache.cpp
+index d26a6a8..35c01a0 100644
+--- a/src/graphics/host_gpu/renderer/cache/bufferCache.cpp
++++ b/src/graphics/host_gpu/renderer/cache/bufferCache.cpp
+@@ -1,3 +1,4 @@
++#include "graphics/host_gpu/renderer/cache/GuestReadbackPacking.h"
+ #include "graphics/host_gpu/renderer/cache/bufferCache.h"
+ #include "slow-log.h"
+ 
+@@ -106,7 +107,7 @@ struct BufferCache::DownloadCopy {
+ };
+ 
+ struct BufferCache::GuestReadback {
+-	struct Part { uint64_t address, size, offset; };
++	using Part = ReadbackPacking::Part;
+ 	std::vector<Part> parts;
+ 	std::vector<GuestRange> pages;
+ 	uint64_t begin = 0, size = 0, tick = 0, packed_size = 0;
+@@ -212,14 +213,23 @@ std::shared_ptr<BufferCache::GuestReadback> BufferCache::BeginGuestReadback(
+ 		if (completed) *completed = true;
+ 		return {};
+ 	}
+-	uint64_t packed_size = 0;
++	// The copies' envelopes in packed regions, one region for envelopes less than 64 KiB apart (the
++	// bytes between are copied too and never written back): GPU writes split a window into up to
++	// thousands of small ranges, a copy command each otherwise (seconds of driver calls in one frame).
++	// The parts place each copy's bytes in the download.
++	ReadbackPacking::Packing packing;
++	packing.parts.reserve(copies.size());
+ 	for (const auto& copy: copies) {
+-		packed_size += AlignDownload(DownloadEnvelope(copy).second);
+-		if (packed_size > Capacity) {
++		const auto [source_begin, envelope_size] = DownloadEnvelope(copy);
++		if (!packing.Add(source_begin, envelope_size, copy.source_offset,
++		                 copy.address, copy.size, Capacity)) {
+ 			LiveCounters::Add(LiveCounters::RbRejectCapacity);
+ 			return {};
+ 		}
+ 	}
++	const auto& envelopes = packing.envelopes;
++	const auto packed_size = packing.size;
++	LiveCounters::Add(LiveCounters::ReadbackRegions, envelopes.size());
+ 	// KYTY_READBACK_SLOTS: when every slot is pending, the render thread waits for the
+ 	// oldest copy (a GPU tick). Bursts from many guest threads fill the original eight.
+ 	const size_t slots = kyty_local_readback_slots_mode.load(std::memory_order_relaxed) != 0
+@@ -257,14 +267,10 @@ std::shared_ptr<BufferCache::GuestReadback> BufferCache::BeginGuestReadback(
+ 		// Also after the slot's last graphics-queue copy (it is submitted: that path flushes).
+ 		request->producer_tick = std::max(request->producer_tick, m_download_ticks[slot]);
+ 		std::vector<ReadbackQueue::Queue::Region> regions;
+-		regions.reserve(copies.size());
+-		uint64_t cursor = 0;
+-		for (const auto& copy: copies) {
+-			const auto [source_begin, envelope_size] = DownloadEnvelope(copy);
+-			regions.push_back({copy.buffer->Handle(), {source_begin, cursor, envelope_size}});
+-			request->parts.push_back({copy.address, copy.size, cursor + copy.source_offset - source_begin});
+-			cursor += AlignDownload(envelope_size);
+-		}
++		regions.reserve(envelopes.size());
++		for (const auto& envelope: envelopes)
++			regions.push_back({buffer.Handle(), {envelope.source, envelope.cursor, envelope.size}});
++		request->parts = std::move(packing.parts);
+ 		request->queue_value = m_readback_queue->Copy(regions, download->Handle(),
+ 		                                              m_scheduler.GetMasterSemaphore().Handle(),
+ 		                                              request->producer_tick);
+@@ -276,10 +282,9 @@ std::shared_ptr<BufferCache::GuestReadback> BufferCache::BeginGuestReadback(
+ 			if (!verify)
+ 				verify = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::Download, 0,
+ 				                                  vk::BufferUsageFlagBits::eTransferDst, Capacity);
+-			for (size_t i = 0; i < copies.size(); ++i)
+-				verify->CopyFrom(m_scheduler.Current(), *copies[i].buffer, regions[i].copy.srcOffset,
+-				                 regions[i].copy.dstOffset, regions[i].copy.size, vk::AccessFlagBits::eMemoryWrite,
+-				                 vk::AccessFlagBits::eHostRead,
++			for (const auto& region: regions)
++				verify->CopyFrom(m_scheduler.Current(), buffer, region.copy.srcOffset, region.copy.dstOffset,
++				                 region.copy.size, vk::AccessFlagBits::eMemoryWrite, vk::AccessFlagBits::eHostRead,
+ 				                 vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite,
+ 				                 vk::AccessFlagBits::eHostRead);
+ 			request->verify = verify.get();
+@@ -292,16 +297,12 @@ std::shared_ptr<BufferCache::GuestReadback> BufferCache::BeginGuestReadback(
+ 		LiveCounters::Add(LiveCounters::AsyncReadbacks);
+ 		return request;
+ 	}
+-	uint64_t cursor = 0;
+-	for (const auto& copy: copies) {
+-		const auto [source_begin, envelope_size] = DownloadEnvelope(copy);
+-		download->CopyFrom(m_scheduler.Current(), *copy.buffer, source_begin, cursor,
+-		    envelope_size, vk::AccessFlagBits::eMemoryWrite, vk::AccessFlagBits::eHostRead,
+-		    vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite,
+-		    vk::AccessFlagBits::eHostRead);
+-		request->parts.push_back({copy.address, copy.size, cursor + copy.source_offset - source_begin});
+-		cursor += AlignDownload(envelope_size);
+-	}
++	for (const auto& envelope: envelopes)
++		download->CopyFrom(m_scheduler.Current(), buffer, envelope.source, envelope.cursor, envelope.size,
++		                   vk::AccessFlagBits::eMemoryWrite, vk::AccessFlagBits::eHostRead,
++		                   vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite,
++		                   vk::AccessFlagBits::eHostRead);
++	request->parts = std::move(packing.parts);
+ 	request->tick = m_scheduler.CurrentTick();
+ 	m_download_ticks[slot] = request->tick;
+ 	if (LiveTrace::WriteTicks()) LiveTrace::Event(LiveTrace::ReadbackTicks, address, size | request->tick << 32u);
+@@ -662,7 +663,7 @@ bool BufferCache::TryReadCopyFeedback(Buffer& buffer, uint64_t vaddr, uint64_t s
+ 		    });
+ 	    });
+ 	if (copies.empty()) return false;
+-	struct Part { uint64_t address, size, offset; };
++	using Part = ReadbackPacking::Part;
+ 	std::vector<Part> parts;
+ 	auto& feedback = *m_copy_feedback;
+ 	const auto mapping_epoch = m_resources->MappingEpoch();
+@@ -741,8 +742,15 @@ void BufferCache::ChangeRegister(BufferId id) {
+ 	DrainGuestReadback(m_slot_buffers[id].CpuAddress(), m_slot_buffers[id].Size());
+ 	m_sync_buffers_valid = false;
+ 	++m_registration_epoch;
+-	// Region requests prove their state against the global registration epoch.
+-	BdaDirtyRegions::MarkAll();
++	// Region requests prove their state against the registration epoch of their own region: only the
++	// requests of these regions need to be synchronized again.
++	if (m_region_registrations.empty()) m_region_registrations.assign(TRACKER_ADDRESS_SIZE / TRACKER_REGION_SIZE, 0);
++	for (auto region = m_slot_buffers[id].CpuAddress() / TRACKER_REGION_SIZE,
++	          last   = (m_slot_buffers[id].CpuAddress() + m_slot_buffers[id].Size() - 1) / TRACKER_REGION_SIZE;
++	     region <= last && region < m_region_registrations.size(); ++region) {
++		m_region_registrations[region] = m_registration_epoch;
++		BdaDirtyRegions::Mark(region);
++	}
+ 	LiveCounters::Add(LiveCounters::BufferRegistrations);
+ 	auto& buffer = m_slot_buffers[id];
+ 	if constexpr (!insert) InvalidateCopyFeedback(buffer.CpuAddress(), buffer.Size());
+@@ -1425,7 +1433,7 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
+ 				    [](void* manager, uint64_t address, uint64_t size) {
+ 					    static_cast<RegionManager*>(manager)->ApplyDeferredProtection(address, size);
+ 				    },
+-				    item.manager, item.address, item.size);
++				    item.manager, item.address, item.size, item.address, item.size);
+ 			} else {
+ 				item.manager->ApplyDeferredProtection(item.address, item.size);
+ 			}
+@@ -1439,7 +1447,7 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
+ 			const auto address = buffer.CpuAddress() + copy.dstOffset;
+ 			const auto* source = async ? LibKernel::Memory::TryGetBackingPointer(address, copy.size) : nullptr;
+ 			if (source != nullptr) {
+-				AsyncUpload::Get().Push(mapped + copy.srcOffset, source, copy.size);
++				AsyncUpload::Get().Push(mapped + copy.srcOffset, source, copy.size, address);
+ 			} else {
+ 				std::memcpy(mapped + copy.srcOffset, reinterpret_cast<const void*>(address), copy.size);
+ 			}
+@@ -1559,13 +1567,13 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, u
+ 	    m_staging_buffer.IsCoherent()) {
+ 		bool queued = false;
+ 		if (const auto* source = Libs::LibKernel::Memory::TryGetBackingPointer(vaddr, size)) {
+-			AsyncUpload::Get().Push(staging, source, size);
++			AsyncUpload::Get().Push(staging, source, size, vaddr);
+ 			queued = true;
+ 		} else if (Libs::LibKernel::Memory::TryGetBackingPieces(vaddr, size, m_backing_pieces)) {
+ 			// Large images usually span several guest mappings.
+ 			uint64_t offset = 0;
+ 			for (const auto& [piece, bytes]: m_backing_pieces) {
+-				AsyncUpload::Get().Push(staging + offset, piece, bytes);
++				AsyncUpload::Get().Push(staging + offset, piece, bytes, vaddr + offset);
+ 				offset += bytes;
+ 			}
+ 			queued = true;
+@@ -1574,7 +1582,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, u
+ 			// parts; the render thread copied hundreds of MiB here synchronously before.
+ 			path = "sparse";
+ 			AsyncUpload::Get().PushCall(ReadMappedOrZeroCall, reinterpret_cast<void*>(vaddr),
+-			                            reinterpret_cast<uint64_t>(staging), size);
++			                            reinterpret_cast<uint64_t>(staging), size, vaddr, size);
+ 			queued = true;
+ 		}
+ 		if (queued) {
+@@ -1621,14 +1629,14 @@ std::pair<Buffer*, uint64_t> BufferCache::StageImagePieces(const std::vector<Sta
+ 		auto* target = staging + piece.offset;
+ 		if (async) {
+ 			if (const auto* source = Libs::LibKernel::Memory::TryGetBackingPointer(piece.vaddr, piece.size)) {
+-				AsyncUpload::Get().Push(target, source, piece.size);
++				AsyncUpload::Get().Push(target, source, piece.size, piece.vaddr);
+ 				queued = true;
+ 				continue;
+ 			}
+ 			if (Libs::LibKernel::Memory::TryGetBackingPieces(piece.vaddr, piece.size, m_backing_pieces)) {
+ 				uint64_t offset = 0;
+ 				for (const auto& [source, bytes]: m_backing_pieces) {
+-					AsyncUpload::Get().Push(target + offset, source, bytes);
++					AsyncUpload::Get().Push(target + offset, source, bytes, piece.vaddr + offset);
+ 					offset += bytes;
+ 				}
+ 				queued = true;
+@@ -1640,7 +1648,7 @@ std::pair<Buffer*, uint64_t> BufferCache::StageImagePieces(const std::vector<Sta
+ 		// when memory is mapped there (TextureCache::MapMemory).
+ 		if (async) {
+ 			AsyncUpload::Get().PushCall(ReadMappedOrZeroCall, reinterpret_cast<void*>(piece.vaddr),
+-			                            reinterpret_cast<uint64_t>(target), piece.size);
++			                            reinterpret_cast<uint64_t>(target), piece.size, piece.vaddr, piece.size);
+ 			queued = true;
+ 			continue;
+ 		}
+@@ -1852,7 +1860,8 @@ void BufferCache::SynchronizeRegionRequest(SyncRegionRequest& request) {
+ 	});
+ 	DrainGuestReadback(request.address, request.size, true);
+ 	const auto epoch = m_memory_tracker.CpuModificationEpoch(request.address, request.size);
+-	const auto registered = m_registration_epoch;
++	// A request lies in one tracker region: registrations elsewhere do not touch its buffers.
++	const auto registered = RegionRegistrationEpoch(request.address);
+ 	if (epoch != 0 && request.cpu_epoch == epoch && request.registration_epoch == registered) {
+ 		LiveCounters::Add(LiveCounters::RegionSkips);
+ 		return;
+@@ -1860,7 +1869,7 @@ void BufferCache::SynchronizeRegionRequest(SyncRegionRequest& request) {
+ 	LiveCounters::Add(LiveCounters::RegionSyncs);
+ 	SynchronizeBuffersInRange(request.address, request.size);
+ 	request.cpu_epoch = 0;
+-	if (epoch != 0 && m_registration_epoch == registered &&
++	if (epoch != 0 && RegionRegistrationEpoch(request.address) == registered &&
+ 	    m_memory_tracker.CpuModificationEpoch(request.address, request.size) == epoch) {
+ 		request.cpu_epoch = epoch;
+ 		request.registration_epoch = registered;
+@@ -1870,18 +1879,27 @@ void BufferCache::SynchronizeRegionRequest(SyncRegionRequest& request) {
+ void BufferCache::SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size) {
+ 	DrainGuestReadback(vaddr, size, true);
+ 	if (!m_sync_buffers_valid) {
++		// The pieces of buffers that stayed registered keep their stamps: a stamp is about its own buffer's
++		// contents against the CPU epoch of its region, which another buffer's registration does not move.
++		std::swap(m_sync_buffers, m_old_sync_buffers);
++		std::swap(m_sync_stamps, m_old_sync_stamps);
+ 		m_sync_buffers.clear();
++		m_sync_stamps.clear();
+ 		m_sync_buffers.reserve(m_buffers.size());
++		size_t old = 0;
+ 		for (const auto& [address, id]: m_buffers) {
+ 			auto& buffer = m_slot_buffers[id];
+ 			const auto end = address + buffer.Size();
+ 			for (auto start = address; start < end;) {
+ 				const auto finish = std::min(end, (start / TRACKER_REGION_SIZE + 1) * TRACKER_REGION_SIZE);
+-				m_sync_buffers.push_back({start, finish, &buffer});
++				while (old < m_old_sync_buffers.size() && m_old_sync_buffers[old].start < start) ++old;
++				const bool kept = old < m_old_sync_buffers.size() && m_old_sync_buffers[old].start == start &&
++				                  m_old_sync_buffers[old].end == finish && m_old_sync_buffers[old].id == id;
++				m_sync_buffers.push_back({start, finish, &buffer, id});
++				m_sync_stamps.push_back(kept ? m_old_sync_stamps[old] : SyncStamp {});
+ 				start = finish;
+ 			}
+ 		}
+-		m_sync_stamps.assign(m_sync_buffers.size(), {});
+ 		m_sync_buffers_valid = true;
+ 	}
+ 	const auto end = vaddr + size;
+diff --git a/src/graphics/host_gpu/renderer/cache/bufferCache.h b/src/graphics/host_gpu/renderer/cache/bufferCache.h
+index 3daa927..5c3b965 100644
+--- a/src/graphics/host_gpu/renderer/cache/bufferCache.h
++++ b/src/graphics/host_gpu/renderer/cache/bufferCache.h
+@@ -107,6 +107,12 @@ public:
+ 	};
+ 	void SynchronizeRegionRequest(SyncRegionRequest& request);
+ 	[[nodiscard]] uint64_t RegistrationEpoch() const { return m_registration_epoch; }
++	// The registration epoch of the last change of a buffer covering the tracker region of `vaddr`: a region
++	// request's proof only depends on the buffers of its own region.
++	[[nodiscard]] uint64_t RegionRegistrationEpoch(uint64_t vaddr) const {
++		const auto region = vaddr / TRACKER_REGION_SIZE;
++		return region < m_region_registrations.size() ? m_region_registrations[region] : 0;
++	}
+ 	// Proofs that an earlier resolution still holds. Pure queries; TouchLiveBuffer
+ 	// only refreshes the LRU slot exactly as ObtainBuffer's TouchBuffer would.
+ 	// Zero means "cannot prove anything" (see MemoryTracker::CpuModificationEpoch).
+@@ -213,10 +219,12 @@ private:
+ 	Common::LeastRecentlyUsedCache<BufferId, uint64_t> m_lru_cache;
+ 	BufferMap                                         m_buffers;
+ 	uint64_t m_registration_epoch = 1;
++	std::vector<uint64_t> m_region_registrations; // per tracker region, see RegionRegistrationEpoch
+ 	struct SyncBuffer {
+ 		uint64_t start;
+ 		uint64_t end;
+ 		Buffer* buffer;
++		BufferId id; // with its generation: a later buffer in the same slot is another buffer
+ 	};
+ 	// GPU-thread-only derived index. SlotVector preserves addresses until erase;
+ 	// every registration change invalidates this view before it can be reused.
+@@ -224,6 +232,8 @@ private:
+ 	bool                                              m_sync_buffers_valid = false;
+ 	struct SyncStamp { uint64_t begin = 0, end = 0, epoch = 0; };
+ 	std::vector<SyncStamp> m_sync_stamps;
++	std::vector<SyncBuffer> m_old_sync_buffers; // rebuild scratch
++	std::vector<SyncStamp>  m_old_sync_stamps;
+ 	PageTable                                         m_page_table;
+ 	RangeSet                                          m_gpu_modified_ranges;
+ 	MemoryTracker                                     m_memory_tracker;
+diff --git a/src/graphics/host_gpu/renderer/cache/gpuResourceManager.cpp b/src/graphics/host_gpu/renderer/cache/gpuResourceManager.cpp
+index b85e6a3..e7901a4 100644
+--- a/src/graphics/host_gpu/renderer/cache/gpuResourceManager.cpp
++++ b/src/graphics/host_gpu/renderer/cache/gpuResourceManager.cpp
+@@ -166,8 +166,9 @@ void GpuResourceManager::UnmapMemory(uint64_t vaddr, uint64_t size, bool releasi
+ 		// Readbacks write guest memory when they finish: the ones into the range finish first
+ 		// (the others do not touch it).
+ 		m_buffer_cache.DrainGuestReadback(vaddr, size);
+-		// Pending upload copies read the backing of ranges that are about to change owner.
+-		AsyncUpload::Drain();
++		// Pending upload jobs on the range read its backing (or change its protection): they finish before
++		// it changes owner. Jobs elsewhere keep running.
++		AsyncUpload::DrainRange(vaddr, size);
+ 		// The GPU only works on the caches' own buffers and images, which are freed after the
+ 		// work in flight completes (deferred operations), so the unmap need not wait for the GPU
+ 		// (it used to finish all of it: up to a frame of GPU work, for every guest unmap). What
+@@ -189,7 +190,14 @@ void GpuResourceManager::UnmapMemory(uint64_t vaddr, uint64_t size, bool releasi
+ 		m_texture_cache.UnmapMemory(vaddr, size);
+ 		std::lock_guard lock(m_mapped_ranges_mutex);
+ 		m_mapped_ranges.Subtract(vaddr, size);
+-		m_unmaps[m_unmap_count++ % m_unmaps.size()] = {++m_mapping_epoch, vaddr, vaddr + size};
++		const auto epoch = ++m_mapping_epoch;
++		if (size == 0) return;
++		constexpr uint64_t leaf_mask = (uint64_t {1} << UnmapLeafBits) - 1;
++		for (uint64_t g = vaddr >> UnmapGranuleBits, last = (vaddr + size - 1) >> UnmapGranuleBits; g <= last; ++g) {
++			auto& leaf = m_unmap_epochs[g >> UnmapLeafBits];
++			if (!leaf) leaf = std::make_unique<uint64_t[]>(leaf_mask + 1);
++			leaf[g & leaf_mask] = epoch;
++		}
+ 	};
+ 	if (m_gpu == nullptr) {
+ 		unmap();
+@@ -199,12 +207,15 @@ void GpuResourceManager::UnmapMemory(uint64_t vaddr, uint64_t size, bool releasi
+ }
+ 
+ bool GpuResourceManager::UnmappedSince(uint64_t epoch, uint64_t vaddr, uint64_t size) const noexcept {
+-	const auto end = vaddr + size;
+-	for (auto count = m_unmap_count; count != 0; --count) {
+-		if (m_unmap_count - count == m_unmaps.size()) return true; // older ones are overwritten
+-		const auto& unmap = m_unmaps[(count - 1) % m_unmaps.size()];
+-		if (unmap.epoch <= epoch) return false;
+-		if (unmap.begin < end && vaddr < unmap.end) return true;
++	if (size == 0) return false;
++	constexpr uint64_t leaf_mask = (uint64_t {1} << UnmapLeafBits) - 1;
++	for (uint64_t g = vaddr >> UnmapGranuleBits, last = (vaddr + size - 1) >> UnmapGranuleBits; g <= last; ++g) {
++		const auto leaf = m_unmap_epochs.find(g >> UnmapLeafBits);
++		if (leaf == m_unmap_epochs.end()) {
++			g |= leaf_mask; // never unmapped in this leaf
++			continue;
++		}
++		if (leaf->second[g & leaf_mask] > epoch) return true;
+ 	}
+ 	return false;
+ }
+@@ -215,19 +226,29 @@ void GpuResourceManager::RefreshBdaRanges() {
+ 	LiveCounters::Add(LiveCounters::BdaRebuilds);
+ 	std::vector<RangeSet::Range> ranges;
+ 	m_buffer_cache.CollectMappedRegisteredRanges(m_mapped_ranges, ranges);
++	// An unchanged request keeps its proof: SynchronizeRegionRequest checks it against its region's CPU and
++	// registration epochs (an unmap marks the range CPU-dirty, which moves the CPU epoch).
++	std::swap(m_bda_region_requests, m_old_bda_region_requests);
+ 	m_bda_region_requests.clear();
++	size_t old = 0;
+ 	for (const auto& range : ranges) {
+ 		const auto end = range.address + range.size;
+ 		for (auto start = range.address; start < end;) {
+ 			const auto finish = std::min(end, (start / TRACKER_REGION_SIZE + 1) * TRACKER_REGION_SIZE);
+-			m_bda_region_requests.push_back({start, finish - start});
++			auto& request = m_bda_region_requests.emplace_back(BufferCache::SyncRegionRequest {start, finish - start});
++			while (old < m_old_bda_region_requests.size() && m_old_bda_region_requests[old].address < start) ++old;
++			if (old < m_old_bda_region_requests.size() && m_old_bda_region_requests[old].address == start &&
++			    m_old_bda_region_requests[old].size == request.size) {
++				request = m_old_bda_region_requests[old];
++			} else if (start / TRACKER_REGION_SIZE < BdaDirtyRegions::Regions) {
++				// A new request starts unproven.
++				BdaDirtyRegions::Mark(start / TRACKER_REGION_SIZE);
++			}
+ 			start = finish;
+ 		}
+ 	}
+ 	m_bda_mapping_epoch = m_mapping_epoch;
+ 	m_bda_registration_epoch = registered;
+-	// Every request starts unproven.
+-	BdaDirtyRegions::MarkAll();
+ }
+ 
+ bool GpuResourceManager::PrepareBdaReadRanges(std::span<const GuestRange> ranges) {
+diff --git a/src/graphics/host_gpu/renderer/cache/gpuResourceManager.h b/src/graphics/host_gpu/renderer/cache/gpuResourceManager.h
+index cc49a40..b0baf73 100644
+--- a/src/graphics/host_gpu/renderer/cache/gpuResourceManager.h
++++ b/src/graphics/host_gpu/renderer/cache/gpuResourceManager.h
+@@ -9,7 +9,9 @@
+ 
+ #include <array>
+ #include <cstdint>
++#include <memory>
+ #include <shared_mutex>
++#include <unordered_map>
+ 
+ namespace Libs::Graphics {
+ 
+@@ -48,8 +50,8 @@ public:
+ 	[[nodiscard]] uint64_t MappingEpoch() const noexcept {
+ 		return m_mapping_epoch.load(std::memory_order_acquire);
+ 	}
+-	// Whether memory in [vaddr, vaddr + size) was unmapped after mapping epoch `epoch` (also
+-	// true when that is further back than the unmaps kept). GPU thread, as UnmapMemory.
++	// Whether memory in [vaddr, vaddr + size) was unmapped after mapping epoch `epoch` (by 16 KiB
++	// granule). GPU thread, as UnmapMemory.
+ 	[[nodiscard]] bool UnmappedSince(uint64_t epoch, uint64_t vaddr, uint64_t size) const noexcept;
+ 
+ 	bool PrepareBdaReadRanges(std::span<const GuestRange> ranges);
+@@ -69,14 +71,13 @@ private:
+ 	mutable std::shared_mutex m_mapped_ranges_mutex;
+ 	RangeSet                  m_mapped_ranges;
+ 	std::atomic<uint64_t> m_mapping_epoch {1};
+-	// The latest unmaps, with the mapping epoch each made (written by UnmapMemory's GPU-thread part).
+-	struct Unmap {
+-		uint64_t epoch = 0, begin = 0, end = 0;
+-	};
+-	std::array<Unmap, 64> m_unmaps {};
+-	uint64_t              m_unmap_count = 0;
++	// The mapping epoch of each 16 KiB granule's latest unmap, in 1 GiB leaves made at its first unmap
++	// (written by UnmapMemory's GPU-thread part). The latest 64 unmaps before: streaming textures in
++	// unmaps that many 64 KiB pool layers within frames, so a proof a few frames old counted as stale.
++	static constexpr uint64_t UnmapGranuleBits = 14, UnmapLeafBits = 16;
++	std::unordered_map<uint64_t, std::unique_ptr<uint64_t[]>> m_unmap_epochs;
+ 	uint64_t m_bda_mapping_epoch = 0, m_bda_registration_epoch = 0;
+-	std::vector<BufferCache::SyncRegionRequest> m_bda_region_requests;
++	std::vector<BufferCache::SyncRegionRequest> m_bda_region_requests, m_old_bda_region_requests;
+ 	GuestGpu*                 m_gpu = nullptr;
+ 	std::atomic<uint64_t> m_preparation_alias_epoch {uint64_t{1} << 32};
+ 	bool                      m_fault_process_pending = false;
+diff --git a/src/graphics/host_gpu/renderer/cache/streamBuffer.cpp b/src/graphics/host_gpu/renderer/cache/streamBuffer.cpp
+index 7c4a5f4..ed9a45f 100644
+--- a/src/graphics/host_gpu/renderer/cache/streamBuffer.cpp
++++ b/src/graphics/host_gpu/renderer/cache/streamBuffer.cpp
+@@ -149,9 +149,11 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
+ 		buffer_info.pQueueFamilyIndices   = families;
+ 	}
+ 
++	// Adapted from BryKytyPS5: share VMA blocks for BDA buffers up to 64 MiB.
++	// The address is queried from each VkBuffer after allocation, independent of its placement.
+ 	const bool with_bda = bool(flags & vk::BufferUsageFlagBits::eShaderDeviceAddress);
+ 	const VmaAllocationCreateFlags bda_flag =
+-	    with_bda ? VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT : 0;
++	    with_bda && size > (64ull << 20u) ? VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT : 0;
+ 	VmaAllocationCreateInfo allocation_info {};
+ 	allocation_info.flags =
+ 	    VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT | bda_flag | AllocationFlags(usage);
+diff --git a/src/graphics/host_gpu/renderer/cache/textureCache.cpp b/src/graphics/host_gpu/renderer/cache/textureCache.cpp
+index 26a1665..3c985ea 100644
+--- a/src/graphics/host_gpu/renderer/cache/textureCache.cpp
++++ b/src/graphics/host_gpu/renderer/cache/textureCache.cpp
+@@ -2176,14 +2176,17 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
+ 
+ bool TextureCache::IsSampledImageCurrent(ImageId id, const ImageDesc& desc) {
+ 	std::scoped_lock lock {m_lock};
+-	if (m_scheduler.Current().IsInvalid() || desc.type != BindingType::Texture ||
+-	    desc.info.data.Empty() || desc.info.IsDepth() || desc.info.HasMetadata() ||
++	// A sampled DCC image keeps the metadata FindTexture gave it (its user checks for a pending clear).
++	const bool dcc = desc.type == BindingType::Texture && desc.info.metadata.kind == ImageMetadataKind::Dcc;
++	if (m_scheduler.Current().IsInvalid() || (desc.type != BindingType::Texture && desc.type != BindingType::Storage) ||
++	    desc.info.data.Empty() || desc.info.IsDepth() || (desc.info.HasMetadata() && !dcc) ||
+ 	    desc.info.HasStencil() || desc.info.tile_mode == Prospero::TileMode::kDepth) {
+ 		return false;
+ 	}
+ 	auto* image = m_slot_images.try_get(id);
+ 	if (image == nullptr || !image->registered || image->depth_id ||
+-	    image->binding.needs_rebind || image->info.IsDepth() || image->info.HasMetadata() ||
++	    image->binding.needs_rebind || image->info.IsDepth() || (image->info.HasMetadata() && !dcc) ||
++	    (dcc && !(image->info.metadata == desc.info.metadata)) ||
+ 	    image->info.HasStencil() || !SameBacking(image->info, desc.info, true) ||
+ 	    !(image->info.resources == desc.info.resources)) {
+ 		return false;
+@@ -2193,6 +2196,31 @@ bool TextureCache::IsSampledImageCurrent(ImageId id, const ImageDesc& desc) {
+ 	return true;
+ }
+ 
++bool TextureCache::IsTargetCurrent(ImageId id, const ImageInfo& requested, uint64_t& epoch) {
++	std::scoped_lock lock {m_lock};
++	const auto current = m_resolution_epoch.load(std::memory_order_relaxed);
++	// FindImage takes the last owner with the requested backing (on the first page or in the region);
++	// only without one does it resolve an overlap (a target found as part of another image).
++	if (epoch != current && RegistrationsSince(requested.data.address, 1, epoch)) {
++		const auto* target = m_slot_images.try_get(id);
++		ImageId     last {};
++		const auto  same = [&](ImageId owner) {
++			const auto* image = m_slot_images.try_get(owner);
++			if (image != nullptr && SameBacking(image->info, requested, false)) last = owner;
++		};
++		ImagePageTable::PageRange pages {};
++		if (kyty_local_preparation_lookup_mode.load(std::memory_order_relaxed) != 0 &&
++		    ImagePageTable::TryGetPageRange(requested.data.address, requested.data.size, pages)) {
++			if (const auto* owners = m_image_page_table.Find(pages.first)) owners->ForEach(same);
++		} else {
++			for (const auto owner: FindImagesInRegion(requested.data.address, requested.data.size, false)) same(owner);
++		}
++		if (target == nullptr || last != (SameBacking(target->info, requested, false) ? id : ImageId {})) return false;
++	}
++	epoch = current;
++	return true;
++}
++
+ bool TextureCache::TryReuseSampledImage(ImageId id, const ImageDesc& desc, uint64_t& epoch) {
+ 	std::scoped_lock lock {m_lock};
+ 	const auto current = m_resolution_epoch.load(std::memory_order_relaxed);
+diff --git a/src/graphics/host_gpu/renderer/cache/textureCache.h b/src/graphics/host_gpu/renderer/cache/textureCache.h
+index 6436cdf..1d39546 100644
+--- a/src/graphics/host_gpu/renderer/cache/textureCache.h
++++ b/src/graphics/host_gpu/renderer/cache/textureCache.h
+@@ -62,7 +62,13 @@ public:
+ 	// TryReuseSampledImage without the resolution-epoch proof, for caches that must
+ 	// survive image registrations elsewhere (native XPR records): the owner is
+ 	// still registered, not being rebound, and has the same backing and resources.
++	// Also for a storage binding (an image a record's programs only write); a sampled image may have
++	// DCC metadata (whose pending fast clears FindTexture applies: the caller checks IsMetaCleared).
+ 	[[nodiscard]] bool IsSampledImageCurrent(ImageId id, const ImageDesc& desc);
++	// Whether a render target lookup of `requested` (FindImage, any format) still finds `id`: nothing
++	// registered over its first page since `epoch`, or no newer image with the requested backing there
++	// (it would take precedence). `epoch` moves to the current one when it holds.
++	[[nodiscard]] bool IsTargetCurrent(ImageId id, const ImageInfo& requested, uint64_t& epoch);
+ 	void                        UpdateImage(ImageId id);
+ 	[[nodiscard]] ImageId       FindImageFromRange(uint64_t address, uint64_t size,
+ 	                                               bool ensure_valid = true);
+diff --git a/src/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp b/src/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp
+index 2f80b33..76caf68 100644
+--- a/src/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp
++++ b/src/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp
+@@ -138,7 +138,15 @@ void PipelineCacheLog(fmt::format_string<Args...> format, Args&&... args) {
+ 	Log::Flush();
+ }
+ 
++// Reads through a null pointer (a draw the game leaves unset during loads): no guest memory is mapped
++// there, and the GPU reads zeros where the host would fault.
++constexpr uint64_t NullPageEnd = 0x10000;
++
+ bool ReadShaderGuestMemory(void*, uint64_t address, uint32_t* value) {
++	if (value != nullptr && address < NullPageEnd) {
++		*value = 0;
++		return true;
++	}
+ 	return value != nullptr &&
+ 	       Libs::LibKernel::Memory::TryReadGpuCleanBackingToHost(address, value, sizeof(*value));
+ }
+@@ -151,7 +159,9 @@ bool ReadShaderRawGuestMemory(void*, uint64_t address, uint32_t* value) {
+ 	// A GPU-written neighbour may protect a clean descriptor on the same page.
+ 	// Reading its checked backing alias avoids an unnecessary GPU drain. Dirty,
+ 	// unmapped and untracked addresses retain the original load/fault behavior.
+-	if (Libs::LibKernel::Memory::TryReadGpuCleanBackingOnWatchedPage(address, value, sizeof(*value))) {
++	if (address < NullPageEnd) {
++		*value = 0;
++	} else if (Libs::LibKernel::Memory::TryReadGpuCleanBackingOnWatchedPage(address, value, sizeof(*value))) {
+ 		LiveCounters::Add(LiveCounters::SrtWatchedReads);
+ 	} else {
+ 		std::memcpy(value, reinterpret_cast<const void*>(address), sizeof(*value));
+@@ -160,11 +170,24 @@ bool ReadShaderRawGuestMemory(void*, uint64_t address, uint32_t* value) {
+ }
+ 
+ bool ReadShaderMemorySpan(void*, uint64_t address, uint32_t* values, uint32_t count, bool clean) {
+-	// Clean spans also read whole tables (resource materialization); raw spans are SRT groups.
+-	return count >= 2 && count <= (clean ? 1024u : 16u) &&
++	// Clean spans also read whole tables (resource materialization); raw spans are SRT groups. The
++	// null page goes word by word (the readers above).
++	return count >= 2 && count <= (clean ? 1024u : 16u) && address >= NullPageEnd &&
+ 	       Libs::LibKernel::Memory::TryReadGpuShaderSpan(address, values, count * 4u, clean);
+ }
+ 
++// Native XPR records evaluate their SRT again over memory the guest may have reused since: a stale
++// pointer on the way fails the evaluation instead of faulting.
++bool ReadMappedRawGuestMemory(void* userdata, uint64_t address, uint32_t* value) {
++	return Libs::LibKernel::Memory::IsFullyMapped(address, sizeof(*value)) &&
++	       ReadShaderRawGuestMemory(userdata, address, value);
++}
++
++bool ReadMappedMemorySpan(void* userdata, uint64_t address, uint32_t* values, uint32_t count, bool clean) {
++	return Libs::LibKernel::Memory::IsFullyMapped(address, uint64_t {count} * 4u) &&
++	       ReadShaderMemorySpan(userdata, address, values, count, clean);
++}
++
+ void ReportMaterialization(const char* label, ShaderType stage, uint64_t hash,
+                            const ShaderRecompiler::IR::MaterializeReport& report, bool ok) {
+ 	if (!ok) {
+@@ -1606,8 +1629,8 @@ bool PipelineCache::Save() {
+ 	}
+ 	PipelineCacheLog("Vulkan pipeline cache: saved {} bytes to {}", payload.size(),
+ 	                 Common::PathToString(m_driver_cache_path));
+-	m_graphics.device.destroyPipelineCache(m_driver_cache, nullptr);
+-	m_driver_cache = nullptr;
++	// Save may run after warmup while gameplay still compiles pipelines.
++	// Keep the driver cache alive until the destructor, and save later additions at exit.
+ 	return inputs_saved;
+ }
+ 
+@@ -1616,12 +1639,14 @@ template <typename Cache>
+ auto FindProgramSource(Cache& cache, const ShaderRecompiler::IR::CompiledShaderInfo& program) {
+ 	auto found = cache.by_program.find(&program);
+ 	if (found == cache.by_program.end()) {
+-		// Sources are node-stable and permutations live in deques, so a found pair
+-		// stays valid until the source is erased (warm-code mismatch, first use).
++		// Sources are node-stable and permutations live in deques, so a pair stays valid until the source is
++		// erased (warm-code mismatch, first use). One pass indexes every permutation: a pass per program
++		// (8900 permutations, 0.1-4 ms) ran for each program a record store met first, hundreds in one frame
++		// when an area's draws were first stored (a 1.9 s frame at Boletaria 1-1).
+ 		for (auto& [key, source]: cache.programs)
+ 			for (const auto& permutation: source.permutations)
+-				if (&permutation.program == &program)
+-					found = cache.by_program.emplace(&program, std::pair {&source, &permutation}).first;
++				cache.by_program.try_emplace(&permutation.program, std::pair {&source, &permutation});
++		found = cache.by_program.find(&program);
+ 	}
+ 	return found;
+ }
+@@ -1637,14 +1662,22 @@ bool PipelineCache::TraceStage(const ShaderRecompiler::IR::CompiledShaderInfo& p
+ 	const ShaderRecompiler::IR::SrtRuntime runtime {
+ 	    .user_data                  = user_data,
+ 	    .shader_base                = shader_base,
+-	    .read_memory                = ReadShaderRawGuestMemory,
++	    .read_memory                = ReadMappedRawGuestMemory,
+ 	    .read_specialization_memory = ReadShaderGuestMemory,
+ 	    .sync_memory                = SyncShaderGuestMemory,
+-	    .try_read_memory_span       = ReadShaderMemorySpan,
++	    .try_read_memory_span       = ReadMappedMemorySpan,
+ 	};
+ 	return ShaderRecompiler::IR::TraceLinearSrtReads(found->second.first->resource_plan, runtime, trace);
+ }
+ 
++ShaderRecompiler::IR::SrtUserDataUse PipelineCache::UserDataUse(const ShaderRecompiler::IR::CompiledShaderInfo& program) {
++	Common::LockGuard lock(m_mutex);
++	auto&             cache = *m_program_cache;
++	const auto        found = FindProgramSource(cache, program);
++	return found == cache.by_program.end() ? ShaderRecompiler::IR::SrtUserDataUse {}
++	                                       : ShaderRecompiler::IR::UserDataUse(found->second.first->resource_plan);
++}
++
+ bool PipelineCache::RematerializeStage(const ShaderRecompiler::IR::CompiledShaderInfo& program,
+                                        std::span<const uint32_t> user_data, uint64_t shader_base,
+                                        ShaderRecompiler::IR::ResourceSnapshot& resources) {
+@@ -1656,10 +1689,10 @@ bool PipelineCache::RematerializeStage(const ShaderRecompiler::IR::CompiledShade
+ 	const ShaderRecompiler::IR::SrtRuntime input_runtime {
+ 	    .user_data                  = user_data,
+ 	    .shader_base                = shader_base,
+-	    .read_memory                = ReadShaderRawGuestMemory,
++	    .read_memory                = ReadMappedRawGuestMemory,
+ 	    .read_specialization_memory = ReadShaderGuestMemory,
+ 	    .sync_memory                = SyncShaderGuestMemory,
+-	    .try_read_memory_span       = ReadShaderMemorySpan,
++	    .try_read_memory_span       = ReadMappedMemorySpan,
+ 	};
+ 	ShaderReadObserver::Runtime observed_runtime(input_runtime);
+ 	ShaderRecompiler::IR::ResourceSpecialization        specialization;
+diff --git a/src/graphics/host_gpu/renderer/pipeline/pipelineCache.h b/src/graphics/host_gpu/renderer/pipeline/pipelineCache.h
+index f4c2b2e..1401830 100644
+--- a/src/graphics/host_gpu/renderer/pipeline/pipelineCache.h
++++ b/src/graphics/host_gpu/renderer/pipeline/pipelineCache.h
+@@ -217,6 +217,8 @@ public:
+ 	[[nodiscard]] bool TraceStage(const ShaderRecompiler::IR::CompiledShaderInfo& program,
+ 	                              std::span<const uint32_t> user_data, uint64_t shader_base,
+ 	                              ShaderRecompiler::IR::SrtReadTrace& trace);
++	// How its SRT evaluation uses user data (ShaderRecompiler::IR::UserDataUse).
++	[[nodiscard]] ShaderRecompiler::IR::SrtUserDataUse UserDataUse(const ShaderRecompiler::IR::CompiledShaderInfo& program);
+ 
+ 	// The shader prefetch (ProgramCache::Prefetch): programs translated or taken over, of `total`;
+ 	// all zero while it loads its inputs or when it does not run. Any thread.
+diff --git a/src/graphics/shader/recompiler/ShaderRecompiler.cpp b/src/graphics/shader/recompiler/ShaderRecompiler.cpp
+index 1b63474..53c61f0 100644
+--- a/src/graphics/shader/recompiler/ShaderRecompiler.cpp
++++ b/src/graphics/shader/recompiler/ShaderRecompiler.cpp
+@@ -4,6 +4,7 @@
+ #include "common/logging/log.h"
+ #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
+ #include "graphics/shader/recompiler/frontend/cfg/ShaderCFG.h"
++#include "graphics/shader/recompiler/frontend/ComputeFrontendCache.h"
+ #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
+ #include "graphics/shader/recompiler/frontend/translate/Translate.h"
+ #include "graphics/shader/recompiler/ir/ShaderIR.h"
+@@ -29,6 +30,12 @@
+ #include <span>
+ #include <utility>
+ 
++#if defined(KYTY_B32_QUIET_SHADER_PHASES)
++#define B32_PHASE_LOG(...) ((void)0)
++#else
++#define B32_PHASE_LOG(...) LOGF(__VA_ARGS__)
++#endif
++
+ namespace Libs::Graphics::ShaderRecompiler {
+ 
+ namespace {
+@@ -587,20 +594,28 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
+ 		                                 .count());
+ 	};
+ 
+-	LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " code_words=%" PRIu64 " decode\n",
++	B32_PHASE_LOG("%s phase begin: stage=%s hash=0x%016" PRIx64 " code_words=%" PRIu64 " decode\n",
+ 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
+ 	     static_cast<uint64_t>(code.size()));
+ 
+ 	Decoder::Program decoded;
++	CFG::Graph cfg;
++	bool dispatcher_fallback = false;
++	std::string dispatcher_reason;
++	const bool cache_eligible = options.stage == ShaderType::Compute && options.back_code.empty();
++	const bool frontend_hit = cache_eligible && FrontendCache::FindCachedComputeFrontend(
++	    code, options.shader_hash, decoded, cfg, dispatcher_fallback, dispatcher_reason);
+ 	std::vector<uint32_t> joined_code;
+-	if (!options.back_code.empty()) {
+-		decoded = DecodeFusedProgram(code, options.back_code, joined_code);
+-	} else {
+-		Decoder::DecodeProgram(code, decoded);
++	if (!frontend_hit) {
++		if (!options.back_code.empty()) {
++			decoded = DecodeFusedProgram(code, options.back_code, joined_code);
++		} else {
++			Decoder::DecodeProgram(code, decoded);
++		}
+ 	}
+ 	DumpDecodedShader(options, joined_code.empty() ? code : std::span<const uint32_t> {joined_code},
+ 	                  decoded);
+-	LOGF("%s phase end: stage=%s hash=0x%016" PRIx64 " decode instructions=%" PRIu64
++	B32_PHASE_LOG("%s phase end: stage=%s hash=0x%016" PRIx64 " decode instructions=%" PRIu64
+ 	     " elapsed_ms=%" PRIu64 "\n",
+ 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
+ 	     static_cast<uint64_t>(decoded.instructions.size()), phase_ms());
+@@ -613,23 +628,24 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
+ 		}
+ 	}
+ 
+-	LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " CFG BuildGraph\n", GetDumpLabel(options),
++	B32_PHASE_LOG("%s phase begin: stage=%s hash=0x%016" PRIx64 " CFG BuildGraph\n", GetDumpLabel(options),
+ 	     StageName(options.stage), options.shader_hash);
+-	auto cfg = CFG::BuildGraph(decoded);
+-	LOGF("%s phase end: stage=%s hash=0x%016" PRIx64 " CFG BuildGraph blocks=%" PRIu64
++	if (!frontend_hit) cfg = CFG::BuildGraph(decoded);
++	B32_PHASE_LOG("%s phase end: stage=%s hash=0x%016" PRIx64 " CFG BuildGraph blocks=%" PRIu64
+ 	     " loops=%" PRIu64 " back_edges=%" PRIu64 " elapsed_ms=%" PRIu64 "\n",
+ 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
+ 	     static_cast<uint64_t>(cfg.blocks.size()), static_cast<uint64_t>(cfg.natural_loops.size()),
+ 	     static_cast<uint64_t>(cfg.back_edges.size()), phase_ms());
+-	bool        dispatcher_fallback = false;
+-	std::string dispatcher_reason;
+-	if (cfg.irreducible) {
++	if (frontend_hit) {
++		// Reuse the previously structured graph; later resource processing still
++		// runs with this invocation's inputs.
++	} else if (cfg.irreducible) {
+ 		dispatcher_fallback = true;
+ 		dispatcher_reason   = cfg.unsupported_reason;
+ 		LogDispatcherFallback(options, cfg, "build", dispatcher_reason);
+ 	} else {
+ 		const auto unstructured_cfg = cfg;
+-		LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " CFG Structurize\n",
++		B32_PHASE_LOG("%s phase begin: stage=%s hash=0x%016" PRIx64 " CFG Structurize\n",
+ 		     GetDumpLabel(options), StageName(options.stage), options.shader_hash);
+ 		if (!CFG::Structurize(cfg)) {
+ 			dispatcher_fallback      = true;
+@@ -643,10 +659,10 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
+ 			cfg.failure_block      = failure_block;
+ 			cfg.unsupported_reason = dispatcher_reason;
+ 		} else {
+-			LOGF("%s structured CFG success: blocks=%" PRIu64 "\n", GetDumpLabel(options),
++			B32_PHASE_LOG("%s structured CFG success: blocks=%" PRIu64 "\n", GetDumpLabel(options),
+ 			     static_cast<uint64_t>(cfg.blocks.size()));
+ 		}
+-		LOGF("%s phase end: stage=%s hash=0x%016" PRIx64 " CFG Structurize blocks=%" PRIu64
++		B32_PHASE_LOG("%s phase end: stage=%s hash=0x%016" PRIx64 " CFG Structurize blocks=%" PRIu64
+ 		     " loops=%" PRIu64 " elapsed_ms=%" PRIu64 "\n",
+ 		     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
+ 		     static_cast<uint64_t>(cfg.blocks.size()),
+@@ -693,10 +709,10 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
+ 	    .compute             = compute,
+ 	    .embedded_fetch      = embedded_fetch.loads.empty() ? nullptr : &embedded_fetch,
+ 	};
+-	LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " IR TranslateProgram\n",
++	B32_PHASE_LOG("%s phase begin: stage=%s hash=0x%016" PRIx64 " IR TranslateProgram\n",
+ 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash);
+ 	auto ir = Frontend::TranslateProgram(decoded, cfg, translate_options);
+-	LOGF("%s phase end: stage=%s hash=0x%016" PRIx64 " IR TranslateProgram blocks=%" PRIu64
++	B32_PHASE_LOG("%s phase end: stage=%s hash=0x%016" PRIx64 " IR TranslateProgram blocks=%" PRIu64
+ 	     " elapsed_ms=%" PRIu64 "\n",
+ 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
+ 	     static_cast<uint64_t>(ir.blocks.size()), phase_ms());
+@@ -732,6 +748,10 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
+ 	}
+ 	IR::TrackResources(ir);
+ 	IR::EliminateDeadCode(ir.blocks);
++	if (cache_eligible && !frontend_hit && phase_ms() >= 16) {
++		FrontendCache::RememberComputeFrontend(code, options.shader_hash, decoded, cfg,
++		                                      dispatcher_fallback, dispatcher_reason);
++	}
+ 	TranslateResult result;
+ 	result.program = std::move(ir);
+ 	if (options.dump_ir) {
+@@ -777,10 +797,10 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
+ 		}
+ 	}
+ 
+-	LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " SPIR-V EmitProgram\n",
++	B32_PHASE_LOG("%s phase begin: stage=%s hash=0x%016" PRIx64 " SPIR-V EmitProgram\n",
+ 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash);
+ 	auto spirv = Spirv::EmitProgram(ir, options.input_info);
+-	LOGF("%s phase end: stage=%s hash=0x%016" PRIx64 " SPIR-V EmitProgram words=%" PRIu64
++	B32_PHASE_LOG("%s phase end: stage=%s hash=0x%016" PRIx64 " SPIR-V EmitProgram words=%" PRIu64
+ 	     " elapsed_ms=%" PRIu64 "\n",
+ 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
+ 	     static_cast<uint64_t>(spirv.size()),
+diff --git a/src/graphics/shader/recompiler/backend/spirv/SpirvBuilder.cpp b/src/graphics/shader/recompiler/backend/spirv/SpirvBuilder.cpp
+index 9408774..86aff97 100644
+--- a/src/graphics/shader/recompiler/backend/spirv/SpirvBuilder.cpp
++++ b/src/graphics/shader/recompiler/backend/spirv/SpirvBuilder.cpp
+@@ -58,24 +58,33 @@ uint32_t Builder::Import(const char* name) {
+ 	return id;
+ }
+ 
++uint32_t Builder::FindOrReserveDeclaration(uint32_t& id) {
++	if (const auto it = m_declaration_ids.find(m_key); it != m_declaration_ids.end()) {
++		return it->second;
++	}
++	id = AllocateId();
++	m_declaration_ids.emplace(m_key, id);
++	return 0;
++}
++
+ uint32_t Builder::Type(uint32_t opcode, std::initializer_list<uint32_t> operands) {
+-	return Type(opcode, std::vector<uint32_t>(operands));
++	return Type(opcode, operands.begin(), operands.size());
+ }
+ 
+ uint32_t Builder::Type(uint32_t opcode, const std::vector<uint32_t>& operands) {
+-	std::vector<uint32_t> key;
+-	key.reserve(operands.size() + 2u);
+-	key.push_back(opcode);
+-	key.push_back(static_cast<uint32_t>(operands.size()));
+-	key.insert(key.end(), operands.begin(), operands.end());
+-	if (const auto it = m_declaration_ids.find(key); it != m_declaration_ids.end()) {
+-		return it->second;
++	return Type(opcode, operands.data(), operands.size());
++}
++
++uint32_t Builder::Type(uint32_t opcode, const uint32_t* operands, size_t count) {
++	m_key.assign({opcode, static_cast<uint32_t>(count)});
++	m_key.insert(m_key.end(), operands, operands + count);
++	uint32_t id = 0;
++	if (const auto found = FindOrReserveDeclaration(id); found != 0) {
++		return found;
+ 	}
+-	const auto id = AllocateId();
+-	m_declaration_ids.emplace(std::move(key), id);
+-	std::vector<uint32_t> words {opcode, id};
+-	words.insert(words.end(), operands.begin(), operands.end());
+-	AppendInstructionWords(m_declarations, words.data(), words.size());
++	m_declarations.push_back((static_cast<uint32_t>(count + 2u) << 16u) | opcode);
++	m_declarations.push_back(id);
++	m_declarations.insert(m_declarations.end(), operands, operands + count);
+ 	return id;
+ }
+ 
+@@ -84,19 +93,18 @@ uint32_t Builder::DecoratedType(uint32_t opcode, std::initializer_list<uint32_t>
+ 	if (annotations.size() == 0) {
+ 		return Type(opcode, operands);
+ 	}
+-	std::vector<uint32_t> key {opcode, static_cast<uint32_t>(operands.size())};
+-	key.insert(key.end(), operands.begin(), operands.end());
+-	key.push_back(static_cast<uint32_t>(annotations.size()));
++	m_key.assign({opcode, static_cast<uint32_t>(operands.size())});
++	m_key.insert(m_key.end(), operands.begin(), operands.end());
++	m_key.push_back(static_cast<uint32_t>(annotations.size()));
+ 	for (const auto& annotation: annotations) {
+-		key.push_back(annotation.opcode);
+-		key.push_back(static_cast<uint32_t>(annotation.operands.size()));
+-		key.insert(key.end(), annotation.operands.begin(), annotation.operands.end());
++		m_key.push_back(annotation.opcode);
++		m_key.push_back(static_cast<uint32_t>(annotation.operands.size()));
++		m_key.insert(m_key.end(), annotation.operands.begin(), annotation.operands.end());
+ 	}
+-	if (const auto it = m_declaration_ids.find(key); it != m_declaration_ids.end()) {
+-		return it->second;
++	uint32_t id = 0;
++	if (const auto found = FindOrReserveDeclaration(id); found != 0) {
++		return found;
+ 	}
+-	const auto id = AllocateId();
+-	m_declaration_ids.emplace(std::move(key), id);
+ 	std::vector<uint32_t> words {opcode, id};
+ 	words.insert(words.end(), operands.begin(), operands.end());
+ 	AppendInstructionWords(m_declarations, words.data(), words.size());
+@@ -110,23 +118,24 @@ uint32_t Builder::DecoratedType(uint32_t opcode, std::initializer_list<uint32_t>
+ 
+ uint32_t Builder::Constant(uint32_t opcode, uint32_t type,
+                            std::initializer_list<uint32_t> operands) {
+-	return Constant(opcode, type, std::vector<uint32_t>(operands));
++	return Constant(opcode, type, operands.begin(), operands.size());
+ }
+ 
+ uint32_t Builder::Constant(uint32_t opcode, uint32_t type, const std::vector<uint32_t>& operands) {
+-	std::vector<uint32_t> key;
+-	key.reserve(operands.size() + 2u);
+-	key.push_back(opcode);
+-	key.push_back(type);
+-	key.insert(key.end(), operands.begin(), operands.end());
+-	if (const auto it = m_declaration_ids.find(key); it != m_declaration_ids.end()) {
+-		return it->second;
++	return Constant(opcode, type, operands.data(), operands.size());
++}
++
++uint32_t Builder::Constant(uint32_t opcode, uint32_t type, const uint32_t* operands, size_t count) {
++	m_key.assign({opcode, type});
++	m_key.insert(m_key.end(), operands, operands + count);
++	uint32_t id = 0;
++	if (const auto found = FindOrReserveDeclaration(id); found != 0) {
++		return found;
+ 	}
+-	const auto id = AllocateId();
+-	m_declaration_ids.emplace(std::move(key), id);
+-	std::vector<uint32_t> words {opcode, type, id};
+-	words.insert(words.end(), operands.begin(), operands.end());
+-	AppendInstructionWords(m_declarations, words.data(), words.size());
++	m_declarations.push_back((static_cast<uint32_t>(count + 3u) << 16u) | opcode);
++	m_declarations.push_back(type);
++	m_declarations.push_back(id);
++	m_declarations.insert(m_declarations.end(), operands, operands + count);
+ 	return id;
+ }
+ 
+diff --git a/src/graphics/shader/recompiler/backend/spirv/SpirvBuilder.h b/src/graphics/shader/recompiler/backend/spirv/SpirvBuilder.h
+index d9aeb9e..9668e28 100644
+--- a/src/graphics/shader/recompiler/backend/spirv/SpirvBuilder.h
++++ b/src/graphics/shader/recompiler/backend/spirv/SpirvBuilder.h
+@@ -7,6 +7,7 @@
+ #include <map>
+ #include <set>
+ #include <string>
++#include <unordered_map>
+ #include <vector>
+ 
+ namespace Libs::Graphics::ShaderRecompiler::Spirv {
+@@ -61,6 +62,10 @@ private:
+ 	static void AppendInstruction(std::vector<uint32_t>& section, uint32_t opcode,
+ 	                              std::initializer_list<uint32_t> operands);
+ 	static void AppendString(std::vector<uint32_t>& words, const char* text);
++	uint32_t    Type(uint32_t opcode, const uint32_t* operands, size_t count);
++	uint32_t    Constant(uint32_t opcode, uint32_t type, const uint32_t* operands, size_t count);
++	// The id of the declaration m_key describes, or 0 after reserving a new one for it.
++	uint32_t    FindOrReserveDeclaration(uint32_t& id);
+ 	void        AddCapability(std::initializer_list<uint32_t> operands);
+ 	void        AddExtension(const char* name);
+ 	void        AddExtInstImport(uint32_t id, const char* name);
+@@ -81,7 +86,16 @@ private:
+ 	std::set<uint32_t>                        m_required_capabilities;
+ 	std::set<std::string>                     m_required_extensions;
+ 	std::map<std::string, uint32_t>           m_import_ids;
+-	std::map<std::vector<uint32_t>, uint32_t> m_declaration_ids;
++	struct WordsHash {
++		size_t operator()(const std::vector<uint32_t>& words) const noexcept {
++			uint64_t hash = 0x9E3779B97F4A7C15ull ^ words.size();
++			for (const auto word: words) hash = (hash ^ word) * 0xFF51AFD7ED558CCDull;
++			return static_cast<size_t>(hash ^ (hash >> 32u));
++		}
++	};
++	// Only looked up (ids are assigned in first-use order), so hashed; m_key is the lookup key's scratch.
++	std::unordered_map<std::vector<uint32_t>, uint32_t, WordsHash> m_declaration_ids;
++	std::vector<uint32_t>                     m_key;
+ 	size_t                                    m_unpatched_phi_incomings = 0;
+ };
+ 
+diff --git a/src/graphics/shader/recompiler/backend/spirv/SpirvEmitter.cpp b/src/graphics/shader/recompiler/backend/spirv/SpirvEmitter.cpp
+index 3f052b4..1973c04 100644
+--- a/src/graphics/shader/recompiler/backend/spirv/SpirvEmitter.cpp
++++ b/src/graphics/shader/recompiler/backend/spirv/SpirvEmitter.cpp
+@@ -327,7 +327,7 @@ std::vector<uint32_t> EmitProgram(const IR::Program& program,
+ 		Fail(program, "SPIR-V emitter requires a fully planned native shader program");
+ 	}
+ 	ValidateNativeProgram(program);
+-	IR::ValidateProgram(program, true);
++	if (IR::ValidationEnabled()) IR::ValidateProgram(program, true);
+ 	EmitterState state(program, input_info);
+ 	state.stage     = program.stage;
+ 	state.lod_stats_subgroup = program.bindings.lod_stats_count != 0 &&
+diff --git a/src/graphics/shader/recompiler/backend/spirv/spirvEmitterAluHelpers.cpp b/src/graphics/shader/recompiler/backend/spirv/spirvEmitterAluHelpers.cpp
+index 543ca78..0da9127 100644
+--- a/src/graphics/shader/recompiler/backend/spirv/spirvEmitterAluHelpers.cpp
++++ b/src/graphics/shader/recompiler/backend/spirv/spirvEmitterAluHelpers.cpp
+@@ -215,21 +215,21 @@ uint32_t EmitLogicalNotBool(EmitterState& state, uint32_t value) {
+ 	return ret;
+ }
+ 
+-F32Class EmitClassifyF32Bits(EmitterState& state, uint32_t bits) {
++// Adapted from BryKytyPS5: the module already preserves NaN and signed zero.
++static F32Class EmitClassifyF32Value(EmitterState& state, uint32_t value, uint32_t bits) {
+ 	F32Class cls;
+-	cls.bits                 = bits;
+-	const auto abs_bits      = EmitAndConstant(state, cls.bits, 0x7fffffffu);
+-	const auto exponent_bits = EmitAndConstant(state, abs_bits, 0x7f800000u);
+-	const auto mantissa_bits = EmitAndConstant(state, abs_bits, 0x007fffffu);
+-	const auto exponent_max  = EmitCompareU32Constant(state, OpIEqual, exponent_bits, 0x7f800000u);
+-	const auto mantissa_nonzero = EmitCompareU32Constant(state, OpINotEqual, mantissa_bits, 0);
+-	cls.nan  = EmitLogicalAndBool(state, exponent_max, mantissa_nonzero);
+-	cls.zero = EmitCompareU32Constant(state, OpIEqual, abs_bits, 0);
++	cls.bits = bits;
++	cls.nan = Unary(state, OpIsNan, TypeBool(state), value);
++	cls.zero = EmitCompareU32Constant(state, OpIEqual, EmitAndConstant(state, bits, 0x7fffffffu), 0);
+ 	return cls;
+ }
+ 
++F32Class EmitClassifyF32Bits(EmitterState& state, uint32_t bits) {
++	return EmitClassifyF32Value(state, EmitBitcastU32ToF32(state, bits), bits);
++}
++
+ F32Class EmitClassifyF32(EmitterState& state, uint32_t value) {
+-	return EmitClassifyF32Bits(state, EmitBitcastF32ToU32(state, value));
++	return EmitClassifyF32Value(state, value, EmitBitcastF32ToU32(state, value));
+ }
+ 
+ uint32_t EmitClassMaskBitMatch(EmitterState& state, uint32_t mask, uint32_t bit,
+@@ -301,7 +301,8 @@ uint32_t EmitMinMaxF32Value(EmitterState& state, uint32_t lhs, uint32_t rhs, boo
+ 	const auto ordered_bits =
+ 	    EmitSelectValueU32(state, numeric_cond, lhs_class.bits, rhs_class.bits);
+ 
+-	const auto both_zero    = EmitLogicalAndBool(state, lhs_class.zero, rhs_class.zero);
++	const auto both_zero = EmitCompareU32Constant(state, OpIEqual,
++	    EmitAndConstant(state, EmitOrU32(state, lhs_class.bits, rhs_class.bits), 0x7fffffffu), 0);
+ 	const auto zero_bits    = max_value ? EmitAndU32(state, lhs_class.bits, rhs_class.bits)
+ 	                                    : EmitOrU32(state, lhs_class.bits, rhs_class.bits);
+ 	const auto numeric_bits = EmitSelectValueU32(state, both_zero, zero_bits, ordered_bits);
+@@ -320,55 +321,24 @@ uint32_t EmitTruncF32Value(EmitterState& state, uint32_t value) {
+ }
+ 
+ uint32_t EmitFlushF32DenormToSignedZero(EmitterState& state, uint32_t value) {
+-	const auto bits      = state.builder.AllocateId();
+-	const auto abs_bits  = state.builder.AllocateId();
+-	const auto sign_bits = state.builder.AllocateId();
+-	const auto non_zero  = state.builder.AllocateId();
+-	const auto subnormal = state.builder.AllocateId();
+-	const auto flush     = state.builder.AllocateId();
+-	const auto selected  = state.builder.AllocateId();
+-	const auto ret       = state.builder.AllocateId();
+-	state.builder.AddFunction({OpBitcast, TypeU32(state), bits, value});
+-	state.builder.AddFunction(
+-	    {OpBitwiseAnd, TypeU32(state), abs_bits, bits, ConstantU32(state, 0x7fffffffu)});
+-	state.builder.AddFunction(
+-	    {OpBitwiseAnd, TypeU32(state), sign_bits, bits, ConstantU32(state, 0x80000000u)});
+-	state.builder.AddFunction(
+-	    {OpINotEqual, TypeBool(state), non_zero, abs_bits, ConstantU32(state, 0)});
+-	state.builder.AddFunction(
+-	    {OpULessThan, TypeBool(state), subnormal, abs_bits, ConstantU32(state, 0x00800000u)});
+-	state.builder.AddFunction({OpLogicalAnd, TypeBool(state), flush, non_zero, subnormal});
+-	state.builder.AddFunction({OpSelect, TypeU32(state), selected, flush, sign_bits, bits});
+-	state.builder.AddFunction({OpBitcast, TypeF32(state), ret, selected});
+-	return ret;
++	// A zero exponent covers both signed zeros and denormals: retain the sign.
++	const auto bits = Unary(state, OpBitcast, TypeU32(state), value);
++	const auto exponent_zero = EmitCompareU32Constant(state, OpIEqual,
++	    EmitAndConstant(state, bits, 0x7f800000u), 0);
++	const auto selected = EmitSelectValueU32(state, exponent_zero,
++	    EmitAndConstant(state, bits, 0x80000000u), bits);
++	return Unary(state, OpBitcast, TypeF32(state), selected);
+ }
+ 
+ uint32_t EmitTrigCycleF32(EmitterState& state, uint32_t src, bool preserve_signed_zero) {
+-	const auto fract        = state.builder.AllocateId();
+-	const auto bits         = state.builder.AllocateId();
+-	const auto abs_bits     = state.builder.AllocateId();
+-	const auto large        = state.builder.AllocateId();
+-	const auto finite       = state.builder.AllocateId();
+-	const auto large_finite = state.builder.AllocateId();
+-	const auto reduced      = state.builder.AllocateId();
+-	state.builder.AddFunction(
+-	    {OpExtInst, TypeF32(state), fract, GlslStd450(state), GlslFract, src});
+-	state.builder.AddFunction({OpBitcast, TypeU32(state), bits, src});
+-	state.builder.AddFunction(
+-	    {OpBitwiseAnd, TypeU32(state), abs_bits, bits, ConstantU32(state, 0x7fffffffu)});
+-	state.builder.AddFunction(
+-	    {OpUGreaterThanEqual, TypeBool(state), large, abs_bits, ConstantU32(state, 0x4b000000u)});
+-	state.builder.AddFunction(
+-	    {OpULessThan, TypeBool(state), finite, abs_bits, ConstantU32(state, 0x7f800000u)});
+-	state.builder.AddFunction({OpLogicalAnd, TypeBool(state), large_finite, large, finite});
+-	state.builder.AddFunction(
+-	    {OpSelect, TypeF32(state), reduced, large_finite, ConstantF32(state, 0), fract});
+-	if (!preserve_signed_zero) {
+-		return reduced;
+-	}
+-	const auto zero = state.builder.AllocateId();
+-	const auto ret  = state.builder.AllocateId();
+-	state.builder.AddFunction({OpIEqual, TypeBool(state), zero, abs_bits, ConstantU32(state, 0)});
++	// Finite fp32 values at magnitude >= 2^23 are integral; Fract already gives +0.
++	const auto reduced = state.builder.AllocateId();
++	state.builder.AddFunction({OpExtInst, TypeF32(state), reduced, GlslStd450(state), GlslFract, src});
++	if (!preserve_signed_zero) return reduced;
++	const auto bits = Unary(state, OpBitcast, TypeU32(state), src);
++	const auto zero = EmitCompareU32Constant(state, OpIEqual,
++	    EmitAndConstant(state, bits, 0x7fffffffu), 0);
++	const auto ret = state.builder.AllocateId();
+ 	state.builder.AddFunction({OpSelect, TypeF32(state), ret, zero, src, reduced});
+ 	return ret;
+ }
+diff --git a/src/graphics/shader/recompiler/frontend/ComputeFrontendCache.h b/src/graphics/shader/recompiler/frontend/ComputeFrontendCache.h
+new file mode 100644
+index 0000000..e8e0a6b
+--- /dev/null
++++ b/src/graphics/shader/recompiler/frontend/ComputeFrontendCache.h
+@@ -0,0 +1,69 @@
++#pragma once
++#include "graphics/shader/recompiler/frontend/cfg/ShaderCFG.h"
++#include <algorithm>
++#include <deque>
++#include <mutex>
++#include <span>
++#include <string>
++#include <vector>
++namespace Libs::Graphics::ShaderRecompiler::FrontendCache {
++struct CachedComputeFrontend {
++	uint64_t shader_hash = 0;
++	std::vector<uint32_t> code;
++	std::vector<Decoder::Instruction> instructions;
++	CFG::Graph graph;
++	bool dispatcher_fallback = false;
++	std::string dispatcher_reason;
++	size_t estimated_bytes = 0;
++};
++
++inline std::mutex g_compute_frontend_mutex;
++inline std::deque<CachedComputeFrontend> g_compute_frontends;
++constexpr size_t MaxCachedComputeFrontends = 512;
++constexpr size_t MaxCachedComputeFrontendBytes = 256ull * 1024 * 1024;
++inline size_t g_compute_frontend_bytes = 0;
++
++inline bool FindCachedComputeFrontend(std::span<const uint32_t> code, uint64_t hash,
++                               Decoder::Program& decoded, CFG::Graph& graph,
++                               bool& dispatcher_fallback, std::string& dispatcher_reason) {
++	std::lock_guard lock(g_compute_frontend_mutex);
++	for (auto& entry: g_compute_frontends) {
++		if (entry.shader_hash != hash || entry.code.size() != code.size() ||
++		    !std::equal(entry.code.begin(), entry.code.end(), code.begin())) {
++			continue;
++		}
++		decoded.code = code;
++		decoded.instructions = entry.instructions;
++		graph = entry.graph;
++		dispatcher_fallback = entry.dispatcher_fallback;
++		dispatcher_reason = entry.dispatcher_reason;
++		return true;
++	}
++	return false;
++}
++
++inline void RememberComputeFrontend(std::span<const uint32_t> code, uint64_t hash,
++                             const Decoder::Program& decoded, const CFG::Graph& graph,
++                             bool dispatcher_fallback, const std::string& dispatcher_reason) {
++	if (code.size() > 16384) {
++		return;
++	}
++	// Conservatively account for nested CFG vectors as well as instruction storage.
++	const size_t estimated_bytes = code.size() * sizeof(uint32_t) +
++	    decoded.instructions.size() * sizeof(Decoder::Instruction) +
++	    graph.blocks.size() * sizeof(CFG::BasicBlock) * 4;
++	if (estimated_bytes > MaxCachedComputeFrontendBytes) {
++		return;
++	}
++	std::lock_guard lock(g_compute_frontend_mutex);
++	while (!g_compute_frontends.empty() &&
++	       (g_compute_frontends.size() >= MaxCachedComputeFrontends ||
++	        g_compute_frontend_bytes > MaxCachedComputeFrontendBytes - estimated_bytes)) {
++		g_compute_frontend_bytes -= g_compute_frontends.front().estimated_bytes;
++		g_compute_frontends.pop_front();
++	}
++	g_compute_frontends.push_back({hash, {code.begin(), code.end()}, decoded.instructions,
++	                               graph, dispatcher_fallback, dispatcher_reason, estimated_bytes});
++	g_compute_frontend_bytes += estimated_bytes;
++}
++}
+diff --git a/src/graphics/shader/recompiler/frontend/translate/Translate.cpp b/src/graphics/shader/recompiler/frontend/translate/Translate.cpp
+index 3831f55..d15ed9c 100644
+--- a/src/graphics/shader/recompiler/frontend/translate/Translate.cpp
++++ b/src/graphics/shader/recompiler/frontend/translate/Translate.cpp
+@@ -1239,7 +1239,7 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph&
+ 		}
+ 		translator.AddBranchCondition(cfg_block, result.block_info[typed_index]);
+ 	}
+-	IR::ValidateProgram(result, false);
++	if (IR::ValidationEnabled()) IR::ValidateProgram(result, false);
+ 	return result;
+ }
+ 
+diff --git a/src/graphics/shader/recompiler/ir/Program.cpp b/src/graphics/shader/recompiler/ir/Program.cpp
+index 7f955ad..8962860 100644
+--- a/src/graphics/shader/recompiler/ir/Program.cpp
++++ b/src/graphics/shader/recompiler/ir/Program.cpp
+@@ -1,6 +1,7 @@
+ #include "common/assert.h"
+ #include "graphics/shader/recompiler/ir/ShaderIR.h"
+ 
++#include <cstdlib>
+ #include <fmt/format.h>
+ #include <map>
+ #include <new>
+@@ -98,8 +99,9 @@ bool EquivalentValue(const ResourcePlan& program, Value left, Value right,
+ } // namespace
+ 
+ ResourcePlan::~ResourcePlan() {
++	// Plan values only refer to each other (CompileResult clones them), so they die together.
+ 	for (auto& inst: value_storage) {
+-		inst.Invalidate();
++		inst.DropLinks();
+ 	}
+ }
+ 
+@@ -112,13 +114,16 @@ ResourcePlan& ResourcePlan::operator=(ResourcePlan&& other) noexcept {
+ }
+ 
+ Program::~Program() {
+-	// Values may cross block boundaries. Detach all arguments before any block starts destroying
+-	// its instruction storage so reverse-use links always point to live definitions.
+-	for (auto* block: blocks) {
++	// Values cross block boundaries and the plan values: drop every link before any storage is destroyed,
++	// all at once rather than unlinking edge by edge.
++	for (auto& block: block_storage) {
+ 		for (auto& inst: *block) {
+-			inst.Invalidate();
++			inst.DropLinks();
+ 		}
+ 	}
++	for (auto& inst: value_storage) {
++		inst.DropLinks();
++	}
+ }
+ 
+ Program& Program::operator=(Program&& other) noexcept {
+@@ -150,7 +155,9 @@ CompiledShaderInfo Program::TakeCompiledInfo() && {
+ }
+ 
+ bool EquivalentValue(const ResourcePlan& program, Value left, Value right) {
+-	std::vector<std::pair<const Inst*, const Inst*>> visited;
++	// Called per candidate pair while planning: one allocation per thread, not per call.
++	thread_local std::vector<std::pair<const Inst*, const Inst*>> visited;
++	visited.clear();
+ 	return EquivalentValue(program, left, right, visited);
+ }
+ 
+@@ -185,6 +192,11 @@ Value ResolveInvariantPhi(const ResourcePlan& program, Value value) {
+ 	return invariant;
+ }
+ 
++bool ValidationEnabled() {
++	static const bool enabled = KYTY_BUILD != KYTY_BUILD_RELEASE || std::getenv("KYTY_IR_VALIDATE") != nullptr;
++	return enabled;
++}
++
+ void ValidateProgram(const Program& program, bool require_ssa) {
+ 	if (program.blocks.size() != program.block_info.size() ||
+ 	    program.blocks.size() != program.block_storage.size()) {
+diff --git a/src/graphics/shader/recompiler/ir/Value.cpp b/src/graphics/shader/recompiler/ir/Value.cpp
+index 2c3de14..8379103 100644
+--- a/src/graphics/shader/recompiler/ir/Value.cpp
++++ b/src/graphics/shader/recompiler/ir/Value.cpp
+@@ -228,9 +228,14 @@ void Inst::AddPhiOperand(Block* predecessor, Value value) {
+ }
+ 
+ void Inst::ReplaceUsesWith(Value replacement, bool preserve) {
+-	const auto old_uses = uses;
++	// Every use moves: take the list whole instead of erasing its entries one by one from the front.
++	const auto old_uses = std::exchange(uses, {});
++	auto*      new_inst = replacement.TryInstruction();
+ 	for (const auto& use: old_uses) {
+-		use.user->SetArg(use.operand, replacement);
++		use.user->args[use.operand] = replacement;
++		if (new_inst != nullptr) {
++			use.user->AddUse(new_inst, use.operand);
++		}
+ 	}
+ 	Invalidate();
+ 	if (preserve) {
+@@ -255,9 +260,7 @@ void Inst::Invalidate() {
+ }
+ 
+ void Inst::AddUse(Inst* used, size_t operand) {
+-	const auto found = std::ranges::find_if(
+-	    used->uses, [&](const Use& use) { return use.user == this && use.operand == operand; });
+-	EXIT_IF(found != used->uses.end());
++	EXIT_IF(ValidationEnabled() && std::ranges::find(used->uses, Use {this, operand}) != used->uses.end());
+ 	used->uses.push_back({this, operand});
+ }
+ 
+@@ -268,6 +271,13 @@ void Inst::RemoveUse(Inst* used, size_t operand) {
+ 	used->uses.erase(found);
+ }
+ 
++void Inst::DropLinks() {
++	args.clear();
++	phi_blocks.clear();
++	uses.clear();
++	opcode = ValueOpcode::Void;
++}
++
+ void Inst::ClearArgs() {
+ 	for (size_t index = 0; index < args.size(); index++) {
+ 		if (auto* value_inst = args[index].TryInstruction(); value_inst != nullptr) {
+diff --git a/src/graphics/shader/recompiler/ir/Value.h b/src/graphics/shader/recompiler/ir/Value.h
+index dd00283..e3d48d9 100644
+--- a/src/graphics/shader/recompiler/ir/Value.h
++++ b/src/graphics/shader/recompiler/ir/Value.h
+@@ -16,6 +16,11 @@ namespace Libs::Graphics::ShaderRecompiler::IR {
+ class Block;
+ class Inst;
+ 
++// Whether translations run the IR consistency checks (ValidateProgram, duplicate uses): debug builds, or
++// KYTY_IR_VALIDATE in release. They only ever stop the emulator, and they were a fifth of a release
++// translation's time (the first-encounter hitches).
++bool ValidationEnabled();
++
+ class Value {
+ public:
+ 	Value() = default;
+@@ -128,6 +133,8 @@ public:
+ 	void ReplaceUsesWith(Value replacement, bool preserve = true);
+ 	void ReplaceOpcode(ValueOpcode opcode);
+ 	void Invalidate();
++	// Invalidate without unlinking the uses: only when every value of the IR is destroyed together.
++	void DropLinks();
+ 
+ 	template <typename T>
+ 	requires(sizeof(T) <= sizeof(uint64_t) && std::is_trivially_copyable_v<T>)
+diff --git a/src/graphics/shader/recompiler/ir/passes/DeadCodeElimination.cpp b/src/graphics/shader/recompiler/ir/passes/DeadCodeElimination.cpp
+index 3d98052..119445b 100644
+--- a/src/graphics/shader/recompiler/ir/passes/DeadCodeElimination.cpp
++++ b/src/graphics/shader/recompiler/ir/passes/DeadCodeElimination.cpp
+@@ -1,6 +1,7 @@
+ #include "graphics/shader/recompiler/ir/passes/DeadCodeElimination.h"
+ 
+ #include <algorithm>
++#include <unordered_set>
+ #include <vector>
+ 
+ namespace Libs::Graphics::ShaderRecompiler::IR {
+@@ -24,10 +25,11 @@ static bool RemoveDeadPhiWebs(const BlockList& blocks) {
+ 	std::vector<Inst*> dead;
+ 	std::vector<Inst*> web;
+ 	std::vector<Inst*> stack;
++	// Membership of `dead` (looked up per phi and, when erasing, per instruction).
++	std::unordered_set<const Inst*> dead_set;
+ 	for (auto* block: blocks) {
+ 		for (auto& inst: block->Instructions()) {
+-			if (inst.GetOpcode() != ValueOpcode::Phi ||
+-			    std::ranges::find(dead, &inst) != dead.end()) {
++			if (inst.GetOpcode() != ValueOpcode::Phi || dead_set.contains(&inst)) {
+ 				continue;
+ 			}
+ 			web.clear();
+@@ -53,6 +55,7 @@ static bool RemoveDeadPhiWebs(const BlockList& blocks) {
+ 				continue;
+ 			}
+ 			dead.insert(dead.end(), web.begin(), web.end());
++			dead_set.insert(web.begin(), web.end());
+ 		}
+ 	}
+ 	if (dead.empty()) {
+@@ -64,7 +67,7 @@ static bool RemoveDeadPhiWebs(const BlockList& blocks) {
+ 	for (auto* block: blocks) {
+ 		auto& instructions = block->Instructions();
+ 		for (auto inst = instructions.begin(); inst != instructions.end();) {
+-			if (std::ranges::find(dead, &*inst) != dead.end()) {
++			if (dead_set.contains(&*inst)) {
+ 				inst = instructions.erase(inst);
+ 			} else {
+ 				inst++;
+diff --git a/src/graphics/shader/recompiler/ir/passes/SrtWalker.cpp b/src/graphics/shader/recompiler/ir/passes/SrtWalker.cpp
+index 4d267aa..4bcdd33 100644
+--- a/src/graphics/shader/recompiler/ir/passes/SrtWalker.cpp
++++ b/src/graphics/shader/recompiler/ir/passes/SrtWalker.cpp
+@@ -473,26 +473,23 @@ private:
+ 		if (inst == nullptr) {
+ 			Fail(use_pc, "invalid typed planning value");
+ 		}
+-		const auto cycle = std::ranges::find(m_visiting, inst);
+-		if (cycle != m_visiting.end()) {
+-			const auto contains_phi = std::any_of(cycle, m_visiting.end(), [](const Inst* value) {
+-				return value->GetOpcode() == ValueOpcode::Phi;
+-			});
+-			if (contains_phi) {
++		// A value is collected once; one reached again on its own path closes a cycle, which is fine through a
++		// phi (m_phis[d] counts the phis above depth d) and an error otherwise.
++		const auto [state, fresh] = m_states.try_emplace(inst, static_cast<uint32_t>(m_phis.size() - 1));
++		if (!fresh) {
++			if (state->second == Collected || m_phis.back() > m_phis[state->second]) {
+ 				return;
+ 			}
+ 			Fail(use_pc, fmt::format("cyclic typed planning value {} without a phi",
+ 			                         ValueOpcodeName(inst->GetOpcode())));
+ 		}
+-		if (std::ranges::find(m_visited, inst) != m_visited.end()) {
+-			return;
+-		}
+-		m_visiting.push_back(inst);
++		auto& depth = state->second;
++		m_phis.push_back(m_phis.back() + (inst->GetOpcode() == ValueOpcode::Phi ? 1 : 0));
+ 		for (size_t index = 0; index < inst->NumArgs(); index++) {
+ 			Collect(inst->Arg(index), use_pc);
+ 		}
+-		m_visiting.pop_back();
+-		m_visited.push_back(inst);
++		m_phis.pop_back();
++		depth = Collected;
+ 		if (!IsRawRead(m_program, *inst)) {
+ 			return;
+ 		}
+@@ -504,7 +501,10 @@ private:
+ 			}
+ 			return;
+ 		}
+-		for (uint32_t slot = 0; slot < m_program.srt_reads.size(); slot++) {
++		// Only reads of one structural hash can be equivalent; within it the earliest slot wins, as
++		// when every read was compared (big compute shaders: thousands of reads, 100+ ms a translation).
++		auto& bucket = m_buckets[StructuralHash(value)];
++		for (const auto slot: bucket) {
+ 			if (EquivalentValue(m_program, value, m_program.srt_reads[slot].value)) {
+ 				m_patches.push_back({inst, slot, false});
+ 				return;
+@@ -512,15 +512,49 @@ private:
+ 		}
+ 		const auto slot = static_cast<uint32_t>(m_program.srt_reads.size());
+ 		m_program.srt_reads.push_back({value, slot});
++		bucket.push_back(slot);
+ 		m_patches.push_back({inst, slot, true});
+ 	}
+ 
++	// Equal for every pair EquivalentValue accepts: it hashes only what that compares (opcode, type,
++	// argument count, immediates, arguments; a phi's blocks, not its arguments, so no cycle is followed).
++	uint64_t StructuralHash(Value value) {
++		const auto mix = [](uint64_t hash, uint64_t part) {
++			return hash ^ (part + 0x9e3779b97f4a7c15ull + (hash << 6u) + (hash >> 2u));
++		};
++		value           = value.Resolve();
++		const auto type = static_cast<uint64_t>(value.GetType());
++		if (value.IsImmediate()) {
++			return mix(type, value.GetType() == Type::U32 ? value.U32() : value.GetType() == Type::U64 ? value.U64() : 0);
++		}
++		const auto* inst = value.TryInstruction();
++		if (inst == nullptr) {
++			return type;
++		}
++		if (const auto found = m_hashes.find(inst); found != m_hashes.end()) {
++			return found->second;
++		}
++		auto hash = mix(mix(type, static_cast<uint64_t>(inst->GetOpcode())), inst->NumArgs());
++		for (size_t index = 0; index < inst->NumArgs(); index++) {
++			hash = mix(hash, inst->GetOpcode() == ValueOpcode::Phi ? reinterpret_cast<uintptr_t>(inst->PhiBlock(index))
++			                                                         : StructuralHash(inst->Arg(index)));
++		}
++		m_hashes.emplace(inst, hash);
++		return hash;
++	}
++
+ 	void PatchReads() {
++		// Each patched read's place in its block, found in one pass (inserting keeps list positions valid).
++		std::unordered_map<const Inst*, decltype(m_program.blocks.front()->Instructions().begin())> places;
++		for (const auto& patch: m_patches) places.emplace(patch.inst, decltype(places)::mapped_type {});
++		for (auto* block: m_program.blocks) {
++			auto& list = block->Instructions();
++			for (auto it = list.begin(); it != list.end(); ++it)
++				if (const auto place = places.find(&*it); place != places.end()) place->second = it;
++		}
+ 		for (const auto& patch: m_patches) {
+ 			auto* block = patch.inst->Parent();
+-			auto& list  = block->Instructions();
+-			auto  where =
+-			    std::ranges::find_if(list, [&](const Inst& inst) { return &inst == patch.inst; });
++			auto  where = places.at(patch.inst);
+ 			const auto resource =
+ 			    Value(&*block->PrependNewInst(where, ValueOpcode::GetSrtResource));
+ 			const auto flat = Value(&*block->PrependNewInst(where, ValueOpcode::ReadConst,
+@@ -547,10 +581,14 @@ private:
+ 		}
+ 	}
+ 
+-	Program&           m_program;
+-	std::vector<Inst*> m_visiting;
+-	std::vector<Inst*> m_visited;
+-	std::vector<Patch> m_patches;
++	static constexpr uint32_t Collected = UINT32_MAX;
++
++	Program&                                                m_program;
++	std::unordered_map<const Inst*, uint32_t>               m_states; // depth on the path, or Collected
++	std::vector<uint32_t>                                   m_phis {0};
++	std::vector<Patch>                                      m_patches;
++	std::unordered_map<uint64_t, std::vector<uint32_t>>     m_buckets; // srt_reads slots by StructuralHash
++	std::unordered_map<const Inst*, uint64_t>               m_hashes;
+ };
+ 
+ // Entries live only for one evaluation. Open addressing avoids allocating a
+@@ -1228,10 +1266,12 @@ bool EvaluateRuntimeSourcesImpl(const ResourcePlan& program, std::span<const uin
+ 			}
+ 		}
+ 	}
+-	results = std::move(evaluated);
+-	active_sources = std::move(active);
++	// Copied, not moved: the callers' vectors are reused storage that the linear evaluation swaps
++	// with its own; a moved-in vector of exactly this size made those reallocate.
++	results.assign(evaluated.begin(), evaluated.end());
++	active_sources.assign(active.begin(), active.end());
+ 	if (evaluate_flat) {
+-		flat = std::move(flattened);
++		flat.assign(flattened.begin(), flattened.end());
+ 	}
+ 	return true;
+ }
+@@ -1445,6 +1485,26 @@ static bool EvaluateLinearSrt(const LinearSrtPlan& plan,const SrtRuntime& runtim
+ }
+ 
+ #if defined(__x86_64__) || defined(_M_X64)
++// What a read node's address is based on (SrtReadTrace::Base): a user data pair, or two structural
++// reads (`read_index`: their indices in the trace; empty: none).
++static SrtReadTrace::Base PointerBase(const LinearSrtPlan& plan, const LinearSrtPlan::Node& node,
++                                      std::span<const uint32_t> read_index) {
++	using Kind = LinearSrtPlan::Kind;
++	SrtReadTrace::Base base;
++	if (node.op == ValueOpcode::ReadConstBuffer) return base;
++	const auto& low  = plan.nodes[node.args[0]];
++	const auto& high = plan.nodes[node.args[1]];
++	if (low.kind == Kind::User && high.kind == Kind::User && high.immediate == low.immediate + 1 &&
++	    low.immediate < SrtReadTrace::NoRoot) {
++		base.root = static_cast<uint8_t>(low.immediate);
++	} else if (low.kind == Kind::Read && high.kind == Kind::Read && !read_index.empty() &&
++	           read_index[node.args[0]] != SrtReadTrace::NoBase && read_index[node.args[1]] != SrtReadTrace::NoBase) {
++		base.low  = read_index[node.args[0]];
++		base.high = read_index[node.args[1]];
++	}
++	return base;
++}
++
+ static bool TraceLinearPlan(const ResourcePlan& program, const LinearSrtPlan& plan, const SrtRuntime& runtime,
+                             SrtReadTrace& trace) {
+ 	if (plan.function == nullptr) return false;
+@@ -1463,46 +1523,55 @@ static bool TraceLinearPlan(const ResourcePlan& program, const LinearSrtPlan& pl
+ 	auto& structural = scratch.structural;
+ 	structural.assign(plan.nodes.size(), 0);
+ 	for (const auto& node: plan.nodes) {
+-		uint32_t used = 0;
+-		uint8_t  use  = SrtReadTrace::Computed;
+ 		switch (node.kind) {
+ 			case Kind::Read:
+-				used = node.op == ValueOpcode::ReadConstBuffer ? 5u : 3u;
+-				use  = SrtReadTrace::Address;
++				if (node.op == ValueOpcode::ReadConstBuffer) {
++					for (uint32_t i = 0; i < 5; ++i) structural[node.args[i]] |= SrtReadTrace::Address;
++				} else {
++					structural[node.args[0]] |= SrtReadTrace::Pointer;
++					structural[node.args[1]] |= SrtReadTrace::Pointer;
++					structural[node.args[2]] |= SrtReadTrace::Address;
++				}
++				break;
++			case Kind::Unary: structural[node.args[0]] |= SrtReadTrace::Computed; break;
++			case Kind::Binary:
++				for (uint32_t i = 0; i < 2; ++i) structural[node.args[i]] |= SrtReadTrace::Computed;
++				break;
++			case Kind::Select:
++				for (uint32_t i = 0; i < 3; ++i) structural[node.args[i]] |= SrtReadTrace::Computed;
+ 				break;
+-			case Kind::Unary: used = 1; break;
+-			case Kind::Binary: used = 2; break;
+-			case Kind::Select: used = 3; break;
+ 			default: break;
+ 		}
+-		for (uint32_t i = 0; i < used; ++i) structural[node.args[i]] |= use;
+ 	}
+ 	for (const auto node: plan.descriptor_words)
+ 		if (node != UINT32_MAX) structural[node] |= SrtReadTrace::Descriptor;
+ 	trace.flat_words = plan.flat_words.size();
++	// Anything in the flattened SRT but a plain read is an immediate, user data or computed from
++	// structural reads: its value stays, its inputs are compared.
+ 	auto& data = scratch.data;
+ 	data.assign(plan.nodes.size(), 0);
+-	for (uint32_t i = 0; i < plan.flat_words.size(); ++i) {
+-		const auto index = plan.flat_words[i];
+-		if (index == UINT32_MAX) continue;
+-		const auto& node = plan.nodes[index];
+-		// Anything else in the flattened SRT is an immediate, user data or computed
+-		// from structural reads: its value stays, its inputs are compared.
+-		if (node.kind != Kind::Read || structural[index] || node.clean) continue;
+-		uint64_t address = 0;
+-		if (!LinearSrtPlan::ReadAddress(&node, values.data(), address)) return false;
+-		trace.data.emplace_back(i, address);
+-		data[index] = 1;
+-	}
++	for (const auto index: plan.flat_words)
++		if (index != UINT32_MAX && plan.nodes[index].kind == Kind::Read && !structural[index] && !plan.nodes[index].clean)
++			data[index] = 1;
+ 	auto& read_index = scratch.read_index;
+-	read_index.assign(plan.nodes.size(), UINT32_MAX);
++	read_index.assign(plan.nodes.size(), SrtReadTrace::NoBase);
+ 	for (uint32_t index = 0; index < plan.nodes.size(); ++index) {
+ 		const auto& node = plan.nodes[index];
+ 		if (node.kind != Kind::Read || data[index]) continue;
+ 		uint64_t address = 0;
+ 		if (!LinearSrtPlan::ReadAddress(&node, values.data(), address)) return false;
+ 		read_index[index] = static_cast<uint32_t>(trace.structural.size());
+-		trace.structural.push_back({address, static_cast<uint32_t>(values[index]), node.clean, structural[index]});
++		trace.structural.push_back({address, static_cast<uint32_t>(values[index]), node.clean, structural[index],
++		                            PointerBase(plan, node, read_index)});
++	}
++	for (uint32_t i = 0; i < plan.flat_words.size(); ++i) {
++		const auto index = plan.flat_words[i];
++		if (index == UINT32_MAX || !data[index]) continue;
++		const auto& node    = plan.nodes[index];
++		uint64_t    address = 0;
++		if (!LinearSrtPlan::ReadAddress(&node, values.data(), address)) return false;
++		trace.data.emplace_back(i, address);
++		trace.data_bases.push_back(PointerBase(plan, node, read_index));
+ 	}
+ 	for (uint32_t i = 0; i < plan.flat_words.size(); ++i) {
+ 		const auto node = plan.flat_words[i];
+@@ -1568,14 +1637,45 @@ bool TraceLinearSrtReads(const ResourcePlan& program, const SrtRuntime& runtime,
+ #if defined(__x86_64__) || defined(_M_X64)
+ 	const auto* plan = program.linear_srt.get();
+ 	trace.data.clear();
++	trace.data_bases.clear();
+ 	trace.structural.clear();
+ 	trace.feeds.clear();
+ 	trace.flat_feeds.clear();
++	trace.unrooted = false;
++	// Nothing to read: no descriptor, flattened word, uniform fill or table.
++	if (plan == nullptr && program.srt_plan_complete && program.descriptor_sources.empty() &&
++	    program.srt_reads.empty() && program.control_flow.empty() && program.uniform_fill.fill.words == 0 &&
++	    !program.requires_specialization_memory) {
++		trace.flat_words = 0;
++		return true;
++	}
+ 	if (plan == nullptr || !program.srt_plan_complete ||
+ 	    !LinearInputsMatch(program, *plan, program.materialization_sources, program.clean_flat_slots))
+ 		return false;
+ 	if (plan->control_variants.empty()) return TraceLinearPlan(program, *plan, runtime, trace);
+-	// The leaf EvaluateRuntimeSources would select, from logged predicate reads.
++	// The leaf EvaluateRuntimeSources selects: by the native predicate when it does (SelectNativePredicate),
++	// whose reads are the plan's, with their roots.
++	if (kyty_local_srt_predicate_mode.load(std::memory_order_relaxed) != 0 && plan->single_condition) {
++		const auto&               predicate = *plan->single_condition;
++		std::array<uint64_t, 128> values;
++		if (predicate.nodes.size() > values.size() || predicate.flat_words.size() != 1 ||
++		    runtime.read_specialization_memory == nullptr || !predicate.function(&runtime, values.data()))
++			return false;
++		const auto choice = uint32_t(values[predicate.flat_words[0]]) != 0 ? 0u : 1u;
++		if (!TraceLinearPlan(program, *plan->control_variants[plan->single_condition_variants[choice]], runtime, trace))
++			return false;
++		for (uint32_t index = 0; index < predicate.nodes.size(); ++index) {
++			const auto& node = predicate.nodes[index];
++			if (node.kind != LinearSrtPlan::Kind::Read) continue;
++			uint64_t address = 0;
++			if (!LinearSrtPlan::ReadAddress(&node, values.data(), address)) return false;
++			trace.structural.push_back({address, static_cast<uint32_t>(values[index]), node.clean,
++			                            SrtReadTrace::Predicate, PointerBase(predicate, node, {})});
++		}
++		return true;
++	}
++	// Else from the interpreter's logged predicate reads.
++	trace.unrooted = true;
+ 	if (runtime.read_memory == nullptr || runtime.read_specialization_memory == nullptr ||
+ 	    runtime.try_read_memory_span == nullptr || runtime.sync_memory == nullptr)
+ 		return false;
+@@ -1605,6 +1705,71 @@ bool TraceLinearSrtReads(const ResourcePlan& program, const SrtRuntime& runtime,
+ #endif
+ }
+ 
++SrtUserDataUse UserDataUse(const ResourcePlan& program) {
++#if defined(__x86_64__) || defined(_M_X64)
++	// The uniform fill and indirect image tables are evaluated outside the plans.
++	if (!program.srt_plan_complete || program.uniform_fill.fill.words != 0 || program.requires_specialization_memory)
++		return {};
++	const auto* root = program.linear_srt.get();
++	if (root == nullptr)
++		return program.descriptor_sources.empty() && program.srt_reads.empty() && program.control_flow.empty()
++		           ? SrtUserDataUse {0, 0}
++		           : SrtUserDataUse {};
++	// The plans an evaluation runs: the linear plan, or the predicate and the variant it selects.
++	std::vector<const LinearSrtPlan*> plans {root};
++	if (!root->control_variants.empty()) {
++		if (root->single_condition == nullptr) return {};
++		plans = {root->single_condition.get()};
++		for (const auto& variant: root->control_variants) plans.push_back(variant.get());
++	}
++	using Kind = LinearSrtPlan::Kind;
++	// By user data index: read at all, the low or the high half of a pointer read's base, or anything else.
++	uint32_t read = 0, low = 0, high = 0, other = 0;
++	for (const auto* plan: plans) {
++		const auto user = [&](uint32_t node) {
++			const auto& n = plan->nodes[node];
++			return n.kind == Kind::User && n.immediate < 31 ? static_cast<int>(n.immediate) : -1;
++		};
++		const auto any = [&](uint32_t node) {
++			if (const auto k = user(node); k >= 0) other |= 1u << k;
++		};
++		for (const auto& node: plan->nodes) {
++			if (node.kind == Kind::User) {
++				if (node.immediate >= 32) return {};
++				read |= 1u << node.immediate;
++			}
++			uint32_t used = 0;
++			switch (node.kind) {
++				case Kind::Read: used = node.op == ValueOpcode::ReadConstBuffer ? 5u : 3u; break;
++				case Kind::Unary: used = 1; break;
++				case Kind::Binary: used = 2; break;
++				case Kind::Select: used = 3; break;
++				default: break;
++			}
++			if (node.kind == Kind::Read && node.op != ValueOpcode::ReadConstBuffer) {
++				const auto k = user(node.args[0]);
++				if (k >= 0 && user(node.args[1]) == k + 1) {
++					low |= 1u << k;
++					high |= 1u << (k + 1);
++					any(node.args[2]);
++					continue;
++				}
++			}
++			for (uint32_t i = 0; i < used; ++i) any(node.args[i]);
++		}
++		for (const auto node: plan->descriptor_words)
++			if (node != UINT32_MAX) any(node);
++		for (const auto node: plan->flat_words)
++			if (node != UINT32_MAX) any(node);
++	}
++	// Each half in its role only.
++	return {read, low & (high >> 1) & ~(other | high) & ~((other | low) >> 1)};
++#else
++	(void)program;
++	return {};
++#endif
++}
++
+ bool ValidateRuntimeValue(const ResourcePlan& program, Value value, RuntimeValueType type,
+                           std::string* reason) {
+ 	RuntimeValidator validator(program, type);
+diff --git a/src/graphics/shader/recompiler/ir/passes/SrtWalker.h b/src/graphics/shader/recompiler/ir/passes/SrtWalker.h
+index bd165ce..ed594ac 100644
+--- a/src/graphics/shader/recompiler/ir/passes/SrtWalker.h
++++ b/src/graphics/shader/recompiler/ir/passes/SrtWalker.h
+@@ -62,14 +62,24 @@ bool WalkSrt(const ResourcePlan& program, const SrtRuntime& runtime,
+ // `structural`, with the value it had. False when the program is not evaluated
+ // by a single linear plan (no plan, control-flow variants, a failed read).
+ struct SrtReadTrace {
+-	// Why a read is structural (bits): it feeds another read's address, a
+-	// descriptor dword, a computed value, or it is a control-flow predicate input.
+-	enum Use : uint8_t { Address = 1, Descriptor = 2, Computed = 4, Predicate = 8 };
++	// Why a read is structural (bits): it feeds another read's address (`Pointer`: as the low or high
++	// half of a pointer read's base, `Address`: otherwise), a descriptor dword, a computed value, or it
++	// is a control-flow predicate input.
++	enum Use : uint8_t { Address = 1, Descriptor = 2, Computed = 4, Predicate = 8, Pointer = 16 };
++	// What a pointer read's address is based on: user data pair `root` (user[k] | user[k + 1] << 32)
++	// or the values of the structural reads `low` and `high`, plus an offset that does not depend on it.
++	static constexpr uint8_t  NoRoot = 0xff;
++	static constexpr uint32_t NoBase = UINT32_MAX;
++	struct Base {
++		uint8_t  root = NoRoot;
++		uint32_t low = NoBase, high = NoBase;
++	};
+ 	struct Read {
+ 		uint64_t address = 0;
+ 		uint32_t value   = 0;
+ 		bool     clean   = false;
+ 		uint8_t  use     = 0;
++		Base     base;
+ 	};
+ 	// Structural reads copied unchanged into a descriptor dword of the snapshot.
+ 	enum class Kind : uint8_t { Buffer, Image, Sampler };
+@@ -79,7 +89,9 @@ struct SrtReadTrace {
+ 		uint32_t index = 0; // resource index in the snapshot
+ 		uint32_t dword = 0;
+ 	};
+-	std::vector<std::pair<uint32_t, uint64_t>> data; // (flat index, address)
++	std::vector<std::pair<uint32_t, uint64_t>> data;       // (flat index, address)
++	std::vector<Base>                          data_bases; // per data read
++	bool                                       unrooted = false; // reads without their roots (the interpreter's)
+ 	std::vector<Read>                          structural;
+ 	std::vector<Feed>                          feeds;
+ 	// Structural reads that are also copied unchanged into the flattened SRT:
+@@ -88,6 +100,15 @@ struct SrtReadTrace {
+ 	size_t                                     flat_words = 0;
+ };
+ bool TraceLinearSrtReads(const ResourcePlan& program, const SrtRuntime& runtime, SrtReadTrace& trace);
++// How the SRT evaluation uses user data (bit k: user[k]): the words it may read, and the pairs
++// (user[k], user[k + 1]) its linear plan uses for nothing but the bases of its pointer reads (an
++// evaluation with another value there reads the same offsets from the new base). Every word and
++// no pair for a plan with control-flow variants, a uniform fill or indirect images.
++struct SrtUserDataUse {
++	uint32_t read     = UINT32_MAX;
++	uint32_t pointers = 0;
++};
++SrtUserDataUse UserDataUse(const ResourcePlan& program);
+ 
+ } // namespace Libs::Graphics::ShaderRecompiler::IR
+ 
+diff --git a/src/graphics/shader/shader.cpp b/src/graphics/shader/shader.cpp
+index 89f8c2f..976ecd6 100644
+--- a/src/graphics/shader/shader.cpp
++++ b/src/graphics/shader/shader.cpp
+@@ -22,7 +22,9 @@
+ #include <array>
+ #include <atomic>
+ #include <bit>
++#include <cstddef>
+ #include <cstdio>
++#include <cstring>
+ #include <memory>
+ #include <mutex>
+ #include <span>
+@@ -121,20 +123,25 @@ static ShaderMappedData ShaderGetMappedData(uint64_t addr, const char* label) {
+ 	EXIT("%s shader=0x%016" PRIx64 " is missing from ShaderMap\n", label, addr);
+ }
+ 
+-static const ShaderBinaryInfo* GetBinaryInfo(const uint32_t* code) {
+-	EXIT_IF(code == nullptr);
+-
+-	if (code[0] == 0xBEEB03FF) {
+-		return reinterpret_cast<const ShaderBinaryInfo*>(code +
+-		                                                 static_cast<size_t>(code[1] + 1) * 2);
+-	}
+-
+-	return nullptr;
++// Shader memory read as HashShaderCode reads the code: GPU ownership is byte-exact, CPU protection
++// covers whole pages, so bytes that only share a page with GPU-written data come from the backing (a
++// load would fault on the page and wait for its download). GPU-written bytes are loaded.
++static void ReadShaderMemory(uint64_t address, void* out, size_t bytes) {
++	if (!LibKernel::Memory::TryReadGpuCleanBackingOnWatchedPage(address, out, bytes))
++		std::memcpy(out, reinterpret_cast<const void*>(address), bytes);
+ }
+ 
+ static uint64_t GetDeclaredShaderHash(uint64_t shader_addr) {
+-	const auto* header = GetBinaryInfo(reinterpret_cast<const uint32_t*>(shader_addr));
+-	return header != nullptr ? (static_cast<uint64_t>(header->hash1) << 32u) | header->hash0 : 0;
++	EXIT_IF(shader_addr == 0);
++	std::array<uint32_t, 2> code {};
++	ReadShaderMemory(shader_addr, code.data(), sizeof(code));
++	if (code[0] != 0xBEEB03FF) return 0;
++	// The header's hash0 and hash1 (ShaderBinaryInfo).
++	std::array<uint32_t, 2> hash {};
++	ReadShaderMemory(shader_addr + static_cast<uint64_t>(code[1] + 1u) * 2u * sizeof(uint32_t) +
++	                     offsetof(ShaderBinaryInfo, hash0),
++	                 hash.data(), sizeof(hash));
++	return (static_cast<uint64_t>(hash[1]) << 32u) | hash[0];
+ }
+ 
+ static uint64_t HashShaderCode(std::span<const uint32_t> code) {
+diff --git a/src/kernel/memoryAddressSpace.inc b/src/kernel/memoryAddressSpace.inc
+index c26de72..ec3b551 100644
+--- a/src/kernel/memoryAddressSpace.inc
++++ b/src/kernel/memoryAddressSpace.inc
+@@ -1100,7 +1100,9 @@ private:
+ 	// The pages the one active host read copies (all until it knows), 0 when none.
+ 	alignas(64) std::atomic<uint64_t> m_host_read_pages {0};
+ 	struct HostReadTranslation { MapEntry entry; uint64_t epoch = 0; };
+-	std::array<HostReadTranslation, 64> m_host_read_translations {};
++	// By 4 MiB granule: 1024 slots cover 4 GiB without two granules sharing one (with 64, granules 256 MiB apart
++	// evicted each other and their reads searched m_maps).
++	std::array<HostReadTranslation, 1024> m_host_read_translations {};
+ 	uint64_t m_mapping_epoch = 1;
+ };
+ 
+diff --git a/src/local/async-upload.h b/src/local/async-upload.h
+index f7c9c05..3531998 100644
+--- a/src/local/async-upload.h
++++ b/src/local/async-upload.h
+@@ -5,7 +5,7 @@
+ // KYTY_ASYNC_UPLOAD=2: the staging copies of image uploads (ObtainBufferForImage) as well.
+ //
+ // The worker reads the backing view, never the guest range: a guest write or protection change
+-// cannot fault it, and unmapping drains the queue before the range can be reused.
++// cannot fault it, and unmapping a range waits for the jobs on it before the range can be reused.
+ 
+ #include "local-platform.h"
+ 
+@@ -37,27 +37,16 @@ public:
+ 	Worker(const Worker&)            = delete;
+ 	Worker& operator=(const Worker&) = delete;
+ 
+-	// Render thread only. Returns the sequence number that covers this copy.
+-	uint64_t Push(uint8_t* destination, const uint8_t* source, uint64_t size) {
+-		const uint64_t head = m_head.load(std::memory_order_relaxed);
+-		while (head - m_done.load(std::memory_order_acquire) >= Capacity) {
+-			Kick();
+-			_mm_pause();
+-		}
+-		m_jobs[head % Capacity] = {destination, source, size, nullptr, nullptr};
+-		m_head.store(head + 1, std::memory_order_seq_cst);
+-		return head + 1;
++	// Render thread only: copies the backing of guest [guest, guest + size). Returns the sequence number
++	// that covers this copy.
++	uint64_t Push(uint8_t* destination, const uint8_t* source, uint64_t size, uint64_t guest) {
++		return Add({destination, source, size, nullptr, nullptr, guest, size});
+ 	}
+-	// Render thread only: runs call(context, a, b) on the worker in queue order.
+-	uint64_t PushCall(void (*call)(void*, uint64_t, uint64_t), void* context, uint64_t a, uint64_t b) {
+-		const uint64_t head = m_head.load(std::memory_order_relaxed);
+-		while (head - m_done.load(std::memory_order_acquire) >= Capacity) {
+-			Kick();
+-			_mm_pause();
+-		}
+-		m_jobs[head % Capacity] = {reinterpret_cast<uint8_t*>(a), nullptr, b, call, context};
+-		m_head.store(head + 1, std::memory_order_seq_cst);
+-		return head + 1;
++	// Render thread only: runs call(context, a, b) on the worker in queue order; it works on guest
++	// [guest, guest + guest_size).
++	uint64_t PushCall(void (*call)(void*, uint64_t, uint64_t), void* context, uint64_t a, uint64_t b, uint64_t guest,
++	                  uint64_t guest_size) {
++		return Add({reinterpret_cast<uint8_t*>(a), nullptr, b, call, context, guest, guest_size});
+ 	}
+ 	// Render thread only: wakes the worker after a batch of pushes.
+ 	void Kick() {
+@@ -65,6 +54,16 @@ public:
+ 	}
+ 	// Render thread only: the sequence number of the last pushed copy.
+ 	[[nodiscard]] uint64_t Pushed() const { return m_head.load(std::memory_order_relaxed); }
++	// Render thread only: the sequence number of the last pending job on guest [vaddr, vaddr + size), or 0.
++	[[nodiscard]] uint64_t PendingOn(uint64_t vaddr, uint64_t size) const {
++		const uint64_t head = m_head.load(std::memory_order_relaxed);
++		uint64_t       last = 0;
++		for (uint64_t sequence = m_done.load(std::memory_order_acquire); sequence < head; ++sequence) {
++			const Job& job = m_jobs[sequence % Capacity];
++			if (job.guest < vaddr + size && vaddr < job.guest + job.guest_size) last = sequence + 1;
++		}
++		return last;
++	}
+ 
+ 	// Any thread: returns once every copy up to `sequence` is in staging memory.
+ 	void Wait(uint64_t sequence) {
+@@ -85,9 +84,21 @@ private:
+ 		const uint8_t* source;
+ 		uint64_t       size;
+ 		void (*call)(void*, uint64_t, uint64_t); // with destination as `a`, size as `b`
+-		void* context;
++		void*    context;
++		uint64_t guest, guest_size;
+ 	};
+ 
++	uint64_t Add(const Job& job) {
++		const uint64_t head = m_head.load(std::memory_order_relaxed);
++		while (head - m_done.load(std::memory_order_acquire) >= Capacity) {
++			Kick();
++			_mm_pause();
++		}
++		m_jobs[head % Capacity] = job;
++		m_head.store(head + 1, std::memory_order_seq_cst);
++		return head + 1;
++	}
++
+ 	void Run() {
+ 		LocalPlatform::SetThreadName("Kyty.Upload");
+ 		// Created by the render thread: do not inherit its dedicated CPU.
+@@ -159,4 +170,9 @@ inline void Drain() {
+ 	Wait(SubmitSequence());
+ }
+ 
++// Render thread: every recorded job on guest [vaddr, vaddr + size) is done before this returns.
++inline void DrainRange(uint64_t vaddr, uint64_t size) {
++	if (g_used.load(std::memory_order_relaxed)) Wait(Get().PendingOn(vaddr, size));
++}
++
+ } // namespace AsyncUpload
+diff --git a/src/local/draw-state-observer.h b/src/local/draw-state-observer.h
+index d0d22c5..effa250 100644
+--- a/src/local/draw-state-observer.h
++++ b/src/local/draw-state-observer.h
+@@ -1,10 +1,10 @@
+ #ifndef EMULATOR_SRC_LOCAL_DRAW_STATE_OBSERVER_H_
+ #define EMULATOR_SRC_LOCAL_DRAW_STATE_OBSERVER_H_
+-// Tracks whether the graphics state changed between consecutive indexed indirect
+-// draws, for the native XPR draw path: a draw is "clean" when nothing but the
+-// per-draw user-data SGPRs (the XPR geometry root), the index state and the
+-// indirect offset changed since the previous DRAW_INDEX_INDIRECT, so the previous
+-// draw-state key still applies.
++// Tracks whether the graphics state changed between consecutive indexed draws
++// (indirect or direct), for the native XPR draw path: a draw is "clean" when nothing
++// but the per-draw user-data SGPRs (the XPR geometry root), the index state and the
++// indirect offset changed since the previous one, so the previous draw-state key
++// still applies.
+ //
+ // A register write only dirties the gap when it changes a value (shadow copies
+ // of the CX/SH/UC spaces). Graphics user-data SGPRs (PS 0x0c-0x2b, GS 0x8c-0xab,
+@@ -92,6 +92,8 @@ inline void ObservePacket(uint32_t opcode, const uint32_t* packet, uint32_t pack
+ 	}
+ 	switch (opcode) {
+ 		case Pm4::IT_DRAW_INDEX_INDIRECT:
++		case Pm4::IT_DRAW_INDEX_2:
++		case Pm4::IT_DRAW_INDEX_OFFSET_2:
+ 			s.last_clean = s.chain && !s.dirty;
+ 			s.chain      = true;
+ 			s.dirty      = false;
+diff --git a/src/local/live-counters.h b/src/local/live-counters.h
+index d55394f..e995174 100644
+--- a/src/local/live-counters.h
++++ b/src/local/live-counters.h
+@@ -103,15 +103,22 @@ enum Id : uint32_t {
+ 	XprRefuseReads,        // ... the SRT read log (alignment, span or total size)
+ 	XprRefuseBind,         // ... resource binding for the record's set
+ 	XprRefuseDraw,         // store requests the normal path did not store (mesh, non-indexed, vertex buffers)
++	XprRelocated,          // uses of relocatable native records (KYTY_NATIVE_XPR_RELOCATE)
++	XprRelocatedStored,    // ... relocated records stored
+ 	DepthOverlaps,         // images recreated between depth and colour use (ResolveDepthOverlap)
+ 	DepthOverlapBytes,     // ... their guest bytes
++	XprMissBlocked,        // native record misses (xpr_miss_key) of a pair that never stores (blocked, unstorable)
++	XprMissRefused,        // ... of a relocated key whose store was refused lately
++	XprMissUnseen,         // ... of a key no earlier frame drew (no store yet)
++	XprMissBudget,         // native record store requests past the frame's budget (KYTY_NATIVE_XPR_STORE_BUDGET)
++	ReadbackRegions,       // copy regions of the guest readbacks started (their parts' envelopes merged)
+ 	Count
+ };
+ 
+ inline constexpr const char* Names[Count] = {
+     "window_faults", "window_pages",     "write_faults",     "read_faults",   "reprotects",
+     "reprotect_pages", "unprotects",     "unprotect_pages",  "protect_calls", "protect_calls_render",
+-    "upload_copies", "upload_bytes",     "sync_downloads",   "async_readbacks", "readback_detaches", "readback_evictions", "dispatch_after_dispatch", "dispatch_same_shader", "pm4_suspends", "submission_requeues", "guest_commands", "render_read_faults", "srt_watched_reads", "submission_slices", "buffer_registrations", "bda_rebuilds", "region_syncs", "region_skips", "bda_full_syncs", "bda_range_calls", "bda_ranges", "bda_range_mib", "protect_calls_gfx", "sync_reads_guest", "sync_reads_render", "rb_reject_size", "rb_reject_backing", "rb_reject_image", "rb_reject_capacity", "rb_queue_done", "rb_queue_inflight", "rb_queue_verified", "rb_queue_mismatch", "indirect_tables", "direct_draws", "mesh_draws", "backing_read_bytes", "backing_read_us", "xpr_tries", "xpr_hits", "xpr_miss_key", "xpr_miss_state", "xpr_miss_target", "xpr_miss_validate", "xpr_stores", "vblanks", "async_image_bytes", "backing_lock_waits", "backing_lock_wait_us", "backing_hold_zero_us", "backing_hold_write_us", "backing_hold_map_us", "alias_rebuilds", "alias_rebuild_us", "alias_maps", "unmap_finishes", "unmap_finish_us", "partial_dirty_faults", "partial_uploads", "partial_upload_bytes", "partial_fallbacks", "partial_unmaps", "stale_protect_repairs", "readback_parts", "gpu_range_entries", "texture_unmaps", "texture_unmap_us", "texture_unmap_deletes", "full_uploads", "full_upload_bytes", "async_pipelines", "xpr_store_pending", "dispatch_key_new", "dispatch_key_same", "dispatch_key_changed", "draw_key_new", "draw_key_same", "xpr_direct_tries", "xpr_direct_hits", "xpr_stored", "xpr_refuse_program", "xpr_refuse_reads", "xpr_refuse_bind", "xpr_refuse_draw", "depth_overlaps", "depth_overlap_bytes"};
++    "upload_copies", "upload_bytes",     "sync_downloads",   "async_readbacks", "readback_detaches", "readback_evictions", "dispatch_after_dispatch", "dispatch_same_shader", "pm4_suspends", "submission_requeues", "guest_commands", "render_read_faults", "srt_watched_reads", "submission_slices", "buffer_registrations", "bda_rebuilds", "region_syncs", "region_skips", "bda_full_syncs", "bda_range_calls", "bda_ranges", "bda_range_mib", "protect_calls_gfx", "sync_reads_guest", "sync_reads_render", "rb_reject_size", "rb_reject_backing", "rb_reject_image", "rb_reject_capacity", "rb_queue_done", "rb_queue_inflight", "rb_queue_verified", "rb_queue_mismatch", "indirect_tables", "direct_draws", "mesh_draws", "backing_read_bytes", "backing_read_us", "xpr_tries", "xpr_hits", "xpr_miss_key", "xpr_miss_state", "xpr_miss_target", "xpr_miss_validate", "xpr_stores", "vblanks", "async_image_bytes", "backing_lock_waits", "backing_lock_wait_us", "backing_hold_zero_us", "backing_hold_write_us", "backing_hold_map_us", "alias_rebuilds", "alias_rebuild_us", "alias_maps", "unmap_finishes", "unmap_finish_us", "partial_dirty_faults", "partial_uploads", "partial_upload_bytes", "partial_fallbacks", "partial_unmaps", "stale_protect_repairs", "readback_parts", "gpu_range_entries", "texture_unmaps", "texture_unmap_us", "texture_unmap_deletes", "full_uploads", "full_upload_bytes", "async_pipelines", "xpr_store_pending", "dispatch_key_new", "dispatch_key_same", "dispatch_key_changed", "draw_key_new", "draw_key_same", "xpr_direct_tries", "xpr_direct_hits", "xpr_stored", "xpr_refuse_program", "xpr_refuse_reads", "xpr_refuse_bind", "xpr_refuse_draw", "xpr_relocated", "xpr_relocated_stored", "depth_overlaps", "depth_overlap_bytes", "xpr_miss_blocked", "xpr_miss_refused", "xpr_miss_unseen", "xpr_miss_budget", "readback_regions"};
+ 
+ inline std::atomic<uint64_t> g_values[Count];
+ // The render thread's counts: it is their only writer, so an increment needs no locked
+diff --git a/src/local/native-xpr.inc b/src/local/native-xpr.inc
+index ed26cf8..8f15321 100644
+--- a/src/local/native-xpr.inc
++++ b/src/local/native-xpr.inc
+@@ -48,6 +48,17 @@ extern "C" {
+ // 1: a store whose pipeline variant is not compiled yet hands it to the compile workers and
+ // is skipped; the draw takes the normal path until a later store finds the variant ready.
+ [[gnu::used]] volatile std::atomic<uint32_t> kyty_local_async_xpr_pipelines_mode {0};
++// 1: relocation. Objects whose user data points at a new copy of the same tables every frame (a ring)
++// had keys new every frame, so no record; the pointer words (user data pairs the SRT reads through and
++// uses for nothing else) leave the key, and the record reads the same offsets from the new base.
++[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_native_xpr_relocate_mode {0};
++// N > 0: at most N store requests a frame. Walking brings hundreds of meshes and LODs
++// into view at once; storing them all in one frame (about 16 us each) made it a hitch. The others ask again
++// in later frames (their draws take the normal path until then).
++[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_native_xpr_store_budget {0};
++// N > 2: records stay N frames unused (2 before: a turn of the camera dropped every record behind it, and
++// turning back stored them all again within the store budget, thousands of normal draws a frame for seconds).
++[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_native_xpr_keep_frames {0};
+ }
+ namespace {
+ // word_patch value of a logged word whose change reaches nothing the evaluation produces.
+@@ -62,6 +73,9 @@ constexpr std::array<uint32_t, 8> NativeXprLodStatsMask {0, 0, 0, 0, 0, (0xfffu
+ // SrtReadTrace::Kind descriptor kinds).
+ constexpr uint32_t NativeXprFlatFeed = 0xf;
+ 
++// A gather run or span read at a fixed address (not relative to a relocated root).
++constexpr uint8_t NativeXprNoRoot = 0xff;
++
+ // Longest gather span, in words.
+ constexpr uint32_t NativeXprSpanWords = 256;
+ 
+@@ -128,6 +142,25 @@ uint32_t NativeXprReadGuestWord(uint64_t address) {
+ 		std::memcpy(&value, reinterpret_cast<const void*>(address), sizeof(value));
+ 	return value;
+ }
++
++// The way the SRT evaluation reads a range: spans through the watched-page aware
++// span reader, single words otherwise.
++void NativeXprReadWords(uint64_t address, uint32_t count, uint32_t* out) {
++	for (uint32_t done = 0; done < count;) {
++		const uint32_t chunk = std::min<uint32_t>(count - done, 16);
++		const auto     at    = address + 4ull * done;
++		if (chunk < 2 || !Libs::LibKernel::Memory::TryReadGpuShaderSpan(at, out + done, chunk * 4ull, false))
++			for (uint32_t i = 0; i < chunk; ++i) out[done + i] = NativeXprReadGuestWord(at + 4ull * i);
++		done += chunk;
++	}
++}
++
++// Retrace's lists mostly come out of address-ordered runs already sorted: the check is one pass. Equal
++// elements are identical or merged independently of their order.
++template <typename Range, typename Less = std::less<>>
++void NativeXprSort(Range& range, Less less = {}) {
++	if (!std::ranges::is_sorted(range, less)) std::ranges::sort(range, less);
++}
+ } // namespace
+ 
+ // Draw state, identified by every graphics register except user data: the
+@@ -142,6 +175,7 @@ struct RenderExecutor::NativeXprDrawState {
+ 		uint64_t              metadata = 0; // surface metadata (HTile/DCC) address, 0 none
+ 		uint32_t              slice    = 0;
+ 		uint64_t              serial   = 0; // the image object the attachment views belong to
++		ImageInfo             requested;    // what the registers ask for (TextureCache::IsTargetCurrent)
+ 	};
+ 	RenderState                      rendering;       // reopened: loads
+ 	RenderState                      first_rendering; // as the stored draw began it
+@@ -149,6 +183,8 @@ struct RenderExecutor::NativeXprDrawState {
+ 	LocalDrawRecording::DynamicState dynamic;
+ 	// Metadata epoch under which no target had a pending fast clear.
+ 	mutable uint64_t                 meta_epoch = 0;
++	// Texture cache resolution epoch under which the targets were what a lookup finds (0: not yet).
++	mutable uint64_t                 targets_epoch = 0;
+ };
+ 
+ // One object: its resources under the compiled programs it was translated with.
+@@ -200,6 +236,23 @@ struct RenderExecutor::NativeXprRecord {
+ 		for (const auto& dep: images) image_ids.push_back(dep.id);
+ 	}
+ 	std::vector<uint32_t> key;
++	// Relocation: a stage's user data pair (user, user + 1) the key leaves out (its words low_word and
++	// high_word), whose reads the gather keeps as offsets from `base`, the pointer the record now holds.
++	struct Root {
++		uint8_t stage = 0, user = 0, low_word = 0, high_word = 0;
++		// The pair's shader data words (user data the shader gets), or NativeXprNoRoot.
++		uint8_t low_data = NativeXprNoRoot, high_data = NativeXprNoRoot;
++		// An earlier root this one equals (the stages get the same pointer): reads through either
++		// are one read, so the record holds while they stay equal.
++		uint8_t  same = NativeXprNoRoot;
++		uint64_t base = 0; // 48 bits, dword aligned
++	};
++	std::vector<Root> roots;
++	// Relocation: user data words nothing reads (the key leaves them out; the record copies them).
++	struct Unread {
++		uint8_t stage = 0, user = 0, word = 0;
++	};
++	std::vector<Unread> unread;
+ 	// The first key words again, inline: a lookup compares most keys without
+ 	// the vector's cache miss.
+ 	static constexpr uint32_t KeyHead = 36;
+@@ -287,6 +340,7 @@ struct RenderExecutor::NativeXprRecord {
+ 			uint32_t count   = 0;
+ 			uint32_t first   = 0; // into values (structural) / targets_at (data)
+ 			bool     clean   = false;
++			uint8_t  root    = NativeXprNoRoot; // into roots: the address is an offset from its base
+ 		};
+ 		std::vector<Run>      structural;
+ 		std::vector<uint32_t> values;
+@@ -302,15 +356,25 @@ struct RenderExecutor::NativeXprRecord {
+ 		// (small gaps included). `words` is what the record currently holds for
+ 		// them: a validation handles only the words that differ.
+ 		struct Span {
+-			uint64_t address = 0;
++			uint64_t address = 0; // an offset from the base of `root`, if any
+ 			uint32_t count   = 0;
+ 			uint32_t first   = 0; // into words
++			uint8_t  root    = NativeXprNoRoot;
++			uint8_t  level   = 0; // read after every span of a lower one (pointers it is read through)
+ 		};
+ 		std::vector<Span>     spans;
+ 		std::vector<uint32_t> words;
+ 		std::vector<int32_t>  word_value; // structural value index, or -1
+ 		std::vector<int32_t>  word_data;  // data dword index (targets_at), or -1
+ 		std::vector<uint32_t> value_word; // per non-clean structural value: its index in words
++		// Relocation: pointers read from memory that later spans are read through (a span root past
++		// the record's roots), as the structural values of their halves; per structural value, whether
++		// it is such a half, read for nothing else (a change moves what is read through it).
++		struct Pointer {
++			uint32_t low = 0, high = 0;
++		};
++		std::vector<Pointer> pointers;
++		std::vector<uint8_t> pointer_value;
+ 		// The clean structural words, as page-local spans; per span word its
+ 		// structural value index, or -1 for a gap.
+ 		std::vector<Span>    clean_spans;
+@@ -319,7 +383,48 @@ struct RenderExecutor::NativeXprRecord {
+ };
+ 
+ namespace {
+-// (A template: the record type is private to RenderExecutor.)
++// A root's base: its pointer as the SRT's pointer reads take it (LinearSrtPlan::ReadAddress).
++uint64_t NativeXprBase(uint32_t low, uint32_t high) {
++	return ((uint64_t {high} << 32u) | low) & 0x0000fffffffffffcull;
++}
++
++// Where a gather run or span is now: its address, or its offset from its root's current base (a
++// record root, or a pointer the gather read). (Templates: the record type is private to RenderExecutor.)
++template <typename Record, typename Span>
++uint64_t NativeXprAddress(const Record& record, const Span& span) {
++	if (span.root == NativeXprNoRoot) return span.address;
++	if (span.root < record.roots.size()) return record.roots[span.root].base + span.address;
++	const auto& gather  = record.gather;
++	const auto& pointer = gather.pointers[span.root - record.roots.size()];
++	return NativeXprBase(gather.values[pointer.low], gather.values[pointer.high]) + span.address;
++}
++
++// A program's user data (bit k: user[k]) a record may take from each draw: the pairs (user[k],
++// user[k + 1]) its SRT only reads through, and the words nothing reads (not the SRT, the shader or
++// the draw offsets). Recorded programs make no address loads: the shader gets user data only as
++// shader data, which a relocation updates.
++struct NativeXprUserData {
++	uint32_t pointers = 0, unread = 0;
++};
++NativeXprUserData NativeXprUserDataOf(PipelineCache& pipelines, const ShaderRecompiler::IR::CompiledShaderInfo& program) {
++	const auto use    = pipelines.UserDataUse(program);
++	const auto base   = int64_t {program.user_data_base};
++	uint32_t   offset = 0, shader = 0;
++	for (const auto reg: {int64_t {program.info.vertex_offset_sgpr} - base, int64_t {program.info.instance_offset_sgpr} - base})
++		if (reg >= 0 && reg < 32) offset |= 1u << reg;
++	for (const auto reg: program.bindings.user_data_registers)
++		if (reg >= base && reg - base < 32) shader |= 1u << (reg - base);
++	return {use.pointers & ~offset & ~(offset >> 1), ~(use.read | shader | offset)};
++}
++
++// Where the shader data holds user data `user` of the program, or NativeXprNoRoot.
++uint8_t NativeXprUserDataWord(const ShaderRecompiler::IR::CompiledShaderInfo& program, uint32_t user) {
++	const auto& registers = program.bindings.user_data_registers;
++	const auto  found     = std::ranges::find(registers, program.user_data_base + user);
++	const auto  index     = found - registers.begin();
++	return found == registers.end() || index >= NativeXprNoRoot ? NativeXprNoRoot : static_cast<uint8_t>(index);
++}
++
+ // The lines of the record's fields a use reads (addresses only: no load waits).
+ template <typename Record>
+ void NativeXprPrefetchFields(const Record& record) {
+@@ -373,6 +478,9 @@ void NativeXprPrefetchArrays(const Record& record) {
+ struct RenderExecutor::NativeXprCache {
+ 	vk::Device                                                        device;
+ 	std::unordered_map<uint64_t, std::unique_ptr<NativeXprRecord>>    records;
++	// Past this many records the sweep keeps only recently used ones (NativeXprCollect); at
++	// RecordsHardCap a store drops them all (NativeXprStore).
++	static constexpr size_t RecordsSoftCap = 49152, RecordsHardCap = 65536;
+ 	// Open-addressing index over `records` (linear probing, at most half full):
+ 	// one cache line per lookup instead of bucket, node and owner.
+ 	struct IndexSlot {
+@@ -443,6 +551,16 @@ struct RenderExecutor::NativeXprCache {
+ 		uint64_t           tick = 0;
+ 	};
+ 	std::vector<RetiredSet> retired;
++	// Sets the GPU is done with, by layout, for that layout's next allocation (a driver allocation and
++	// free are a call each); the layout of every set allocated here.
++	struct FreeSet {
++		vk::DescriptorPool pool;
++		vk::DescriptorSet  set;
++	};
++	static constexpr size_t FreeSetsPerLayout = 32, FreeSetsMax = 2048;
++	std::unordered_map<VkDescriptorSetLayout, std::vector<FreeSet>> free_sets;
++	std::unordered_map<VkDescriptorSet, VkDescriptorSetLayout>      set_layouts;
++	size_t                                                          free_count = 0;
+ 	std::vector<vk::DescriptorPool>                                pools;
+ 	std::vector<uint32_t>                                          key;
+ 	// Store request: the reads of the normal draw's SRT evaluation.
+@@ -480,6 +598,11 @@ struct RenderExecutor::NativeXprCache {
+ 		uint64_t stored = 0, wasted = 0;
+ 		bool     blocked = false;
+ 		bool     unstorable = false; // a program writes memory or uses DMA/GDS (NativeXprStore)
++		// Relocation: the key words the pair's records leave out (bit i: word i), known once a store
++		// looked at the pair's programs (NativeXprStore).
++		bool     relocation_known = false;
++		bool     pointers_off     = false; // a record could not be traced through its pointers
++		uint64_t relocate         = 0;
+ 	};
+ 	std::unordered_map<uint64_t, PairStats> pairs;
+ 	// Keys that missed, with the frame of their latest miss. A record pays off only
+@@ -506,6 +629,58 @@ struct RenderExecutor::NativeXprCache {
+ 		*(empty != nullptr ? empty : &seen[hash & mask]) = {hash, frame};
+ 		return false;
+ 	}
++	// Relocation (direct draws, and indirect runs whose whole key missed): the latest try's key before
++	// its pointer words left it, the words it left out, the words that joined the rest (its mesh or the
++	// run's first argument address, which use of them in the frame it was) and its hash (for the store a
++	// miss requests); per program, the user data a record may take from each draw.
++	std::vector<uint32_t> full_key;
++	uint64_t              tried_relocate = 0;
++	std::vector<uint32_t> tried_suffix;
++	uint64_t              tried_hash     = 0;
++	// Keys whose store was refused: the same refusal would come every frame.
++	static constexpr uint64_t RefuseFrames = 64;
++	std::vector<SeenKey>      refused      = std::vector<SeenKey>(4096);
++	[[nodiscard]] bool        Refused(uint64_t hash, uint64_t frame) const {
++		hash            = IndexHash(hash);
++		const auto mask = refused.size() - 1;
++		for (uint64_t i = 0, at = hash & mask; i < 8; ++i, at = (at + 1) & mask)
++			if (refused[at].hash == hash) return refused[at].frame + RefuseFrames > frame;
++		return false;
++	}
++	void Refuse(uint64_t hash, uint64_t frame) {
++		hash            = IndexHash(hash);
++		const auto mask = refused.size() - 1;
++		auto*      slot = &refused[hash & mask];
++		for (uint64_t i = 0, at = hash & mask; i < 8; ++i, at = (at + 1) & mask)
++			if (refused[at].hash == hash || refused[at].hash == 0 || refused[at].frame + RefuseFrames <= frame) {
++				slot = &refused[at];
++				break;
++			}
++		*slot = {hash, frame};
++	}
++	std::unordered_map<const ShaderRecompiler::IR::CompiledShaderInfo*, NativeXprUserData> user_data;
++	// Uses of each relocated key in the frame: the n-th use finds the n-th record (objects that differ
++	// only in their pointers keep their own records).
++	struct Occurrence {
++		uint64_t hash  = 0;
++		uint32_t frame = 0, count = 0;
++	};
++	std::vector<Occurrence> occurrences = std::vector<Occurrence>(8192);
++	uint32_t                NextOccurrence(uint64_t hash, uint64_t frame) {
++		hash            = IndexHash(hash);
++		const auto mask = occurrences.size() - 1;
++		const auto now  = static_cast<uint32_t>(frame);
++		// Entries of earlier frames are free: within a frame none is freed, so a probe run never breaks.
++		for (uint64_t i = 0, at = hash & mask; i < 16; ++i, at = (at + 1) & mask) {
++			auto& entry = occurrences[at];
++			if (entry.hash == 0 || entry.frame != now) {
++				entry = {hash, now, 1};
++				return 0;
++			}
++			if (entry.hash == hash) return entry.count++;
++		}
++		return UINT32_MAX;
++	}
+ 	uint64_t                                swept_frame = UINT64_MAX;
+ 	// Draw-state key of the latest draw (native or normal), for clean draws.
+ 	uint64_t state_key       = 0;
+@@ -515,14 +690,27 @@ struct RenderExecutor::NativeXprCache {
+ 	uint64_t                  last_state_key = 0; // the latest states lookup (entries never move)
+ 	const NativeXprDrawState* last_state     = nullptr;
+ 	uint64_t collected_frame = UINT64_MAX;
++	// Store requests in store_frame (kyty_local_native_xpr_store_budget).
++	uint64_t store_frame    = UINT64_MAX;
++	uint32_t store_requests = 0;
++	size_t   reported_records = 0;
+ 	~NativeXprCache() {
+ 		for (auto pool: pools) device.destroyDescriptorPool(pool);
+ 	}
+ };
+ 
+ namespace {
++// The shader addresses and the user-data counts. The same programs come with different numbers of user data
++// words (1-1: a pair's draws with 0 or 2 PS words), which moves the words in the key: relocation learns which
++// are pointers per layout (learned from the 0-word draws, the others' per-frame PS pointer stayed in their keys).
+ uint64_t NativeXprPairKey(const std::vector<uint32_t>& key) {
+-	return key.size() < 4 ? 0 : XXH3_64bits(key.data(), 4 * sizeof(uint32_t));
++	if (key.size() < 4) return 0;
++	std::array<uint32_t, 7> layout {key[0], key[1], key[2], key[3], 0, 0, 0};
++	for (size_t i = 0, at = 4; i < 3 && at < key.size(); ++i) {
++		layout[4 + i] = key[at];
++		at += 1 + key[at];
++	}
++	return XXH3_64bits(layout.data(), sizeof(layout));
+ }
+ } // namespace
+ 
+@@ -597,6 +785,14 @@ vk::DescriptorSet RenderExecutor::NativeXprAllocateSet(vk::DescriptorSetLayout l
+                                                        vk::DescriptorPool& pool_out) {
+ 	auto&      cache  = NativeXprState();
+ 	const auto device = cache.device;
++	if (const auto found = cache.free_sets.find(static_cast<VkDescriptorSetLayout>(layout));
++	    found != cache.free_sets.end() && !found->second.empty()) {
++		const auto item = found->second.back();
++		found->second.pop_back();
++		--cache.free_count;
++		pool_out = item.pool;
++		return item.set;
++	}
+ 	vk::DescriptorSetAllocateInfo allocate {};
+ 	allocate.descriptorSetCount = 1;
+ 	allocate.pSetLayouts        = &layout;
+@@ -607,6 +803,7 @@ vk::DescriptorSet RenderExecutor::NativeXprAllocateSet(vk::DescriptorSetLayout l
+ 		allocate.descriptorPool = pool;
+ 		if (device.allocateDescriptorSets(&allocate, &set) == vk::Result::eSuccess) {
+ 			pool_out = pool;
++			cache.set_layouts[static_cast<VkDescriptorSet>(set)] = static_cast<VkDescriptorSetLayout>(layout);
+ 			return set;
+ 		}
+ 	}
+@@ -629,6 +826,7 @@ vk::DescriptorSet RenderExecutor::NativeXprAllocateSet(vk::DescriptorSetLayout l
+ 	allocate.descriptorPool = pool;
+ 	EXIT_IF(device.allocateDescriptorSets(&allocate, &set) != vk::Result::eSuccess);
+ 	pool_out = pool;
++	cache.set_layouts[static_cast<VkDescriptorSet>(set)] = static_cast<VkDescriptorSetLayout>(layout);
+ 	return set;
+ }
+ 
+@@ -655,20 +853,28 @@ void RenderExecutor::NativeXprRetire(std::unique_ptr<NativeXprRecord> record, bo
+ 	cache.stale[hash] = std::move(record);
+ }
+ 
+-// Once per frame: free the retired sets the GPU is done with, one call per pool
+-// (each call drains the recording queue).
++// Once per frame: the retired sets the GPU is done with are kept for reuse or freed, one call per
++// pool.
+ void RenderExecutor::NativeXprCollect() {
+ 	if (!m_native_xpr) return;
+ 	auto&      cache = *m_native_xpr;
+ 	const auto frame = m_context.FrameNumber();
+ 	if (frame - cache.swept_frame >= 8) {
+-		// Every eighth frame, records no draw used for two frames leave (their
++		// Every eighth frame, records no draw used for `keep` frames leave (their
+ 		// objects are gone or their keys changed); a pair whose records keep
+-		// leaving unused stops storing.
++		// leaving unused stops storing. Past the soft cap only the last two frames' stay
++		// (at the hard cap NativeXprStore drops them all).
+ 		cache.swept_frame = frame;
++		const uint64_t keep = cache.records.size() > NativeXprCache::RecordsSoftCap
++		                          ? 2
++		                          : std::max(2u, kyty_local_native_xpr_keep_frames.load(std::memory_order_relaxed));
++		if (SlowLog::HitchThreshold() > 0.0 && cache.records.size() / 4096 != cache.reported_records / 4096) {
++			std::printf("[tsc %llu] XPR records %zu\n", static_cast<unsigned long long>(__rdtsc()), cache.records.size());
++			cache.reported_records = cache.records.size();
++		}
+ 		for (auto it = cache.records.begin(); it != cache.records.end();) {
+ 			auto& record = *it->second;
+-			if (record.used_frame + 2 >= frame) {
++			if (record.used_frame + keep >= frame) {
+ 				++it;
+ 				continue;
+ 			}
+@@ -687,6 +893,16 @@ void RenderExecutor::NativeXprCollect() {
+ 	std::vector<NativeXprCache::RetiredSet> done;
+ 	std::erase_if(cache.retired, [&](const NativeXprCache::RetiredSet& item) {
+ 		if (!scheduler.IsFree(item.tick)) return false;
++		const auto layout = cache.set_layouts.find(static_cast<VkDescriptorSet>(item.set));
++		if (layout != cache.set_layouts.end() && cache.free_count < NativeXprCache::FreeSetsMax) {
++			auto& sets = cache.free_sets[layout->second];
++			if (sets.size() < NativeXprCache::FreeSetsPerLayout) {
++				sets.push_back({item.pool, item.set});
++				++cache.free_count;
++				return true;
++			}
++		}
++		if (layout != cache.set_layouts.end()) cache.set_layouts.erase(layout);
+ 		done.push_back(item);
+ 		return true;
+ 	});
+@@ -1308,6 +1524,66 @@ void RenderExecutor::NativeXprStore(CommandBuffer& buffer, const DrawRenderState
+ 	auto       record    = std::make_unique<NativeXprRecord>();
+ 	const auto state_key = NativeXprStateKey(buffer);
+ 	auto&      pipelines = m_context.GetPipelineCache();
++	NativeXprKey(buffer, record->key);
++	auto& pair_stats = cache.pairs[NativeXprPairKey(record->key)];
++	// A refused key is not requested again for a while (NativeXprCache::Refused).
++	const auto refuse = [&] { cache.Refuse(cache.tried_hash, m_context.FrameNumber()); };
++	// Relocation (NativeXprTry): the key words of user data pairs the SRTs only read through
++	// (pointers to a new copy of the same tables every frame) and of user data nothing reads leave
++	// the key; the gather reads through the pointers. The VS's user data are the GS SGPRs (NGG ones
++	// from s8); the vertex tables a static vertex input reads (ShaderGetStaticInputInfoVS) stay.
++	std::vector<NativeXprRecord::Root>   roots;
++	std::vector<NativeXprRecord::Unread> unread;
++	if (kyty_local_native_xpr_relocate_mode.load(std::memory_order_relaxed) != 0) {
++		const auto&    key   = record->key;
++		const uint32_t hs    = key[4], gs = key[5 + hs], ps = key[6 + hs + gs];
++		const uint32_t shift = (buffer.GetRegisters().GetShaderStages() & 0x20u) != 0 ? 8 : 0;
++		uint64_t       words = 0;
++		for (uint32_t st = 0; st < stages.size(); ++st) {
++			const auto* program   = stages[st]->runtime->program;
++			auto [use, unknown]   = cache.user_data.try_emplace(program);
++			if (unknown) use->second = NativeXprUserDataOf(pipelines, *program);
++			uint32_t fetch = 0;
++			if (st == 0 && state.vs_input_info.fetch_embedded)
++				for (const auto reg: {state.vs_input_info.fetch_attrib_reg, state.vs_input_info.fetch_buffer_reg})
++					if (reg >= 0 && reg + shift < 31) fetch |= 3u << (reg + shift);
++			// The key word of the stage's user data k, or -1.
++			const auto word_of = [&](uint32_t k) {
++				const auto j    = st == 0 ? int64_t {k} - shift : int64_t {k};
++				const auto word = (st == 0 ? 6 + hs : 7 + hs + gs) + j;
++				return j < 0 || j >= (st == 0 ? gs : ps) || word >= 64 ? int64_t {-1} : word;
++			};
++			for (auto pairs = pair_stats.pointers_off ? 0u : use->second.pointers & ~fetch & ~(fetch >> 1); pairs != 0;
++			     pairs &= pairs - 1) {
++				const auto k = static_cast<uint32_t>(std::countr_zero(pairs));
++				const auto w = word_of(k);
++				if (w < 0 || word_of(k + 1) < 0) continue;
++				words |= 3ull << w;
++				roots.push_back({static_cast<uint8_t>(st), static_cast<uint8_t>(k), static_cast<uint8_t>(w),
++				                 static_cast<uint8_t>(w + 1), NativeXprUserDataWord(*program, k),
++				                 NativeXprUserDataWord(*program, k + 1)});
++			}
++			for (auto bits = use->second.unread & ~fetch; bits != 0; bits &= bits - 1) {
++				const auto k = static_cast<uint32_t>(std::countr_zero(bits));
++				const auto w = word_of(k);
++				if (w < 0) continue;
++				words |= 1ull << w;
++				unread.push_back({static_cast<uint8_t>(st), static_cast<uint8_t>(k), static_cast<uint8_t>(w)});
++			}
++		}
++		if (!pair_stats.relocation_known) {
++			pair_stats.relocation_known = true;
++			pair_stats.relocate         = words;
++		}
++		// A relocated record comes from a try under the same words (its use in the frame); other tries
++		// (indirect runs, a pair's first) store whole keys.
++		if (cache.tried_relocate == 0) {
++			roots.clear();
++			unread.clear();
++		} else if (words != cache.tried_relocate) {
++			return refuse();
++		}
++	}
+ 	const auto colors    = std::span {state.color_info, state.color_count};
+ 	const auto* pixel    = state.ps_active ? &state.ps_input_info : nullptr;
+ 	auto* const variant  = kyty_local_async_xpr_pipelines_mode.load(std::memory_order_relaxed) != 0
+@@ -1332,17 +1608,24 @@ void RenderExecutor::NativeXprStore(CommandBuffer& buffer, const DrawRenderState
+ 	if (runtime) {
+ 		uint64_t total_words = 0;
+ 		for (const auto& [address, size]: cache.reads) {
+-			if (address % 4 != 0 || size % 4 != 0 || size == 0 || size > 4096)
++			// (Reads of the null page are zeros the record could not read again.)
++			if (address % 4 != 0 || size % 4 != 0 || size == 0 || size > 4096 || address < 0x10000) {
++				refuse();
+ 				return LiveCounters::Add(LiveCounters::XprRefuseReads);
++			}
+ 			total_words += size / 4;
+ 		}
+-		if (total_words > 2048) return LiveCounters::Add(LiveCounters::XprRefuseReads);
++		if (total_words > 2048) {
++			refuse();
++			return LiveCounters::Add(LiveCounters::XprRefuseReads);
++		}
+ 		record->reads.reserve(cache.reads.size());
+ 		record->words.reserve(total_words);
+ 		for (const auto& [address, size]: cache.reads) {
+-			record->reads.emplace_back(address, static_cast<uint32_t>(size / 4));
+-			for (uint64_t offset = 0; offset < size; offset += 4)
+-				record->words.push_back(NativeXprReadGuestWord(address + offset));
++			const auto count = static_cast<uint32_t>(size / 4);
++			record->reads.emplace_back(address, count);
++			record->words.resize(record->words.size() + count);
++			NativeXprReadWords(address, count, record->words.data() + record->words.size() - count);
+ 		}
+ 		// What RefreshShaders evaluated each stage's SRT with.
+ 		const auto& sh  = buffer.GetShaders();
+@@ -1363,9 +1646,44 @@ void RenderExecutor::NativeXprStore(CommandBuffer& buffer, const DrawRenderState
+ 			record->stages[1].shader_base = pixel_params.Base();
+ 		}
+ 	}
+-	if (NativeXprBindResources(*record, stages, pipeline.descriptor_set_layout, runtime) != nullptr)
++	if (NativeXprBindResources(*record, stages, pipeline.descriptor_set_layout, runtime) != nullptr) {
++		refuse();
+ 		return LiveCounters::Add(LiveCounters::XprRefuseBind);
++	}
++	// The roots' pointers: the user data the SRTs were evaluated with, as the key and the shader data
++	// hold them.
++	for (auto& root: roots) {
++		const auto& stage = record->stages[root.stage];
++		const auto& user  = stage.user_data;
++		const auto  held  = [&](uint8_t data, uint32_t value) {
++			return data == NativeXprNoRoot || (data < stage.shader_data.size() && stage.shader_data[data] == value);
++		};
++		if (!runtime || root.user + 1u >= user.size() || user != stage.snapshot.user_data ||
++		    user[root.user] != record->key[root.low_word] || user[root.user + 1] != record->key[root.high_word] ||
++		    !held(root.low_data, user[root.user]) || !held(root.high_data, user[root.user + 1]))
++			return refuse();
++		root.base = NativeXprBase(user[root.user], user[root.user + 1]);
++		for (size_t r = 0; r < static_cast<size_t>(&root - roots.data()) && root.same == NativeXprNoRoot; ++r)
++			if (roots[r].same == NativeXprNoRoot && record->key[roots[r].low_word] == record->key[root.low_word] &&
++			    record->key[roots[r].high_word] == record->key[root.high_word])
++				root.same = static_cast<uint8_t>(r);
++	}
++	// Unread words past the stage's user data reach no part of the draw.
++	for (const auto& word: unread) {
++		const auto& stage = record->stages[word.stage];
++		if (!runtime || stage.user_data != stage.snapshot.user_data ||
++		    (word.user < stage.user_data.size() && stage.user_data[word.user] != record->key[word.word]))
++			return refuse();
++	}
++	record->roots  = std::move(roots);
++	record->unread = std::move(unread);
+ 	if (runtime) NativeXprRetrace(*record);
++	if (!record->roots.empty() && !record->gather.traced) {
++		// Without the reads through them the pointers stay in the pair's keys.
++		pair_stats.pointers_off = true;
++		for (const auto& root: record->roots) pair_stats.relocate &= ~(3ull << root.low_word);
++		return refuse();
++	}
+ 
+ 	// Render targets as this draw left them; a reopened rendering loads.
+ 	NativeXprDrawState draw_state;
+@@ -1386,7 +1704,7 @@ void RenderExecutor::NativeXprStore(CommandBuffer& buffer, const DrawRenderState
+ 		                              rendering.color_attachments[i].image_layout,
+ 		                              image.binding.attachment_access,
+ 		                              {view.base_level, view.level_count, view.base_layer, view.layer_count},
+-		                              metadata_of(desc), view.base_layer, image.serial});
++		                              metadata_of(desc), view.base_layer, image.serial, desc.info});
+ 	}
+ 	if (state.depth_info.image_id) {
+ 		const auto& desc  = state.depth_info.desc;
+@@ -1396,7 +1714,7 @@ void RenderExecutor::NativeXprStore(CommandBuffer& buffer, const DrawRenderState
+ 		                              rendering.depth_stencil_attachment.image_layout,
+ 		                              image.binding.attachment_access,
+ 		                              {view.base_level, view.level_count, view.base_layer, view.layer_count},
+-		                              metadata_of(desc), view.base_layer, image.serial});
++		                              metadata_of(desc), view.base_layer, image.serial, desc.info});
+ 	}
+ 	draw_state.meta_epoch = 0;
+ 	draw_state.dynamic = LocalDrawRecording::Capture(
+@@ -1412,11 +1730,16 @@ void RenderExecutor::NativeXprStore(CommandBuffer& buffer, const DrawRenderState
+ 	*slot = std::move(draw_state);
+ 	if (cache.emit.state == slot.get()) cache.emit.state = nullptr;
+ 
+-	NativeXprKey(buffer, record->key);
++	// A relocated key: without the roots' and the unread words, with the words the try added (NativeXprTry).
++	if (!record->roots.empty() || !record->unread.empty()) {
++		for (const auto& root: record->roots) record->key[root.low_word] = record->key[root.high_word] = 0;
++		for (const auto& word: record->unread) record->key[word.word] = 0;
++		record->key.insert(record->key.end(), cache.tried_suffix.begin(), cache.tried_suffix.end());
++		LiveCounters::Add(LiveCounters::XprRelocatedStored);
++	}
+ 	record->HoldKey();
+ 	const auto hash    = XXH3_64bits(record->key.data(), record->key.size() * sizeof(uint32_t));
+ 	record->used_frame = m_context.FrameNumber();
+-	auto& pair_stats   = cache.pairs[NativeXprPairKey(record->key)];
+ 	++pair_stats.stored;
+ 	if (auto old = cache.records.find(hash); old != cache.records.end()) {
+ 		// Pipelines depend on the programs and the draw state only; direct-draw offsets also on
+@@ -1454,7 +1777,7 @@ void RenderExecutor::NativeXprStore(CommandBuffer& buffer, const DrawRenderState
+ 		if (record->word_patch.size() != record->words.size())
+ 			record->word_patch.assign(record->words.size(), -1);
+ 	}
+-	if (cache.records.size() >= 65536) {
++	if (cache.records.size() >= NativeXprCache::RecordsHardCap) {
+ 		for (auto& [key, value]: cache.records) NativeXprRetire(std::move(value), false);
+ 		cache.records.clear();
+ 		cache.index.assign(8192, {});
+@@ -1465,18 +1788,6 @@ void RenderExecutor::NativeXprStore(CommandBuffer& buffer, const DrawRenderState
+ 	LiveCounters::Add(LiveCounters::XprStored);
+ }
+ 
+-// The way the SRT evaluation reads a range: spans through the watched-page aware
+-// span reader, single words otherwise.
+-void NativeXprReadWords(uint64_t address, uint32_t count, uint32_t* out) {
+-	for (uint32_t done = 0; done < count;) {
+-		const uint32_t chunk = std::min<uint32_t>(count - done, 16);
+-		const auto     at    = address + 4ull * done;
+-		if (chunk < 2 || !Libs::LibKernel::Memory::TryReadGpuShaderSpan(at, out + done, chunk * 4ull, false))
+-			for (uint32_t i = 0; i < chunk; ++i) out[done + i] = NativeXprReadGuestWord(at + 4ull * i);
+-		done += chunk;
+-	}
+-}
+-
+ // Clean (specialization) reads go through the clean backing only; false when
+ // the bytes are GPU-owned and a fresh evaluation would fail too.
+ bool NativeXprReadClean(uint64_t address, uint32_t count, uint32_t* out) {
+@@ -1497,35 +1808,71 @@ void RenderExecutor::NativeXprRetrace(NativeXprRecord& record) {
+ 	auto& gather  = record.gather;
+ 	gather.traced = false;
+ 	if (record.stages[0].shader_base == 0) return;
++	// `root`: the record root the address is relative to (relocation), or NativeXprNoRoot.
+ 	struct StructuralRead {
+ 		uint64_t address;
+ 		uint32_t value;
+ 		uint8_t  use;
++		uint8_t  root;
+ 		bool     operator<(const StructuralRead& other) const { return address < other.address; }
+ 	};
++	struct DataRead {
++		uint64_t address;
++		uint32_t target; // stage << 24 | flat
++		uint8_t  root;
++		bool     operator<(const DataRead& other) const {
++			return address != other.address ? address < other.address : target < other.target;
++		}
++	};
+ 	// Spans over the non-clean structural words and the data words.
+ 	struct Word {
+ 		uint64_t address;
+ 		int32_t  value;
+ 		int32_t  data;
++		uint8_t  root;
++		uint8_t  level;
+ 	};
++	// Relocated records: a pointer read from memory (its halves' addresses and the roots they are read
++	// through), whether what is read through it moves with it, and its root and level as a span root.
++	struct Pointer {
++		uint64_t low, high;
++		uint8_t  low_root, high_root;
++		bool     usable = true;
++		uint8_t  root = NativeXprNoRoot, level = 0;
++	};
++	using Trace = ShaderRecompiler::IR::SrtReadTrace;
+ 	// Scratch kept across calls (a retrace per stored record: tens to hundreds a frame
+ 	// while walking, each with some twenty temporary vectors otherwise).
+ 	thread_local struct {
+ 		std::vector<StructuralRead>                structural, clean, unique;
+-		std::vector<std::pair<uint64_t, uint32_t>> feeds, data, index_of;
++		std::vector<std::pair<uint64_t, uint32_t>> feeds, index_of;
++		std::vector<DataRead>                      data;
++		std::vector<std::pair<uint64_t, uint8_t>>  roots;
+ 		std::vector<uint32_t>                      feed_value, cursor;
+ 		std::vector<Word>                          words;
+-		ShaderRecompiler::IR::SrtReadTrace         trace;
++		std::vector<Pointer>                       pointers;
++		std::vector<uint8_t>                       read_root, levels;
++		Trace                                      trace;
+ 	} scratch;
+ 	auto& structural = scratch.structural;
+ 	auto& clean      = scratch.clean;
+ 	auto& feeds      = scratch.feeds; // (address, packed feed)
+-	auto& data       = scratch.data;  // (address, stage << 24 | flat)
++	auto& data       = scratch.data;
++	auto& pointers   = scratch.pointers;
+ 	structural.clear();
+ 	clean.clear();
+ 	feeds.clear();
+ 	data.clear();
++	pointers.clear();
++	const auto user_roots = static_cast<uint8_t>(record.roots.size());
++	// The record root of stage `st`'s reads through user data pair `user`.
++	const auto root_of = [&](uint32_t st, uint8_t user) {
++		for (size_t r = 0; user != Trace::NoRoot && r < record.roots.size(); ++r) {
++			const auto& root = record.roots[r];
++			if (root.stage == st && root.user == user) return root.same != NativeXprNoRoot ? root.same : static_cast<uint8_t>(r);
++		}
++		return NativeXprNoRoot;
++	};
+ 	auto& pipelines   = m_context.GetPipelineCache();
+ 	auto& untraceable = m_native_xpr->untraceable;
+ 	for (uint32_t st = 0; st < record.stage_count; ++st)
+@@ -1537,12 +1884,32 @@ void RenderExecutor::NativeXprRetrace(NativeXprRecord& record) {
+ 			untraceable.insert(stage.program);
+ 			return;
+ 		}
+-		if (trace.flat_words != stage.flattened.size()) {
++		if (trace.flat_words != stage.flattened.size() || (trace.unrooted && !record.roots.empty())) {
+ 			return;
+ 		}
+-		for (const auto& [flat, address]: trace.data) data.emplace_back(address, st << 24u | flat);
+-		for (const auto& read: trace.structural)
+-			(read.clean ? clean : structural).push_back({read.address, read.value, read.use});
++		// A read's root: a user data pair's, or (relocated records) the pointer two earlier reads make.
++		auto&      read_root = scratch.read_root;
++		const auto base_of   = [&](const Trace::Base& base) {
++			if (base.root != Trace::NoRoot) return root_of(st, base.root);
++			if (base.low == Trace::NoBase || user_roots == 0) return NativeXprNoRoot;
++			const auto& low  = trace.structural[base.low];
++			const auto& high = trace.structural[base.high];
++			if (low.clean || high.clean) return NativeXprNoRoot;
++			for (size_t p = 0; p < pointers.size(); ++p)
++				if (pointers[p].low == low.address && pointers[p].high == high.address)
++					return static_cast<uint8_t>(user_roots + p);
++			if (user_roots + pointers.size() >= NativeXprNoRoot) return NativeXprNoRoot;
++			pointers.push_back({low.address, high.address, read_root[base.low], read_root[base.high]});
++			return static_cast<uint8_t>(user_roots + pointers.size() - 1);
++		};
++		read_root.assign(trace.structural.size(), NativeXprNoRoot);
++		for (size_t i = 0; i < trace.structural.size(); ++i) read_root[i] = base_of(trace.structural[i].base);
++		for (size_t i = 0; i < trace.data.size(); ++i)
++			data.push_back({trace.data[i].second, st << 24u | trace.data[i].first, base_of(trace.data_bases[i])});
++		for (size_t i = 0; i < trace.structural.size(); ++i) {
++			const auto& read = trace.structural[i];
++			(read.clean ? clean : structural).push_back({read.address, read.value, read.use, read_root[i]});
++		}
+ 		for (const auto& feed: trace.feeds) {
+ 			if (feed.index >= 0x10000 || feed.dword >= 8) continue;
+ 			feeds.emplace_back(trace.structural[feed.read].address,
+@@ -1554,8 +1921,55 @@ void RenderExecutor::NativeXprRetrace(NativeXprRecord& record) {
+ 			feeds.emplace_back(trace.structural[read].address, st << 28u | NativeXprFlatFeed << 24u | flat);
+ 		}
+ 	}
++	// A pointer moves what is read through it when its halves are read for nothing else (no other
++	// address, descriptor or predicate use, no clean read; flattened copies follow); else those reads
++	// stay at their addresses, and a change of the pointer evaluates again.
++	auto& levels = scratch.levels;
++	levels.clear();
++	if (!pointers.empty()) {
++		for (auto& pointer: pointers) {
++			const auto half = [&](uint64_t address) { return address == pointer.low || address == pointer.high; };
++			for (const auto& read: structural)
++				if (half(read.address) && read.use != Trace::Pointer) pointer.usable = false;
++			for (const auto& read: clean)
++				if (half(read.address)) pointer.usable = false;
++			for (const auto& [address, packed]: feeds)
++				if (half(address) && ((packed >> 24u) & 0xfu) != NativeXprFlatFeed) pointer.usable = false;
++		}
++		// The levels (a pointer's halves are read at a lower one) and roots of the usable ones.
++		uint8_t    next     = user_roots;
++		const auto level_of = [&](uint8_t root) {
++			return root != NativeXprNoRoot && root >= user_roots && pointers[root - user_roots].usable
++			           ? pointers[root - user_roots].level
++			           : uint8_t {0};
++		};
++		for (auto& pointer: pointers) {
++			pointer.level = static_cast<uint8_t>(1 + std::max(level_of(pointer.low_root), level_of(pointer.high_root)));
++			if (!pointer.usable) continue;
++			pointer.root = next++;
++			levels.push_back(pointer.level);
++		}
++		const auto remap = [&](uint8_t& root) {
++			if (root != NativeXprNoRoot && root >= user_roots) root = pointers[root - user_roots].root;
++		};
++		for (auto* reads: {&structural, &clean})
++			for (auto& read: *reads) remap(read.root);
++		for (auto& read: data) remap(read.root);
++	}
++	// A word read both at a fixed address and through a root (or through two roots) would part on
++	// relocation: such a record is not traced.
++	if (!record.roots.empty()) {
++		auto& roots = scratch.roots;
++		roots.clear();
++		for (const auto* reads: {&structural, &clean})
++			for (const auto& read: *reads) roots.emplace_back(read.address, read.root);
++		for (const auto& read: data) roots.emplace_back(read.address, read.root);
++		NativeXprSort(roots);
++		for (size_t i = 1; i < roots.size(); ++i)
++			if (roots[i].first == roots[i - 1].first && roots[i].second != roots[i - 1].second) return;
++	}
+ 	const auto runs_of = [&](std::vector<StructuralRead>& reads, bool is_clean) {
+-		std::sort(reads.begin(), reads.end());
++		NativeXprSort(reads);
+ 		// One entry per address, with the union of its uses.
+ 		auto& unique = scratch.unique;
+ 		unique.clear();
+@@ -1565,9 +1979,10 @@ void RenderExecutor::NativeXprRetrace(NativeXprRecord& record) {
+ 		}
+ 		for (const auto& read: unique) {
+ 			if (gather.structural.empty() || gather.structural.back().clean != is_clean ||
+-			    gather.structural.back().count >= 16 ||
++			    gather.structural.back().root != read.root || gather.structural.back().count >= 16 ||
+ 			    gather.structural.back().address + 4ull * gather.structural.back().count != read.address)
+-				gather.structural.push_back({read.address, 0, static_cast<uint32_t>(gather.values.size()), is_clean});
++				gather.structural.push_back(
++				    {read.address, 0, static_cast<uint32_t>(gather.values.size()), is_clean, read.root});
+ 			++gather.structural.back().count;
+ 			gather.values.push_back(read.value);
+ 			gather.uses.push_back(read.use);
+@@ -1578,24 +1993,35 @@ void RenderExecutor::NativeXprRetrace(NativeXprRecord& record) {
+ 	gather.uses.clear();
+ 	runs_of(structural, false);
+ 	runs_of(clean, true);
++	// Spans read through a pointer come after those its halves are in.
++	const auto level_of = [&](uint8_t root) {
++		return root != NativeXprNoRoot && root >= user_roots ? levels[root - user_roots] : uint8_t {0};
++	};
++	const auto by_level = [](const Word& a, const Word& b) {
++		return std::tie(a.level, a.root, a.address) < std::tie(b.level, b.root, b.address);
++	};
++	auto& words = scratch.words;
++	words.clear();
++	for (const auto& run: gather.structural)
++		if (run.clean)
++			for (uint32_t i = 0; i < run.count; ++i)
++				words.push_back({run.address + 4ull * i, static_cast<int32_t>(run.first + i), -1, run.root, level_of(run.root)});
++	NativeXprSort(words, by_level);
+ 	gather.clean_spans.clear();
+ 	gather.clean_value.clear();
+-	for (const auto& run: gather.structural) {
+-		if (!run.clean) continue;
+-		for (uint32_t i = 0; i < run.count; ++i) {
+-			const auto address = run.address + 4ull * i;
+-			auto*      span    = gather.clean_spans.empty() ? nullptr : &gather.clean_spans.back();
+-			const auto end     = span != nullptr ? span->address + 4ull * span->count : 0;
+-			// The gap words count too: a span never exceeds NativeXprSpanWords (the gather's buffer).
+-			if (span == nullptr || address < end || address - end > 32 || address / 4096 != span->address / 4096 ||
+-			    span->count + (address - end) / 4 + 1 > NativeXprSpanWords) {
+-				gather.clean_spans.push_back({address, 0, static_cast<uint32_t>(gather.clean_value.size())});
+-				span = &gather.clean_spans.back();
+-			}
+-			for (; span->address + 4ull * span->count < address; ++span->count) gather.clean_value.push_back(-1);
+-			gather.clean_value.push_back(static_cast<int32_t>(run.first + i));
+-			++span->count;
+-		}
++	for (const auto& word: words) {
++		auto*      span = gather.clean_spans.empty() ? nullptr : &gather.clean_spans.back();
++		const auto end  = span != nullptr ? span->address + 4ull * span->count : 0;
++		// The gap words count too: a span never exceeds NativeXprSpanWords (the gather's buffer).
++		if (span == nullptr || span->root != word.root || word.address < end || word.address - end > 32 ||
++		    word.address / 4096 != span->address / 4096 || span->count + (word.address - end) / 4 + 1 > NativeXprSpanWords) {
++			gather.clean_spans.push_back(
++			    {word.address, 0, static_cast<uint32_t>(gather.clean_value.size()), word.root, word.level});
++			span = &gather.clean_spans.back();
++		}
++		for (; span->address + 4ull * span->count < word.address; ++span->count) gather.clean_value.push_back(-1);
++		gather.clean_value.push_back(word.value);
++		++span->count;
+ 	}
+ 	// Feeds per structural value (clean values never feed a patch).
+ 	auto& index_of = scratch.index_of; // (address, value index), non-clean runs
+@@ -1603,8 +2029,22 @@ void RenderExecutor::NativeXprRetrace(NativeXprRecord& record) {
+ 	for (const auto& run: gather.structural)
+ 		if (!run.clean)
+ 			for (uint32_t i = 0; i < run.count; ++i) index_of.emplace_back(run.address + 4ull * i, run.first + i);
+-	std::ranges::sort(index_of);
+-	std::ranges::sort(feeds);
++	NativeXprSort(index_of);
++	// The usable pointers' halves as structural values.
++	const auto value_at = [&](uint64_t address) {
++		const auto it = std::ranges::lower_bound(index_of, std::pair {address, 0u});
++		return it != index_of.end() && it->first == address ? it->second : UINT32_MAX;
++	};
++	gather.pointers.clear();
++	gather.pointer_value.assign(gather.values.size(), 0);
++	for (const auto& pointer: pointers) {
++		if (!pointer.usable) continue;
++		const auto low = value_at(pointer.low), high = value_at(pointer.high);
++		if (low == UINT32_MAX || high == UINT32_MAX) return;
++		gather.pointers.push_back({low, high});
++		gather.pointer_value[low] = gather.pointer_value[high] = 1;
++	}
++	NativeXprSort(feeds);
+ 	{
+ 		// Grouped by value in feed order: a count per value, its prefix sums as the
+ 		// starts, then the feeds placed at their value's cursor.
+@@ -1625,31 +2065,30 @@ void RenderExecutor::NativeXprRetrace(NativeXprRecord& record) {
+ 		for (size_t f = 0; f < feeds.size(); ++f)
+ 			if (feed_value[f] != UINT32_MAX) gather.feeds[cursor[feed_value[f]]++] = feeds[f].second;
+ 	}
+-	std::ranges::sort(data);
++	NativeXprSort(data);
+ 	gather.data.clear();
+ 	gather.targets_at.clear();
+ 	gather.targets.clear();
+ 	for (size_t i = 0; i < data.size();) {
+-		const auto address = data[i].first;
+-		if (gather.data.empty() || gather.data.back().count >= 16 ||
++		const auto address = data[i].address;
++		if (gather.data.empty() || gather.data.back().root != data[i].root || gather.data.back().count >= 16 ||
+ 		    gather.data.back().address + 4ull * gather.data.back().count != address)
+-			gather.data.push_back({address, 0, static_cast<uint32_t>(gather.targets_at.size()), false});
++			gather.data.push_back({address, 0, static_cast<uint32_t>(gather.targets_at.size()), false, data[i].root});
+ 		++gather.data.back().count;
+ 		gather.targets_at.push_back(static_cast<uint32_t>(gather.targets.size()));
+-		for (; i < data.size() && data[i].first == address; ++i) gather.targets.push_back(data[i].second);
++		for (; i < data.size() && data[i].address == address; ++i) gather.targets.push_back(data[i].target);
+ 	}
+ 	gather.targets_at.push_back(static_cast<uint32_t>(gather.targets.size()));
+ 
+-	auto& words = scratch.words;
+ 	words.clear();
+ 	for (const auto& run: gather.structural)
+ 		if (!run.clean)
+ 			for (uint32_t i = 0; i < run.count; ++i)
+-				words.push_back({run.address + 4ull * i, static_cast<int32_t>(run.first + i), -1});
++				words.push_back({run.address + 4ull * i, static_cast<int32_t>(run.first + i), -1, run.root, level_of(run.root)});
+ 	for (const auto& run: gather.data)
+ 		for (uint32_t i = 0; i < run.count; ++i)
+-			words.push_back({run.address + 4ull * i, -1, static_cast<int32_t>(run.first + i)});
+-	std::ranges::sort(words, {}, &Word::address);
++			words.push_back({run.address + 4ull * i, -1, static_cast<int32_t>(run.first + i), run.root, level_of(run.root)});
++	NativeXprSort(words, by_level);
+ 	gather.spans.clear();
+ 	gather.words.clear();
+ 	gather.word_value.clear();
+@@ -1658,7 +2097,7 @@ void RenderExecutor::NativeXprRetrace(NativeXprRecord& record) {
+ 	for (const auto& word: words) {
+ 		auto*          span = gather.spans.empty() ? nullptr : &gather.spans.back();
+ 		const uint64_t end  = span != nullptr ? span->address + 4ull * span->count : 0;
+-		if (span != nullptr && word.address < end) {
++		if (span != nullptr && span->root == word.root && word.address < end) {
+ 			// Read both structurally and as data.
+ 			const auto at = span->first + span->count - 1;
+ 			if (word.value >= 0) gather.word_value[at] = word.value;
+@@ -1666,9 +2105,9 @@ void RenderExecutor::NativeXprRetrace(NativeXprRecord& record) {
+ 			continue;
+ 		}
+ 		// The gap words count too: a span never exceeds NativeXprSpanWords (the gather's buffer).
+-		if (span == nullptr || word.address - end > Gap || word.address / Page != span->address / Page ||
+-		    span->count + (word.address - end) / 4 + 1 > NativeXprSpanWords) {
+-			gather.spans.push_back({word.address, 0, static_cast<uint32_t>(gather.words.size())});
++		if (span == nullptr || span->root != word.root || word.address - end > Gap ||
++		    word.address / Page != span->address / Page || span->count + (word.address - end) / 4 + 1 > NativeXprSpanWords) {
++			gather.spans.push_back({word.address, 0, static_cast<uint32_t>(gather.words.size()), word.root, word.level});
+ 			span = &gather.spans.back();
+ 		}
+ 		for (; span->address + 4ull * span->count < word.address; ++span->count) {
+@@ -1714,6 +2153,10 @@ void RenderExecutor::NativeXprRetrace(NativeXprRecord& record) {
+ 			gather.words[w]   = record.stages[target >> 24u].flattened[target & 0xffffffu];
+ 		}
+ 	}
++	// Spans through a root keep their offset from its base (NativeXprAddress).
++	for (auto* spans: {&gather.spans, &gather.clean_spans})
++		for (auto& span: *spans)
++			if (span.root != NativeXprNoRoot) span.address -= NativeXprAddress(record, NativeXprRecord::Gather::Span {0, 0, 0, span.root});
+ 	gather.traced = true;
+ }
+ 
+@@ -1836,55 +2279,81 @@ bool RenderExecutor::NativeXprGather(NativeXprRecord& record) {
+ 	NativeXprReader reader(m_context.GetGpuResources());
+ 	auto& changed = m_native_xpr->changed; // (value index, new value)
+ 	changed.clear();
+-	// Clean structural reads (GPU-written memory, read as the evaluation reads
+-	// it) are never patched.
+-	std::array<uint32_t, NativeXprSpanWords> fresh;
+-	for (const auto& item: gather.clean_spans) {
+-		if (item.count > fresh.size()) return false; // never past the buffer: evaluate again
+-		const auto* values = gather.clean_value.data() + item.first;
+-		// A span that reads clean has clean words; otherwise each word is read
+-		// as the evaluation reads it.
+-		if (Libs::LibKernel::Memory::TryReadGpuCleanBackingToHost(item.address, fresh.data(), 4ull * item.count)) {
+-			for (uint32_t i = 0; i < item.count; ++i)
+-				if (values[i] >= 0 && fresh[i] != gather.values[values[i]]) return false;
+-			continue;
+-		}
+-		for (uint32_t i = 0; i < item.count; ++i) {
+-			if (values[i] < 0) continue;
+-			uint32_t value = 0;
+-			if (!NativeXprReadClean(item.address + 4ull * i, 1, &value) || value != gather.values[values[i]])
+-				return false;
+-		}
+-	}
+ 	// Records are mostly used once per frame: their guest words are cold. Start
+ 	// every line's load before comparing any.
+-	for (const auto& item: gather.spans)
+-		for (uint64_t line = item.address & ~63ull; line < item.address + 4ull * item.count; line += 64)
+-			__builtin_prefetch(reinterpret_cast<const void*>(line));
+ 	for (const auto& item: gather.spans) {
+-		if (item.count > fresh.size()) return false; // never past the buffer: evaluate again
+-		reader.Read(item.address, item.count, fresh.data());
+-		auto* held = gather.words.data() + item.first;
+-		if (std::memcmp(fresh.data(), held, item.count * 4ull) == 0) continue;
+-		for (uint32_t i = 0; i < item.count; ++i) {
+-			const auto value = fresh[i];
+-			if (value == held[i]) continue;
+-			const auto at = item.first + i;
+-			if (const auto d = gather.word_data[at]; d >= 0)
+-				for (auto t = gather.targets_at[d]; t < gather.targets_at[d + 1]; ++t) {
+-					const auto target = gather.targets[t];
+-					record.stages[target >> 24u].flattened[target & 0xffffffu] = value;
++		const auto address = NativeXprAddress(record, item);
++		for (uint64_t line = address & ~63ull; line < address + 4ull * item.count; line += 64)
++			__builtin_prefetch(reinterpret_cast<const void*>(line));
++	}
++	std::array<uint32_t, NativeXprSpanWords> fresh;
++	// A pointer read from memory (a root past the record's) may hold anything: what is read through it
++	// must be mapped.
++	const auto readable = [&](const NativeXprRecord::Gather::Span& item, uint64_t address) {
++		return item.count <= fresh.size() && // never past the buffer: evaluate again
++		       (item.root == NativeXprNoRoot || item.root < record.roots.size() ||
++		        Libs::LibKernel::Memory::IsFullyMapped(address, 4ull * item.count));
++	};
++	// Level by level: the spans read through a pointer after those holding it.
++	size_t next_clean = 0, next = 0;
++	while (next_clean < gather.clean_spans.size() || next < gather.spans.size()) {
++		const auto level = std::min(next_clean < gather.clean_spans.size() ? gather.clean_spans[next_clean].level : 0xff,
++		                            next < gather.spans.size() ? gather.spans[next].level : 0xff);
++		// Clean structural reads (GPU-written memory, read as the evaluation reads
++		// it) are never patched.
++		for (; next_clean < gather.clean_spans.size() && gather.clean_spans[next_clean].level == level; ++next_clean) {
++			const auto& item    = gather.clean_spans[next_clean];
++			const auto* values  = gather.clean_value.data() + item.first;
++			const auto  address = NativeXprAddress(record, item);
++			if (!readable(item, address)) return false;
++			// A span that reads clean has clean words; otherwise each word is read
++			// as the evaluation reads it.
++			if (Libs::LibKernel::Memory::TryReadGpuCleanBackingToHost(address, fresh.data(), 4ull * item.count)) {
++				for (uint32_t i = 0; i < item.count; ++i)
++					if (values[i] >= 0 && fresh[i] != gather.values[values[i]]) return false;
++				continue;
++			}
++			for (uint32_t i = 0; i < item.count; ++i) {
++				if (values[i] < 0) continue;
++				uint32_t value = 0;
++				if (!NativeXprReadClean(address + 4ull * i, 1, &value) || value != gather.values[values[i]]) return false;
++			}
++		}
++		for (; next < gather.spans.size() && gather.spans[next].level == level; ++next) {
++			const auto& item    = gather.spans[next];
++			const auto  address = NativeXprAddress(record, item);
++			if (!readable(item, address)) return false;
++			reader.Read(address, item.count, fresh.data());
++			auto* held = gather.words.data() + item.first;
++			if (std::memcmp(fresh.data(), held, item.count * 4ull) == 0) continue;
++			for (uint32_t i = 0; i < item.count; ++i) {
++				const auto value = fresh[i];
++				if (value == held[i]) continue;
++				const auto at = item.first + i;
++				if (const auto d = gather.word_data[at]; d >= 0)
++					for (auto t = gather.targets_at[d]; t < gather.targets_at[d + 1]; ++t) {
++						const auto target = gather.targets[t];
++						record.stages[target >> 24u].flattened[target & 0xffffffu] = value;
++					}
++				if (const auto v = gather.word_value[at]; v >= 0) {
++					// A pointer's half: what later spans read through it moves (its feeds are flattened copies).
++					if (gather.pointer_value[v] != 0) {
++						for (auto f = gather.feeds_at[v]; f < gather.feeds_at[v + 1]; ++f)
++							record.stages[gather.feeds[f] >> 28u].flattened[gather.feeds[f] & 0xffffffu] = value;
++						gather.values[v] = held[i] = value;
++						continue;
++					}
++					// Only words that feed nothing but descriptor dwords may be patched;
++					// anything else is evaluated again (which traces again).
++					if ((gather.uses[v] & ~ShaderRecompiler::IR::SrtReadTrace::Descriptor) != 0 ||
++					    gather.feeds_at[v] == gather.feeds_at[v + 1]) {
++						return false;
++					}
++					changed.emplace_back(v, value);
++					continue; // held once the patch is done
+ 				}
+-			if (const auto v = gather.word_value[at]; v >= 0) {
+-				// Only words that feed nothing but descriptor dwords may be patched;
+-				// anything else is evaluated again (which traces again).
+-				if ((gather.uses[v] & ~ShaderRecompiler::IR::SrtReadTrace::Descriptor) != 0 ||
+-				    gather.feeds_at[v] == gather.feeds_at[v + 1])
+-					return false;
+-				changed.emplace_back(v, value);
+-				continue; // held once the patch is done
++				held[i] = value;
+ 			}
+-			held[i] = value;
+ 		}
+ 	}
+ 	if (!changed.empty()) {
+@@ -2020,11 +2489,16 @@ bool RenderExecutor::NativeXprValidate(NativeXprRecord& record, uint64_t frame)
+ 		const auto unmapped = [&](uint64_t address, uint32_t count) {
+ 			return resources.UnmappedSince(record.mapping_epoch, address, 4ull * count);
+ 		};
+-		if (record.gather.traced
+-		        ? std::ranges::any_of(record.gather.spans, [&](const auto& span) { return unmapped(span.address, span.count); })
+-		        : std::ranges::any_of(record.reads, [&](const auto& read) { return unmapped(read.first, read.second); }))
++		if (record.gather.traced ? std::ranges::any_of(record.gather.spans,
++		                                               [&](const auto& span) {
++			                                               return unmapped(NativeXprAddress(record, span), span.count);
++		                                               })
++		                         : std::ranges::any_of(record.reads,
++		                                               [&](const auto& read) { return unmapped(read.first, read.second); }))
+ 			return false;
+ 	}
++	// The read log of a relocated record is at its first pointers.
++	if (!record.roots.empty() && !record.gather.traced) return false;
+ 	if (record.gather.traced) {
+ 		if (!NativeXprGather(record) && (record.gather.broken || !NativeXprReevaluate(record))) {
+ 			return false;
+@@ -2180,11 +2654,22 @@ bool RenderExecutor::NativeXprValidateResources(NativeXprRecord& record, uint64_
+ 	// TouchLiveBuffer also keeps the owners from the garbage collector, as the
+ 	// normal path's per-draw ObtainBuffer would.
+ 	const bool cpu_proven = !mapping_moved && cpu_epoch != 0 && cpu_epoch == record.cpu_epoch;
+-	for (const auto& dep: record.buffers) {
+-		if ((mapping_moved && !range_current(dep)) ||
+-		    !buffers.TouchLiveBuffer(dep.id, dep.handle, dep.address, dep.size)) {
+-			return false;
++	// A buffer or image the record binds is gone or replaced (textures streaming in and out): its slots are
++	// resolved again from the descriptors it holds, as for a descriptor change, instead of dropping the record
++	// (whose draws then took the normal path until a store, within the store budget, made it again).
++	const auto rebind = [&] {
++		std::array<ShaderRecompiler::IR::ResourceSnapshot, 2> snapshots;
++		for (uint32_t st = 0; st < record.stage_count; ++st) {
++			snapshots[st]               = record.stages[st].snapshot;
++			snapshots[st].flattened_srt = record.stages[st].flattened;
+ 		}
++		if (!NativeXprRebind(record, snapshots)) return false;
++		if (record.gather.traced) NativeXprRetrace(record);
++		return true;
++	};
++	for (const auto& dep: record.buffers) {
++		if (mapping_moved && !range_current(dep)) return false;
++		if (!buffers.TouchLiveBuffer(dep.id, dep.handle, dep.address, dep.size)) return rebind();
+ 		if (cpu_proven || !buffers.IsRegionCpuModified(dep.address, dep.size)) continue;
+ 		// The guest rewrote the range: bring the owner up to date as the store
+ 		// did (the normal path would copy the range for its draw instead).
+@@ -2215,13 +2700,21 @@ bool RenderExecutor::NativeXprValidateResources(NativeXprRecord& record, uint64_
+ 	const bool per_image = kyty_local_native_image_proof_mode.load(std::memory_order_relaxed) != 0;
+ 	for (const auto& dep: record.images) {
+ 		auto* image = textures.m_slot_images.try_get(dep.id);
+-		if (image == nullptr || image->serial != dep.serial || image->IsCpuDirty()) return false;
++		if (image == nullptr || image->serial != dep.serial) return rebind();
++		// The guest rewrote it (a texture streaming in): upload it as the normal path's FindTexture does,
++		// instead of dropping the record and storing it again.
++		if (image->IsCpuDirty()) {
++			if (!image->registered || image->depth_id || image->binding.needs_rebind) return false;
++			(void)textures.FindTexture(dep.id, dep.desc);
++			image = textures.m_slot_images.try_get(dep.id);
++			if (image == nullptr || image->serial != dep.serial || image->IsCpuDirty()) return false;
++		}
+ 		if (registrations_moved) {
+ 			if (per_image && image->registered && image->registrations == dep.registration &&
+ 			    !image->depth_id && !image->binding.needs_rebind) {
+ 				image->frame_accessed_last = textures.CurrentFrame();
+ 			} else if (!textures.IsSampledImageCurrent(dep.id, dep.desc)) {
+-				return false;
++				return rebind();
+ 			}
+ 		}
+ 		(void)textures.GetImage(dep.id); // LRU, as FindTexture does
+@@ -2338,6 +2831,12 @@ bool RenderExecutor::NativeXprEmit(CommandBuffer& buffer, NativeXprRecord& recor
+ 	for (const auto& dep: record.images) {
+ 		auto* image = textures.m_slot_images.try_get(dep.id);
+ 		if (image == nullptr) return false;
++		// A DCC image with a fast clear pending: the normal path's FindTexture applies it first.
++		if (dep.desc.info.metadata.kind == ImageMetadataKind::Dcc) {
++			if (image->info.IsVolume()) return false;
++			for (uint32_t layer = dep.range.base_layer; layer < dep.range.base_layer + dep.range.layer_count; ++layer)
++				if (layer >= 32 || textures.IsMetaCleared(dep.desc.info.metadata.range.address, layer)) return false;
++		}
+ 		image->Transit(dep.layout, vk::AccessFlagBits2::eShaderRead, dep.range, vk_buffer);
+ 	}
+ 	scheduler.BeginRendering(keep_clears ? draw_state.first_rendering : draw_state.rendering);
+@@ -2430,6 +2929,23 @@ bool RenderExecutor::NativeXprTry(CommandBuffer& buffer, bool clean, std::span<c
+                                   uint64_t index_base, uint64_t index_bytes, vk::IndexType index_type,
+                                   const NativeXprDirectDraw* direct) {
+ 	auto& cache = NativeXprState();
++	// Store requests within the frame's budget (kyty_local_native_xpr_store_budget); the others ask again
++	// in a later frame.
++	const auto request_store = [&] {
++		if (const auto budget = kyty_local_native_xpr_store_budget.load(std::memory_order_relaxed); budget != 0) {
++			if (cache.store_frame != m_context.FrameNumber()) {
++				cache.store_frame    = m_context.FrameNumber();
++				cache.store_requests = 0;
++			}
++			if (cache.store_requests++ >= budget) {
++				LiveCounters::Add(LiveCounters::XprMissBudget);
++				return;
++			}
++		}
++		m_native_xpr_store = true;
++	};
++	// A changed state leaves no key behind, even when this try stops before computing it.
++	if (!clean) cache.state_key_valid = false;
+ 	if (buffer.IsInvalid() || (direct == nullptr ? commands.empty() : !commands.empty()) || commands.size() > 64 ||
+ 	    index_base == 0 || index_bytes == 0)
+ 		return false;
+@@ -2442,20 +2958,118 @@ bool RenderExecutor::NativeXprTry(CommandBuffer& buffer, bool clean, std::span<c
+ 		cache.state_key_valid = true;
+ 	}
+ 	NativeXprKey(buffer, cache.key);
+-	const auto hash  = XXH3_64bits(cache.key.data(), cache.key.size() * sizeof(uint32_t));
+-	auto* const found = cache.IndexFind(hash);
++	// Relocation: the pair's pointer words leave the key, and which use of the rest in the frame this
++	// is joins it.
++	const bool relocation = kyty_local_native_xpr_relocate_mode.load(std::memory_order_relaxed) != 0;
++	const bool relocating = relocation && direct != nullptr;
++	auto       pair       = relocating ? cache.pairs.find(NativeXprPairKey(cache.key)) : cache.pairs.end();
++	cache.tried_relocate  = 0;
++	const auto relocate   = [&] {
++		cache.full_key = cache.key;
++		for (auto words = pair->second.relocate; words != 0; words &= words - 1) cache.key[std::countr_zero(words)] = 0;
++		cache.tried_relocate = pair->second.relocate;
++		const auto masked    = cache.key.size();
++		// The mesh (the draw's first index) joins the key, so the n-th use counts the uses of one mesh: a
++		// record keeps its object while the frame's other objects of the pair come and go (counting the
++		// pair's uses, a walk re-evaluated most relocated records every frame). A run's object is its first
++		// draw's arguments: their address stays while its tables move every frame (and a run tried again
++		// from a later draw after a miss is another key, so the uses count the same in every frame).
++		const uint64_t object = direct != nullptr ? index_base : commands[0];
++		cache.key.push_back(static_cast<uint32_t>(object));
++		cache.key.push_back(static_cast<uint32_t>(object >> 32u));
++		cache.key.push_back(cache.NextOccurrence(XXH3_64bits(cache.key.data(), cache.key.size() * sizeof(uint32_t)),
++		                                         m_context.FrameNumber()));
++		cache.tried_suffix.assign(cache.key.begin() + static_cast<std::ptrdiff_t>(masked), cache.key.end());
++	};
++	if (pair != cache.pairs.end() && pair->second.relocate != 0) relocate();
++	auto hash  = XXH3_64bits(cache.key.data(), cache.key.size() * sizeof(uint32_t));
++	auto found = cache.IndexFind(hash);
++	// A run whose whole key misses can be an object whose tables move every frame: its relocated key. Runs
++	// whose whole keys come again keep them (relocating those too made every use read through the pointers:
++	// Boletaria 1-1 23.6 -> 32.3 ms a frame).
++	uint64_t whole_hash = 0;
++	if (relocation && direct == nullptr && (found == nullptr || !found->SameKey(cache.key))) {
++		pair = cache.pairs.find(NativeXprPairKey(cache.key));
++		if (pair != cache.pairs.end() && pair->second.relocate != 0 && !pair->second.blocked && !pair->second.unstorable) {
++			whole_hash = hash;
++			relocate();
++			hash  = XXH3_64bits(cache.key.data(), cache.key.size() * sizeof(uint32_t));
++			found = cache.IndexFind(hash);
++		}
++	}
+ 	if (found != nullptr) NativeXprPrefetchFields(*found);
+ 	LiveCounters::Add(direct != nullptr ? LiveCounters::XprDirectTries : LiveCounters::XprTries);
++	// The key a store this try requests is refused under (a found record's too: dropped, it stores again).
++	cache.tried_hash = hash;
+ 	if (found == nullptr || !found->SameKey(cache.key)) {
+ 		LiveCounters::Add(LiveCounters::XprMissKey);
+-		if (const auto pair = cache.pairs.find(NativeXprPairKey(cache.key));
+-		    pair != cache.pairs.end() && (pair->second.blocked || pair->second.unstorable))
++		if (!relocating && whole_hash == 0) pair = cache.pairs.find(NativeXprPairKey(cache.key));
++		if (pair != cache.pairs.end() && (pair->second.blocked || pair->second.unstorable)) {
++			LiveCounters::Add(LiveCounters::XprMissBlocked);
+ 			return false;
+-		if (!cache.SeenAgain(hash, m_context.FrameNumber())) return false;
+-		m_native_xpr_store = true;
++		}
++		// A run's whole key that comes again is stored as it is.
++		if (whole_hash != 0 && !cache.Refused(whole_hash, m_context.FrameNumber()) &&
++		    cache.SeenAgain(whole_hash, m_context.FrameNumber())) {
++			cache.tried_relocate = 0;
++			cache.tried_hash     = whole_hash;
++			request_store();
++			return false;
++		}
++		// The first store of a pair learns its pointer words (a run's too: a run whose tables move every frame
++		// never comes again under its whole key, so only a store learns that it can be relocated).
++		if (relocation && (relocating || whole_hash == 0) && (pair == cache.pairs.end() || !pair->second.relocation_known)) {
++			request_store();
++			return false;
++		}
++		if (cache.Refused(hash, m_context.FrameNumber())) {
++			LiveCounters::Add(LiveCounters::XprMissRefused);
++			return false;
++		}
++		if (!cache.SeenAgain(hash, m_context.FrameNumber())) {
++			LiveCounters::Add(LiveCounters::XprMissUnseen);
++			return false;
++		}
++		request_store();
++		return false;
++	}
++	auto& record = *found;
++	// A record that no longer holds: the normal path draws and stores again.
++	const auto drop = [&] {
++		LiveCounters::Add(LiveCounters::XprMissValidate);
++		cache.IndexErase(hash);
++		const auto owner = cache.records.find(hash);
++		NativeXprRetire(std::move(owner->second), true);
++		cache.records.erase(owner);
++		request_store();
+ 		return false;
++	};
++	// A relocated record reads through this draw's pointers (NativeXprGather) and holds its unread words.
++	if (!record.roots.empty() || !record.unread.empty()) {
++		if (cache.tried_relocate == 0) return false;
++		LiveCounters::Add(LiveCounters::XprRelocated);
++		const auto& key = cache.full_key;
++		for (const auto& word: record.unread) {
++			auto& stage = record.stages[word.stage];
++			if (word.user < stage.user_data.size())
++				stage.user_data[word.user] = stage.snapshot.user_data[word.user] = key[word.word];
++		}
++		for (const auto& root: record.roots)
++			if (root.same != NativeXprNoRoot && (key[root.low_word] != key[record.roots[root.same].low_word] ||
++			                                     key[root.high_word] != key[record.roots[root.same].high_word]))
++				return drop();
++		for (auto& root: record.roots) {
++			const auto low   = cache.full_key[root.low_word];
++			const auto high  = cache.full_key[root.high_word];
++			auto&      stage = record.stages[root.stage];
++			if (stage.user_data[root.user] == low && stage.user_data[root.user + 1] == high) continue;
++			stage.user_data[root.user] = stage.snapshot.user_data[root.user] = low;
++			stage.user_data[root.user + 1] = stage.snapshot.user_data[root.user + 1] = high;
++			if (root.low_data != NativeXprNoRoot) stage.shader_data[root.low_data] = low;
++			if (root.high_data != NativeXprNoRoot) stage.shader_data[root.high_data] = high;
++			root.base = NativeXprBase(low, high);
++		}
+ 	}
+-	auto& record      = *found;
+ 	record.used_frame = m_context.FrameNumber();
+ 	++record.uses;
+ 	if (kyty_local_native_xpr_predict_mode.load(std::memory_order_relaxed) != 0) {
+@@ -2480,7 +3094,7 @@ bool RenderExecutor::NativeXprTry(CommandBuffer& buffer, bool clean, std::span<c
+ 		const auto state_it = cache.states.find(cache.state_key);
+ 		if (state_it == cache.states.end()) {
+ 			LiveCounters::Add(LiveCounters::XprMissState);
+-			m_native_xpr_store = true;
++			request_store();
+ 			return false;
+ 		}
+ 		cache.last_state_key = cache.state_key;
+@@ -2490,7 +3104,7 @@ bool RenderExecutor::NativeXprTry(CommandBuffer& buffer, bool clean, std::span<c
+ 	                                           &std::pair<uint64_t, const PipelineCache::Pipeline*>::first);
+ 	if (pipeline_it == record.pipelines.end()) {
+ 		LiveCounters::Add(LiveCounters::XprMissState);
+-		m_native_xpr_store = true;
++		request_store();
+ 		return false;
+ 	}
+ 	// A direct draw also needs the offsets the normal path resolved under this state.
+@@ -2500,7 +3114,7 @@ bool RenderExecutor::NativeXprTry(CommandBuffer& buffer, bool clean, std::span<c
+ 		    std::ranges::find(record.direct_offsets, cache.state_key, &NativeXprRecord::DirectOffsets::state);
+ 		if (offsets == record.direct_offsets.end()) {
+ 			LiveCounters::Add(LiveCounters::XprMissState);
+-			m_native_xpr_store = true;
++			request_store();
+ 			return false;
+ 		}
+ 		direct_draw = {*direct, offsets->vertex, offsets->instance};
+@@ -2513,10 +3127,24 @@ bool RenderExecutor::NativeXprTry(CommandBuffer& buffer, bool clean, std::span<c
+ 		const auto* image = textures.m_slot_images.try_get(target.id);
+ 		if (image == nullptr || image->serial != target.serial) {
+ 			LiveCounters::Add(LiveCounters::XprMissTarget);
+-			m_native_xpr_store = true;
++			request_store();
+ 			return false;
+ 		}
+ 	}
++	// A newer image with the same backing as a target is what the registers now select.
++	if (draw_state.targets_epoch != textures.ResolutionEpoch()) {
++		uint64_t proven = UINT64_MAX;
++		for (const auto& target: draw_state.targets) {
++			auto epoch = draw_state.targets_epoch;
++			if (!textures.IsTargetCurrent(target.id, target.requested, epoch)) {
++				LiveCounters::Add(LiveCounters::XprMissTarget);
++				request_store();
++				return false;
++			}
++			proven = std::min(proven, epoch);
++		}
++		draw_state.targets_epoch = proven != UINT64_MAX ? proven : textures.ResolutionEpoch();
++	}
+ 	// Records are mostly used once per frame, so their data is cold: load the
+ 	// arrays together instead of missing on each in turn.
+ 	NativeXprPrefetchArrays(record);
+@@ -2530,15 +3158,7 @@ bool RenderExecutor::NativeXprTry(CommandBuffer& buffer, bool clean, std::span<c
+ 	const auto frame = m_context.FrameNumber();
+ 	// Every use reads the SRT words again: the guest may rewrite constants between
+ 	// two draws of one frame (the normal path reads them at each draw).
+-	if (!NativeXprValidate(record, frame)) {
+-		LiveCounters::Add(LiveCounters::XprMissValidate);
+-		cache.IndexErase(hash);
+-		const auto owner = cache.records.find(hash);
+-		NativeXprRetire(std::move(owner->second), true);
+-		cache.records.erase(owner);
+-		m_native_xpr_store = true;
+-		return false;
+-	}
++	if (!NativeXprValidate(record, frame)) return drop();
+ 	if (kyty_local_native_xpr_mode.load(std::memory_order_relaxed) == 2) {
+ 		m_native_xpr_verify = {&record, &draw_state};
+ 		return false;
+diff --git a/src/local/performance-switches.h b/src/local/performance-switches.h
+index bbddd36..811775b 100644
+--- a/src/local/performance-switches.h
++++ b/src/local/performance-switches.h
+@@ -35,6 +35,9 @@ extern volatile std::atomic_uint32_t kyty_local_draw_packets_mode;
+ extern volatile std::atomic_uint32_t kyty_local_native_xpr_predict_mode;
+ extern volatile std::atomic_uint32_t kyty_local_native_image_proof_mode;
+ extern volatile std::atomic_uint32_t kyty_local_async_xpr_pipelines_mode;
++extern volatile std::atomic_uint32_t kyty_local_native_xpr_relocate_mode;
++extern volatile std::atomic_uint32_t kyty_local_native_xpr_store_budget;
++extern volatile std::atomic_uint32_t kyty_local_native_xpr_keep_frames;
+ #endif
+ }
+ 
+@@ -97,6 +100,11 @@ inline void InitializePerformanceSwitches() {
+ 	    Switch {"KYTY_NATIVE_XPR_PREDICT", &kyty_local_native_xpr_predict_mode},
+ 	    Switch {"KYTY_NATIVE_IMAGE_PROOF", &kyty_local_native_image_proof_mode},
+ 	    Switch {"KYTY_ASYNC_XPR_PIPELINES", &kyty_local_async_xpr_pipelines_mode},
++	    Switch {"KYTY_NATIVE_XPR_RELOCATE", &kyty_local_native_xpr_relocate_mode},
++	    // Native XPR store requests per frame (0: no limit).
++	    Switch {"KYTY_NATIVE_XPR_STORE_BUDGET", &kyty_local_native_xpr_store_budget, 0, 65536},
++	    // Frames an unused native XPR record stays (at least 2).
++	    Switch {"KYTY_NATIVE_XPR_KEEP_FRAMES", &kyty_local_native_xpr_keep_frames, 0, 1000000},
+ #endif
+ 	};
+ 	std::string enabled;
+diff --git a/src/local/proven-gpu-worker.h b/src/local/proven-gpu-worker.h
+new file mode 100644
+index 0000000..7bce813
+--- /dev/null
++++ b/src/local/proven-gpu-worker.h
+@@ -0,0 +1,92 @@
++#pragma once
++#if defined(_WIN32) && defined(KYTY_B32_FAST_CPU_SETS)
++#ifndef NOMINMAX
++#define NOMINMAX
++#endif
++#include <windows.h>
++#include <algorithm>
++#include <cstddef>
++#include <cstdlib>
++#include <vector>
++#include "common/logging/log.h"
++#endif
++#if defined(_WIN32) && defined(KYTY_B32_FAST_CPU_SETS)
++static void PreferFastCpuSetsForGpuWorker() {
++	const char* setting = std::getenv("KYTY_B32_FAST_CPU_SETS");
++	if (setting != nullptr && setting[0] == '0' && setting[1] == '\0') {
++		LOGF("Build32 GPU worker CPU sets: disabled by environment\n");
++		return;
++	}
++	// The GPU command worker is on the frame's critical path. Raise only this
++	// thread within the normal process priority class; never use real-time mode.
++	const char* priority_setting = std::getenv("KYTY_B32_GPU_PRIORITY");
++	if (priority_setting != nullptr && priority_setting[0] == '0' &&
++	    priority_setting[1] == '\0') {
++		LOGF("Build32 GPU worker priority: disabled by environment\n");
++	} else {
++		const BOOL applied = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
++		LOGF("Build32 GPU worker priority: requested=highest applied=%u current=%d\n",
++		     static_cast<unsigned>(applied != 0), GetThreadPriority(GetCurrentThread()));
++	}
++	THREAD_POWER_THROTTLING_STATE qos {};
++	qos.Version     = THREAD_POWER_THROTTLING_CURRENT_VERSION;
++	qos.ControlMask = THREAD_POWER_THROTTLING_EXECUTION_SPEED;
++	qos.StateMask   = 0;
++	const BOOL qos_applied = SetThreadInformation(GetCurrentThread(), ThreadPowerThrottling,
++	                                               &qos, sizeof(qos));
++	LOGF("Build32 GPU worker full-speed QoS: applied=%u\n",
++	     static_cast<unsigned>(qos_applied != 0));
++	ULONG bytes = 0;
++	(void)GetSystemCpuSetInformation(nullptr, 0, &bytes, GetCurrentProcess(), 0);
++	if (bytes < sizeof(SYSTEM_CPU_SET_INFORMATION) || bytes > 1024 * 1024) {
++		LOGF("Build32 GPU worker CPU sets: enumeration unavailable\n");
++		return;
++	}
++	std::vector<std::max_align_t> storage(
++	    (bytes + sizeof(std::max_align_t) - 1) / sizeof(std::max_align_t));
++	ULONG returned = 0;
++	if (!GetSystemCpuSetInformation(
++	        reinterpret_cast<PSYSTEM_CPU_SET_INFORMATION>(storage.data()),
++	        static_cast<ULONG>(storage.size() * sizeof(std::max_align_t)), &returned,
++	        GetCurrentProcess(), 0) || returned > storage.size() * sizeof(std::max_align_t)) {
++		LOGF("Build32 GPU worker CPU sets: enumeration failed\n");
++		return;
++	}
++	struct Candidate { ULONG id; BYTE efficiency; bool parked; };
++	std::vector<Candidate> candidates;
++	BYTE slowest = 255, fastest = 0;
++	const auto* data = reinterpret_cast<const unsigned char*>(storage.data());
++	for (size_t offset = 0; offset + sizeof(SYSTEM_CPU_SET_INFORMATION) <= returned;) {
++		const auto* info = reinterpret_cast<const SYSTEM_CPU_SET_INFORMATION*>(data + offset);
++		if (info->Size < sizeof(SYSTEM_CPU_SET_INFORMATION) || info->Size > returned - offset)
++			break;
++		if (info->Type == CpuSetInformation) {
++			const BYTE flags = info->CpuSet.AllFlags;
++			if ((flags & 0x08u) == 0 && ((flags & 0x02u) == 0 || (flags & 0x04u) != 0)) {
++				const auto efficiency = info->CpuSet.EfficiencyClass;
++				candidates.push_back({info->CpuSet.Id, efficiency, (flags & 0x01u) != 0});
++				slowest = std::min(slowest, efficiency);
++				fastest = std::max(fastest, efficiency);
++			}
++		}
++		offset += info->Size;
++	}
++	if (candidates.empty() || fastest == slowest) {
++		LOGF("Build32 GPU worker CPU sets: uniform or unavailable, OS scheduling retained\n");
++		return;
++	}
++	std::vector<ULONG> selected;
++	for (const auto& cpu: candidates) {
++		if (cpu.efficiency == fastest && !cpu.parked) selected.push_back(cpu.id);
++	}
++	if (selected.empty()) {
++		LOGF("Build32 GPU worker CPU sets: fast cores parked, OS scheduling retained\n");
++		return;
++	}
++	const BOOL applied = SetThreadSelectedCpuSets(GetCurrentThread(), selected.data(),
++	                                              static_cast<ULONG>(selected.size()));
++	LOGF("Build32 GPU worker CPU sets: eligible=%zu selected=%zu classes=%u..%u applied=%u\n",
++	     candidates.size(), selected.size(), static_cast<unsigned>(slowest),
++	     static_cast<unsigned>(fastest), static_cast<unsigned>(applied != 0));
++}
++#endif
+diff --git a/tests/ComputeFrontendCacheTests.cpp b/tests/ComputeFrontendCacheTests.cpp
+new file mode 100644
+index 0000000..2190f45
+--- /dev/null
++++ b/tests/ComputeFrontendCacheTests.cpp
+@@ -0,0 +1,50 @@
++#include "graphics/shader/recompiler/frontend/ComputeFrontendCache.h"
++#include <atomic>
++#include <cstdio>
++#include <cstdlib>
++#include <thread>
++
++using namespace Libs::Graphics::ShaderRecompiler;
++namespace Cache = FrontendCache;
++static void Check(bool condition, const char* message) {
++    if (!condition) { std::fprintf(stderr, "%s\n", message); std::abort(); }
++}
++int main() {
++    std::vector<uint32_t> code {1, 2, 3}, equivalent {1, 2, 3}, collision {1, 2, 4};
++    Decoder::Program input;
++    input.instructions.resize(1);
++    input.instructions[0].pc = 12;
++    CFG::Graph graph;
++    graph.entry_block = 17;
++    Cache::RememberComputeFrontend(code, 42, input, graph, true, "fallback");
++    Decoder::Program output;
++    CFG::Graph result;
++    bool fallback = false;
++    std::string reason;
++    Check(Cache::FindCachedComputeFrontend(equivalent, 42, output, result, fallback, reason), "Equivalent source missed the cache");
++    Check(output.code.data() == equivalent.data(), "Cached decode retains the wrong source lifetime");
++    Check(output.instructions[0].pc == 12 && result.entry_block == 17 && fallback && reason == "fallback", "Cached frontend lost its graph or fallback state");
++    Check(!Cache::FindCachedComputeFrontend(collision, 42, output, result, fallback, reason), "Hash collision reused a different shader");
++    Check(!Cache::FindCachedComputeFrontend(code, 43, output, result, fallback, reason), "Different shader identity reused the cache");
++    output.instructions[0].pc = 99;
++    result.entry_block = 99;
++    Check(Cache::FindCachedComputeFrontend(code, 42, output, result, fallback, reason) && output.instructions[0].pc == 12 && result.entry_block == 17, "Mutating a returned graph changed the stored frontend");
++    std::atomic<bool> valid {true};
++    std::vector<std::thread> threads;
++    for (int i = 0; i < 4; ++i) threads.emplace_back([&] {
++        for (int n = 0; n < 100; ++n) {
++            Decoder::Program copy; CFG::Graph cfg; bool dispatch = false; std::string why;
++            if (!Cache::FindCachedComputeFrontend(code, 42, copy, cfg, dispatch, why) || copy.instructions[0].pc != 12) valid.store(false);
++        }
++    });
++    for (auto& thread : threads) thread.join();
++    Check(valid.load(), "Parallel shader warmup reads changed frontend data");
++    for (size_t i = 0; i < Cache::MaxCachedComputeFrontends; ++i) {
++        std::vector<uint32_t> other {static_cast<uint32_t>(i + 100)};
++        Cache::RememberComputeFrontend(other, i + 100, input, graph, false, "");
++    }
++    Check(Cache::g_compute_frontends.size() == Cache::MaxCachedComputeFrontends, "Frontend cache exceeded its entry cap");
++    Check(Cache::g_compute_frontend_bytes <= Cache::MaxCachedComputeFrontendBytes, "Frontend cache exceeded its estimated byte cap");
++    Check(!Cache::FindCachedComputeFrontend(code, 42, output, result, fallback, reason), "Old frontend was not evicted at the cache limit");
++    std::puts("Frontend cache identity, lifetime, graph isolation, concurrency and eviction passed");
++}
+diff --git a/tests/GuestReadbackPackingTests.cpp b/tests/GuestReadbackPackingTests.cpp
+new file mode 100644
+index 0000000..8896afe
+--- /dev/null
++++ b/tests/GuestReadbackPackingTests.cpp
+@@ -0,0 +1,34 @@
++#include "graphics/host_gpu/renderer/cache/GuestReadbackPacking.h"
++#include <cstring>
++#include <iostream>
++#include <stdexcept>
++
++using Libs::Graphics::ReadbackPacking::Packing;
++void Check(bool result) { if (!result) throw std::runtime_error("readback packing regression"); }
++int main() {
++    // Thousands of fragmented dirty ranges: copying gaps must never overwrite guest CPU bytes.
++    Packing p;
++    std::vector<uint8_t> gpu(512 * 1024), guest(gpu.size(), 0xa5), expected = guest;
++    for (size_t i = 0; i < gpu.size(); ++i) gpu[i] = static_cast<uint8_t>(i * 13);
++    for (uint64_t at = 1; at + 3 < gpu.size(); at += 32) {
++        Check(p.Add(at & ~uint64_t{3}, 4, at, at, 3, 1024 * 1024));
++        std::memcpy(expected.data() + at, gpu.data() + at, 3);
++    }
++    Check(p.envelopes.size() == 1 && p.parts.size() > 16000);
++    std::vector<uint8_t> packed(p.size);
++    for (const auto& e : p.envelopes) std::memcpy(packed.data() + e.cursor, gpu.data() + e.source, e.size);
++    for (const auto& part : p.parts) std::memcpy(guest.data() + part.address, packed.data() + part.offset, part.size);
++    Check(guest == expected);
++    Packing distant;
++    Check(distant.Add(0, 4, 1, 100, 2, 256));
++    Check(distant.Add(70000, 4, 70001, 200, 2, 256));
++    Check(distant.envelopes.size() == 2 && distant.parts[1].offset == 65 && distant.size == 128);
++    Packing bound;
++    Check(bound.Add(0, 64, 0, 0, 64, 64));
++    Check(!bound.Add(64, 4, 64, 64, 4, 64) && bound.size == 64 && bound.parts.size() == 1);
++    Check(!bound.Add(UINT64_MAX - 1, 4, UINT64_MAX - 1, 0, 1, UINT64_MAX));
++    Packing unaligned;
++    Check(unaligned.Add(4, 8, 7, 100, 3, 64) && unaligned.parts[0].offset == 3);
++    Check(!unaligned.Add(0, 4, 0, 0, 4, 64));
++    std::cout << "Readback dirty-byte parity, gaps, offsets, capacity and overflow passed\n";
++}
+diff --git a/tests/ShaderRecompilerComputeTests.cpp b/tests/ShaderRecompilerComputeTests.cpp
+index ff08f4d..67ea858 100644
+--- a/tests/ShaderRecompilerComputeTests.cpp
++++ b/tests/ShaderRecompilerComputeTests.cpp
+@@ -31930,6 +31930,15 @@ int main(int argc, char **argv) {
+ 
+   std::setvbuf(stdout, nullptr, _IONBF, 0);
+   EnsureConfigInitialized();
++  if (argc == 2 && std::strcmp(argv[1], "--gpu-math-emission-only") == 0) {
++    for (auto test : {VectorMinMaxF32NanAndSignedZeroEdges(),
++                     VectorSpecialF32FlushesDenormalInputs(),
++                     VectorSinCosMaxFiniteSpecialCases()}) {
++      test.compile_only = true;
++      RunCase(nullptr, test);
++    }
++    return 0;
++  }
+   if (argc == 2 && std::strcmp(argv[1], "--portable-formats-only") == 0) {
+     CheckPortableFormatDecoder(false);
+     return 0;
