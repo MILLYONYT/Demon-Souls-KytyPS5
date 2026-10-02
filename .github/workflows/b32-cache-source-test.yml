@@ -1,16 +1,16 @@
-name: KytyPS5 B123 cache lifetime and shader compiler
+name: KytyPS5 B123 combined renderer performance
 on:
   push:
-    branches: [best123-cache-shader-compiler]
+    branches: [best123-combined-renderer-performance]
     paths:
       - .github/workflows/b32-cache-source-test.yml
-      - patches/b123-cache-and-shader-compiler.patch
+      - patches/b123-combined-renderer-performance.patch
   workflow_dispatch:
 permissions:
   contents: read
 jobs:
   windows-x64:
-    name: Build from frozen B123 with cache lifetime and shader compiler fixes
+    name: Build B123 plus cache/compiler, readback, native draws and GPU optimizations
     runs-on: windows-2022
     steps:
       - uses: actions/checkout@v4
@@ -71,9 +71,9 @@ jobs:
       - name: Apply frozen B123 performance code and reviewed cache/compiler fixes
         shell: pwsh
         run: |
-          git -C source apply --check ../patches/b123-cache-and-shader-compiler.patch
+          git -C source apply --check ../patches/b123-combined-renderer-performance.patch
           if ($LASTEXITCODE) { throw 'Proven FPS ports do not match pinned source' }
-          git -C source apply ../patches/b123-cache-and-shader-compiler.patch
+          git -C source apply ../patches/b123-combined-renderer-performance.patch
           if ($LASTEXITCODE) { throw 'Proven FPS port failed; refusing a partial build' }
       - name: Configure portable optimized build
         shell: cmd
@@ -82,7 +82,7 @@ jobs:
           -DCMAKE_BUILD_TYPE=Release -DKYTY_BUILD_LAUNCHER=OFF
           -DKYTY_MARCH=x86-64-v3 -DKYTY_THIN_LTO=ON
           -DKYTY_BUILD_ORIGIN=Fork -DKYTY_BUILD_REPOSITORY=${{ github.repository }}
-          -DKYTY_RELEASE_TAG=B123-CACHE-SHADER-${{ github.run_number }}
+          -DKYTY_RELEASE_TAG=B123-COMBINED-PERF-${{ github.run_number }}
           "-DCMAKE_CXX_FLAGS=/DWIN32 /D_WINDOWS /W3 /GR /EHsc /DKYTY_B32_FAST_CPU_SETS /DKYTY_B32_QUIET_SHADER_PHASES"
           -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl
       - name: Verify required Windows compiler flags
@@ -95,7 +95,7 @@ jobs:
       - name: Build emulator and shader preparation
         run: cmake --build _Build/windows --target kyty_emulator kyty_shader_precompile --parallel 4
       - name: Build resource, SRT and shader compiler regression checks
-        run: cmake --build _Build/windows --target resource_tracking_tests resource_materialization_tests compute_frontend_cache_tests scalar_provenance_tests shader_cfg_tests --parallel 4
+        run: cmake --build _Build/windows --target resource_tracking_tests resource_materialization_tests compute_frontend_cache_tests scalar_provenance_tests shader_cfg_tests guest_readback_packing_tests shader_recompiler_compute_tests --parallel 4
       - name: Run resource and compiler regression checks with IR validation
         shell: pwsh
         run: |
@@ -103,17 +103,22 @@ jobs:
           # Test that layout without modifying its tests or production defaults.
           $env:KYTY_PORTABLE_SHADERS = '0'
           $env:KYTY_IR_VALIDATE = '1'
-          ctest --test-dir _Build/windows --output-on-failure -R "^(resource_tracking|resource_materialization|compute_frontend_cache|scalar_provenance|shader_cfg)$"
+          ctest --test-dir _Build/windows --output-on-failure -R "^(resource_tracking|resource_materialization|compute_frontend_cache|scalar_provenance|shader_cfg|guest_readback_packing)$"
           if ($LASTEXITCODE) { throw 'Compiler/resource regression checks failed' }
           Remove-Item Env:KYTY_IR_VALIDATE
           ctest --test-dir _Build/windows --output-on-failure -R "^(scalar_provenance|shader_cfg)$"
           if ($LASTEXITCODE) { throw 'Release compiler regression checks failed' }
+          & _Build/windows/shader_recompiler_compute_tests.exe --gpu-math-emission-only
+          if ($LASTEXITCODE) { throw 'GPU math SPIR-V emission checks failed' }
+          & _Build/windows/shader_recompiler_compute_tests.exe --draw-run-ranges-only
+          if ($LASTEXITCODE) { throw 'Native draw range checks failed' }
+
       - name: Verify frozen rendering fix and exact performance patch
         shell: pwsh
         run: |
           git -C source apply --reverse --check ../indexed-shader-init.patch
           if ($LASTEXITCODE) { throw 'Frozen indexed shader fix missing' }
-          git -C source apply --reverse --check ../patches/b123-cache-and-shader-compiler.patch
+          git -C source apply --reverse --check ../patches/b123-combined-renderer-performance.patch
           if ($LASTEXITCODE) { throw 'Compiled source differs from the reviewed performance port' }
       - name: Package portable candidate
         shell: pwsh
@@ -128,12 +133,12 @@ jobs:
             'powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0settings.ps1"',
             'if errorlevel 1 pause')
           # No files, patches, or configuration from ci/perf40 or the user's builds.
-          @{ checkpoint='b123-cache-lifetime-shader-compiler'; environment=@{}; command=@('--','kyty_emulator.exe','--shader-optimization-type','Performance','--shader-log-direction','Silent','--printf-direction','Silent') } |
+          @{ checkpoint='b123-combined-renderer-performance'; environment=@{}; command=@('--','kyty_emulator.exe','--shader-optimization-type','Performance','--shader-log-direction','Silent','--printf-direction','Silent') } |
             ConvertTo-Json -Depth 4 | Set-Content "$out/launch.json" -Encoding UTF8
           Set-Content "$out/run.cmd" -Encoding ASCII -Value @(
             '@echo off',
             'if /I "%~1"=="settings" goto settings',
-            'powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0run-windows.ps1" -Baseline -Prompt -Set KYTY_PORTABLE_SHADERS=0,KYTY_DRIVER_CACHE_KEY=ae183c1a3e4b1da3fe960d72f6884df438b72c79f4e0ca955d9e71b569c75ce9,KYTY_SHADER_WARMUP=1,KYTY_SHADER_WARMUP_THREADS=12,KYTY_SHADER_WARMUP_SECONDS=60,KYTY_SHADER_WARMUP_FILE=_PipelineCache/warmup-legacy/recording.shaders,KYTY_PREPARATION_SCRATCH=1,KYTY_DISPATCH_BATCH=128 %*',
+            'powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0run-windows.ps1" -Baseline -Prompt -Set KYTY_PORTABLE_SHADERS=0,KYTY_DRIVER_CACHE_KEY=98edcf312ef7ea126af9bb5a876005fc746955313ea0535ba2563c766289753b,KYTY_SHADER_WARMUP=1,KYTY_SHADER_WARMUP_THREADS=12,KYTY_SHADER_WARMUP_SECONDS=60,KYTY_SHADER_WARMUP_FILE=_PipelineCache/warmup-legacy/recording.shaders,KYTY_PREPARATION_SCRATCH=1,KYTY_DISPATCH_BATCH=128,KYTY_BACKING_READ=1,KYTY_FRAME_PIPELINE=1,KYTY_READBACK_QUEUE=1,KYTY_READBACK_SLOTS=1,KYTY_ASYNC_UPLOAD=2,KYTY_BDA_DIRTY_REGIONS=1,KYTY_NATIVE_XPR=1,KYTY_NATIVE_XPR_RELOCATE=1,KYTY_NATIVE_XPR_STORE_BUDGET=256,KYTY_NATIVE_XPR_KEEP_FRAMES=600,KYTY_NATIVE_IMAGE_PROOF=1,KYTY_ASYNC_XPR_PIPELINES=1 %*',
             'goto finish',
             ':settings',
             'powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0settings.ps1"',
@@ -143,11 +148,18 @@ jobs:
             '@echo off',
             'powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0precompile-windows.ps1" %*',
             'if errorlevel 1 pause')
+          $verify = (Get-Content "$out/run.cmd" -Raw).Replace('KYTY_NATIVE_XPR=1','KYTY_NATIVE_XPR=2')
+          [IO.File]::WriteAllText("$out/run-verify.cmd", $verify, [Text.ASCIIEncoding]::new())
           Set-Content "$out/README.txt" -Value @(
-            'Frozen B123 rendering, sound and accepted FPS changes, plus cache lifetime and shader compiler fixes.',
+            'Frozen B123 lineage plus cache/compiler, readback, native draw-record and GPU optimizations.',
             'Driver cache survives warmup saves and keeps caching later gameplay pipelines.',
             'Shader compiler uses hash-bucketed SRT planning, linear use-list rewrites and cheaper SPIR-V declarations.',
             'Release skips redundant IR validation; compiler tests also run with KYTY_IR_VALIDATE=1.',
+            'Readback copies nearby GPU ranges together, writing back only the original dirty bytes.',
+            'Native draw-record reuse and relocation enabled, 256 stores per frame, 600-frame retention.',
+            'GPU range proofs and async uploads reduce redundant synchronization and unrelated unmap waits.',
+            'BDA buffers up to 64 MiB share VMA blocks; exact fp32 helpers emit fewer GPU instructions.',
+            'run-verify.cmd compares native draw records with normal preparation for rendering diagnostics.',
             'B123 is frozen separately at best123-frozen-textures-audio-proven-fps.',
             'Shader replay records on first use; judge smoothness on a second launch through the same scene.',
             'Restores B102 replay, B103 compute frontend reuse and quiet logging, GPU worker CPU sets/priority/QoS, SRT visited-set lookup, scratch capacity reuse and 128-dispatch batching.',
@@ -156,11 +168,11 @@ jobs:
             'Run run.cmd and choose the folder containing eboot.bin.',
             'Open settings.cmd (or run.cmd settings) to change display, GPU, shader optimization and logging settings.',
             'Click Save, then relaunch the game. Settings are stored in launch.json.',
-            'Uses upstream baseline drawing with only the documented accepted performance overrides.',
+            'Uses upstream Baseline launcher plus explicit combined performance overrides; new renderer paths need gameplay testing.',
             'The upstream Windows red-zone protection and logs remain enabled.',
             'Texture compatibility test: legacy shader bindings (KYTY_PORTABLE_SHADERS=0) with a separate driver cache key.',
-            'Portable shaders stay disabled. Native XPR, draw packets and image dirty/readback experiments remain at B121 defaults.',
-            'B123 texture/audio and restored FPS are user-confirmed. New cache/compiler changes need gameplay validation.',
+            'Portable shaders stay disabled. Native XPR and async readback enabled; draw packets and partial image dirty experiments stay off.',
+            'B123 is user-confirmed; B124 cache/compiler checks passed. Combined renderer/GPU behavior needs gameplay validation.',
             'This is not the private benchmark package. No private PGO, SRT AOT or game shader seeds.',
             'ATRAC9 uses public revision ec8899dadf393f655f2871a94e0fe4b3d6220c9a because the source gitlink is unavailable.',
             'Legacy resource tracking, materialization scratch/reentrancy checks and frontend cache lifetime/collision/concurrency/eviction checks run in CI.',
@@ -187,11 +199,11 @@ jobs:
             packaging_commit=$env:GITHUB_SHA
             user_emulator_patches_included=$true
             prior_candidate_configuration_included=$false
-            source_modifications=@('ATRAC9 public dependency substitution','Initialize indexed shader before mesh-stage inspection','Reviewed performance ports from accepted B102/B103 lineage','Driver cache survives Save','Hash-bucketed SRT planning and shader compiler optimizations')
+            source_modifications=@('ATRAC9 public dependency substitution','Initialize indexed shader before mesh-stage inspection','Reviewed performance ports from accepted B102/B103 lineage','Driver cache survives Save','Hash-bucketed SRT planning and shader compiler optimizations','GPU readback batching','Native XPR relocation retention and rebinding','Per-region BDA proofs and range-scoped upload waits','BryKytyPS5 BDA suballocation and exact fp32 math')
             launcher_mode='upstream -Baseline'
             settings_window_included=$true
             portable_shaders_enabled=$false
-            driver_cache_key='ae183c1a3e4b1da3fe960d72f6884df438b72c79f4e0ca955d9e71b569c75ce9'
+            driver_cache_key='98edcf312ef7ea126af9bb5a876005fc746955313ea0535ba2563c766289753b'
             frozen_baseline_commit='3c6fe681bebad5029512560162b6a9859bd8acbf'
             frozen_baseline_branch='best123-frozen-textures-audio-proven-fps'
             frozen_base_rendering_and_audio_user_confirmed=$true
@@ -201,7 +213,18 @@ jobs:
             test_modes=@('resource_tracking legacy','resource_materialization','compute_frontend_cache','scalar_provenance','shader_cfg','IR validation on and release default')
             upstream_fix_commits=@('e5738defa60a579dd076563f83d104b6d33be399','5a12d808ce9384db464484943ca0fb80bef3a4f8','a28de66fe2f431bcd3ee50c20c1388e00935e82b')
             cache_save_adaptation='Retain cache lifetime fix; always save content without size-only unchanged heuristic'
-            deferred_changes=@('GPU readback batching','native XPR changes','BryKytyPS5 rendering optimizations')
+            upstream_renderer_commit='60a012f2852cbff1b825dac6ea373b9d6e432268'
+            previous_candidate_commit='27be229579f0aed927a3d1c699f22db440d6e684'
+            previous_candidate_ci_passed=$true
+            brykyty_ports=@('4068f4ac886dcd25acc52b6e3fa3e3800dc576a9 BDA suballocation adapted','5e224812df1354f89c7451e58fc540c476843dc0 exact fp32 helpers adapted')
+            native_xpr_enabled=$true
+            native_xpr_store_budget=256
+            native_xpr_keep_frames=600
+            frame_pipeline_enabled=$true
+            readback_queue_mode=1
+            async_upload_mode=2
+            additional_tests=@('guest_readback_packing dirty-byte parity','GPU math SPIR-V emission','draw_run_ranges')
+            incompatible_ports_not_included=@('BryKytyPS5 texture binding memo and draw speculation require different renderer APIs','Hardware buffer bounds require a separate shader/backend port')
             pgo_included=$false
             srt_aot_dll_included=$false
             game_shader_seeds_included=$false
@@ -227,14 +250,14 @@ jobs:
           $config.command = @('--','kyty_emulator.exe','--screen-width','1920','--screen-height','1080','--fullscreen','--present-mode','Mailbox','--shader-optimization-type','Performance')
           $testConfig = Join-Path $env:RUNNER_TEMP 'launcher-test.json'
           $config | ConvertTo-Json -Depth 4 | Set-Content $testConfig -Encoding UTF8
-          $text = (& "$out/run-windows.ps1" -Config $testConfig -Game $fake -Baseline -Set KYTY_PORTABLE_SHADERS=0,KYTY_DRIVER_CACHE_KEY=ae183c1a3e4b1da3fe960d72f6884df438b72c79f4e0ca955d9e71b569c75ce9,KYTY_SHADER_WARMUP=1,KYTY_SHADER_WARMUP_THREADS=12,KYTY_SHADER_WARMUP_SECONDS=60,KYTY_SHADER_WARMUP_FILE=_PipelineCache/warmup-legacy/recording.shaders,KYTY_PREPARATION_SCRATCH=1,KYTY_DISPATCH_BATCH=128 -DryRun 6>&1 | Out-String)
+          $text = (& "$out/run-windows.ps1" -Config $testConfig -Game $fake -Baseline -Set KYTY_PORTABLE_SHADERS=0,KYTY_DRIVER_CACHE_KEY=98edcf312ef7ea126af9bb5a876005fc746955313ea0535ba2563c766289753b,KYTY_SHADER_WARMUP=1,KYTY_SHADER_WARMUP_THREADS=12,KYTY_SHADER_WARMUP_SECONDS=60,KYTY_SHADER_WARMUP_FILE=_PipelineCache/warmup-legacy/recording.shaders,KYTY_PREPARATION_SCRATCH=1,KYTY_DISPATCH_BATCH=128,KYTY_BACKING_READ=1,KYTY_FRAME_PIPELINE=1,KYTY_READBACK_QUEUE=1,KYTY_READBACK_SLOTS=1,KYTY_ASYNC_UPLOAD=2,KYTY_BDA_DIRTY_REGIONS=1,KYTY_NATIVE_XPR=1,KYTY_NATIVE_XPR_RELOCATE=1,KYTY_NATIVE_XPR_STORE_BUDGET=256,KYTY_NATIVE_XPR_KEEP_FRAMES=600,KYTY_NATIVE_IMAGE_PROOF=1,KYTY_ASYNC_XPR_PIPELINES=1 -DryRun 6>&1 | Out-String)
           foreach ($expected in @('--screen-width 1920','--screen-height 1080','--fullscreen','--present-mode Mailbox','--shader-optimization-type Performance')) {
             if (!$text.Contains($expected)) { throw "Launcher ignored setting: $expected" }
           }
-          if (!$text.Contains('KYTY_PORTABLE_SHADERS=0') -or !$text.Contains('KYTY_DRIVER_CACHE_KEY=ae183c1a3e4b1da3fe960d72f6884df438b72c79f4e0ca955d9e71b569c75ce9')) {
+          if (!$text.Contains('KYTY_PORTABLE_SHADERS=0') -or !$text.Contains('KYTY_DRIVER_CACHE_KEY=98edcf312ef7ea126af9bb5a876005fc746955313ea0535ba2563c766289753b')) {
             throw 'Launcher ignored the legacy binding or isolated cache override'
           }
-          foreach ($expected in @('KYTY_SHADER_WARMUP=1','KYTY_PREPARATION_SCRATCH=1','KYTY_DISPATCH_BATCH=128')) {
+          foreach ($expected in @('KYTY_FRAME_PIPELINE=1','KYTY_NATIVE_XPR=1','KYTY_NATIVE_XPR_STORE_BUDGET=256','KYTY_BDA_DIRTY_REGIONS=1','KYTY_ASYNC_UPLOAD=2','KYTY_READBACK_QUEUE=1','KYTY_SHADER_WARMUP=1','KYTY_PREPARATION_SCRATCH=1','KYTY_DISPATCH_BATCH=128')) {
             if (!$text.Contains($expected)) { throw "Launcher ignored proven performance override: $expected" }
           }
           Remove-Item "$out/game-path.txt" -ErrorAction SilentlyContinue
@@ -249,7 +272,7 @@ jobs:
       - name: Upload clean standalone public fork
         uses: actions/upload-artifact@v4
         with:
-          name: KytyPS5-B123-CACHE-SHADER-Windows-x64-${{ github.run_number }}
+          name: KytyPS5-B123-COMBINED-PERF-Windows-x64-${{ github.run_number }}
           path: _Build/package/**
           if-no-files-found: error
 
