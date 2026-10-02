@@ -1,0 +1,912 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 9dbd00e..37f8fea 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -868,3 +868,9 @@ endif()
+ if(KYTY_CLANG_CL)
+ 	install(FILES "${KYTY_THIRD_PARTY_DIR}/winpthread/bin/libwinpthread-1.dll" DESTINATION .)
+ endif()
++
++# Ported #103 frontend cache: CPU-only lifetime, identity and eviction checks.
++find_package(Threads REQUIRED)
++add_executable(compute_frontend_cache_tests EXCLUDE_FROM_ALL tests/ComputeFrontendCacheTests.cpp)
++target_link_libraries(compute_frontend_cache_tests PRIVATE Threads::Threads)
++add_test(NAME compute_frontend_cache COMMAND compute_frontend_cache_tests)
+diff --git a/src/graphics/guest_gpu/graphicsRun.cpp b/src/graphics/guest_gpu/graphicsRun.cpp
+index 23159fa..03ba947 100644
+--- a/src/graphics/guest_gpu/graphicsRun.cpp
++++ b/src/graphics/guest_gpu/graphicsRun.cpp
+@@ -28,6 +28,7 @@
+ #include "frame-capture.h"
+ #include "live-control.h"
+ #include "performance-switches.h"
++#include "proven-gpu-worker.h"
+ #include "xpr-capture.h"
+ #ifdef KYTY_LOCAL_VULKAN_RECORDING
+ #include "vulkan-recording.h"
+@@ -543,6 +544,9 @@ void GuestGpu::ThreadRun(void* data) {
+ 	g_gpu_state  = gpu;
+ 	LiveTrace::g_mark_thread = true;
+ 	InitializePerformanceSwitches();
++#if defined(_WIN32) && defined(KYTY_B32_FAST_CPU_SETS)
++	PreferFastCpuSetsForGpuWorker();
++#endif
+ 	LiveControl::Start();
+ 	XprCapture::Initialize();
+ #ifdef KYTY_LOCAL_VULKAN_RECORDING
+diff --git a/src/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp b/src/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp
+index 2f80b33..5cc4d0f 100644
+--- a/src/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp
++++ b/src/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp
+@@ -1606,8 +1606,8 @@ bool PipelineCache::Save() {
+ 	}
+ 	PipelineCacheLog("Vulkan pipeline cache: saved {} bytes to {}", payload.size(),
+ 	                 Common::PathToString(m_driver_cache_path));
+-	m_graphics.device.destroyPipelineCache(m_driver_cache, nullptr);
+-	m_driver_cache = nullptr;
++	// Save may run after warmup while gameplay still compiles pipelines.
++	// Keep the driver cache alive until the destructor, and save later additions at exit.
+ 	return inputs_saved;
+ }
+ 
+diff --git a/src/graphics/shader/recompiler/ShaderRecompiler.cpp b/src/graphics/shader/recompiler/ShaderRecompiler.cpp
+index 1b63474..53c61f0 100644
+--- a/src/graphics/shader/recompiler/ShaderRecompiler.cpp
++++ b/src/graphics/shader/recompiler/ShaderRecompiler.cpp
+@@ -4,6 +4,7 @@
+ #include "common/logging/log.h"
+ #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
+ #include "graphics/shader/recompiler/frontend/cfg/ShaderCFG.h"
++#include "graphics/shader/recompiler/frontend/ComputeFrontendCache.h"
+ #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
+ #include "graphics/shader/recompiler/frontend/translate/Translate.h"
+ #include "graphics/shader/recompiler/ir/ShaderIR.h"
+@@ -29,6 +30,12 @@
+ #include <span>
+ #include <utility>
+ 
++#if defined(KYTY_B32_QUIET_SHADER_PHASES)
++#define B32_PHASE_LOG(...) ((void)0)
++#else
++#define B32_PHASE_LOG(...) LOGF(__VA_ARGS__)
++#endif
++
+ namespace Libs::Graphics::ShaderRecompiler {
+ 
+ namespace {
+@@ -587,20 +594,28 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
+ 		                                 .count());
+ 	};
+ 
+-	LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " code_words=%" PRIu64 " decode\n",
++	B32_PHASE_LOG("%s phase begin: stage=%s hash=0x%016" PRIx64 " code_words=%" PRIu64 " decode\n",
+ 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
+ 	     static_cast<uint64_t>(code.size()));
+ 
+ 	Decoder::Program decoded;
++	CFG::Graph cfg;
++	bool dispatcher_fallback = false;
++	std::string dispatcher_reason;
++	const bool cache_eligible = options.stage == ShaderType::Compute && options.back_code.empty();
++	const bool frontend_hit = cache_eligible && FrontendCache::FindCachedComputeFrontend(
++	    code, options.shader_hash, decoded, cfg, dispatcher_fallback, dispatcher_reason);
+ 	std::vector<uint32_t> joined_code;
+-	if (!options.back_code.empty()) {
+-		decoded = DecodeFusedProgram(code, options.back_code, joined_code);
+-	} else {
+-		Decoder::DecodeProgram(code, decoded);
++	if (!frontend_hit) {
++		if (!options.back_code.empty()) {
++			decoded = DecodeFusedProgram(code, options.back_code, joined_code);
++		} else {
++			Decoder::DecodeProgram(code, decoded);
++		}
+ 	}
+ 	DumpDecodedShader(options, joined_code.empty() ? code : std::span<const uint32_t> {joined_code},
+ 	                  decoded);
+-	LOGF("%s phase end: stage=%s hash=0x%016" PRIx64 " decode instructions=%" PRIu64
++	B32_PHASE_LOG("%s phase end: stage=%s hash=0x%016" PRIx64 " decode instructions=%" PRIu64
+ 	     " elapsed_ms=%" PRIu64 "\n",
+ 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
+ 	     static_cast<uint64_t>(decoded.instructions.size()), phase_ms());
+@@ -613,23 +628,24 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
+ 		}
+ 	}
+ 
+-	LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " CFG BuildGraph\n", GetDumpLabel(options),
++	B32_PHASE_LOG("%s phase begin: stage=%s hash=0x%016" PRIx64 " CFG BuildGraph\n", GetDumpLabel(options),
+ 	     StageName(options.stage), options.shader_hash);
+-	auto cfg = CFG::BuildGraph(decoded);
+-	LOGF("%s phase end: stage=%s hash=0x%016" PRIx64 " CFG BuildGraph blocks=%" PRIu64
++	if (!frontend_hit) cfg = CFG::BuildGraph(decoded);
++	B32_PHASE_LOG("%s phase end: stage=%s hash=0x%016" PRIx64 " CFG BuildGraph blocks=%" PRIu64
+ 	     " loops=%" PRIu64 " back_edges=%" PRIu64 " elapsed_ms=%" PRIu64 "\n",
+ 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
+ 	     static_cast<uint64_t>(cfg.blocks.size()), static_cast<uint64_t>(cfg.natural_loops.size()),
+ 	     static_cast<uint64_t>(cfg.back_edges.size()), phase_ms());
+-	bool        dispatcher_fallback = false;
+-	std::string dispatcher_reason;
+-	if (cfg.irreducible) {
++	if (frontend_hit) {
++		// Reuse the previously structured graph; later resource processing still
++		// runs with this invocation's inputs.
++	} else if (cfg.irreducible) {
+ 		dispatcher_fallback = true;
+ 		dispatcher_reason   = cfg.unsupported_reason;
+ 		LogDispatcherFallback(options, cfg, "build", dispatcher_reason);
+ 	} else {
+ 		const auto unstructured_cfg = cfg;
+-		LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " CFG Structurize\n",
++		B32_PHASE_LOG("%s phase begin: stage=%s hash=0x%016" PRIx64 " CFG Structurize\n",
+ 		     GetDumpLabel(options), StageName(options.stage), options.shader_hash);
+ 		if (!CFG::Structurize(cfg)) {
+ 			dispatcher_fallback      = true;
+@@ -643,10 +659,10 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
+ 			cfg.failure_block      = failure_block;
+ 			cfg.unsupported_reason = dispatcher_reason;
+ 		} else {
+-			LOGF("%s structured CFG success: blocks=%" PRIu64 "\n", GetDumpLabel(options),
++			B32_PHASE_LOG("%s structured CFG success: blocks=%" PRIu64 "\n", GetDumpLabel(options),
+ 			     static_cast<uint64_t>(cfg.blocks.size()));
+ 		}
+-		LOGF("%s phase end: stage=%s hash=0x%016" PRIx64 " CFG Structurize blocks=%" PRIu64
++		B32_PHASE_LOG("%s phase end: stage=%s hash=0x%016" PRIx64 " CFG Structurize blocks=%" PRIu64
+ 		     " loops=%" PRIu64 " elapsed_ms=%" PRIu64 "\n",
+ 		     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
+ 		     static_cast<uint64_t>(cfg.blocks.size()),
+@@ -693,10 +709,10 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
+ 	    .compute             = compute,
+ 	    .embedded_fetch      = embedded_fetch.loads.empty() ? nullptr : &embedded_fetch,
+ 	};
+-	LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " IR TranslateProgram\n",
++	B32_PHASE_LOG("%s phase begin: stage=%s hash=0x%016" PRIx64 " IR TranslateProgram\n",
+ 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash);
+ 	auto ir = Frontend::TranslateProgram(decoded, cfg, translate_options);
+-	LOGF("%s phase end: stage=%s hash=0x%016" PRIx64 " IR TranslateProgram blocks=%" PRIu64
++	B32_PHASE_LOG("%s phase end: stage=%s hash=0x%016" PRIx64 " IR TranslateProgram blocks=%" PRIu64
+ 	     " elapsed_ms=%" PRIu64 "\n",
+ 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
+ 	     static_cast<uint64_t>(ir.blocks.size()), phase_ms());
+@@ -732,6 +748,10 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
+ 	}
+ 	IR::TrackResources(ir);
+ 	IR::EliminateDeadCode(ir.blocks);
++	if (cache_eligible && !frontend_hit && phase_ms() >= 16) {
++		FrontendCache::RememberComputeFrontend(code, options.shader_hash, decoded, cfg,
++		                                      dispatcher_fallback, dispatcher_reason);
++	}
+ 	TranslateResult result;
+ 	result.program = std::move(ir);
+ 	if (options.dump_ir) {
+@@ -777,10 +797,10 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
+ 		}
+ 	}
+ 
+-	LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " SPIR-V EmitProgram\n",
++	B32_PHASE_LOG("%s phase begin: stage=%s hash=0x%016" PRIx64 " SPIR-V EmitProgram\n",
+ 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash);
+ 	auto spirv = Spirv::EmitProgram(ir, options.input_info);
+-	LOGF("%s phase end: stage=%s hash=0x%016" PRIx64 " SPIR-V EmitProgram words=%" PRIu64
++	B32_PHASE_LOG("%s phase end: stage=%s hash=0x%016" PRIx64 " SPIR-V EmitProgram words=%" PRIu64
+ 	     " elapsed_ms=%" PRIu64 "\n",
+ 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
+ 	     static_cast<uint64_t>(spirv.size()),
+diff --git a/src/graphics/shader/recompiler/backend/spirv/SpirvBuilder.cpp b/src/graphics/shader/recompiler/backend/spirv/SpirvBuilder.cpp
+index 9408774..86aff97 100644
+--- a/src/graphics/shader/recompiler/backend/spirv/SpirvBuilder.cpp
++++ b/src/graphics/shader/recompiler/backend/spirv/SpirvBuilder.cpp
+@@ -58,24 +58,33 @@ uint32_t Builder::Import(const char* name) {
+ 	return id;
+ }
+ 
++uint32_t Builder::FindOrReserveDeclaration(uint32_t& id) {
++	if (const auto it = m_declaration_ids.find(m_key); it != m_declaration_ids.end()) {
++		return it->second;
++	}
++	id = AllocateId();
++	m_declaration_ids.emplace(m_key, id);
++	return 0;
++}
++
+ uint32_t Builder::Type(uint32_t opcode, std::initializer_list<uint32_t> operands) {
+-	return Type(opcode, std::vector<uint32_t>(operands));
++	return Type(opcode, operands.begin(), operands.size());
+ }
+ 
+ uint32_t Builder::Type(uint32_t opcode, const std::vector<uint32_t>& operands) {
+-	std::vector<uint32_t> key;
+-	key.reserve(operands.size() + 2u);
+-	key.push_back(opcode);
+-	key.push_back(static_cast<uint32_t>(operands.size()));
+-	key.insert(key.end(), operands.begin(), operands.end());
+-	if (const auto it = m_declaration_ids.find(key); it != m_declaration_ids.end()) {
+-		return it->second;
++	return Type(opcode, operands.data(), operands.size());
++}
++
++uint32_t Builder::Type(uint32_t opcode, const uint32_t* operands, size_t count) {
++	m_key.assign({opcode, static_cast<uint32_t>(count)});
++	m_key.insert(m_key.end(), operands, operands + count);
++	uint32_t id = 0;
++	if (const auto found = FindOrReserveDeclaration(id); found != 0) {
++		return found;
+ 	}
+-	const auto id = AllocateId();
+-	m_declaration_ids.emplace(std::move(key), id);
+-	std::vector<uint32_t> words {opcode, id};
+-	words.insert(words.end(), operands.begin(), operands.end());
+-	AppendInstructionWords(m_declarations, words.data(), words.size());
++	m_declarations.push_back((static_cast<uint32_t>(count + 2u) << 16u) | opcode);
++	m_declarations.push_back(id);
++	m_declarations.insert(m_declarations.end(), operands, operands + count);
+ 	return id;
+ }
+ 
+@@ -84,19 +93,18 @@ uint32_t Builder::DecoratedType(uint32_t opcode, std::initializer_list<uint32_t>
+ 	if (annotations.size() == 0) {
+ 		return Type(opcode, operands);
+ 	}
+-	std::vector<uint32_t> key {opcode, static_cast<uint32_t>(operands.size())};
+-	key.insert(key.end(), operands.begin(), operands.end());
+-	key.push_back(static_cast<uint32_t>(annotations.size()));
++	m_key.assign({opcode, static_cast<uint32_t>(operands.size())});
++	m_key.insert(m_key.end(), operands.begin(), operands.end());
++	m_key.push_back(static_cast<uint32_t>(annotations.size()));
+ 	for (const auto& annotation: annotations) {
+-		key.push_back(annotation.opcode);
+-		key.push_back(static_cast<uint32_t>(annotation.operands.size()));
+-		key.insert(key.end(), annotation.operands.begin(), annotation.operands.end());
++		m_key.push_back(annotation.opcode);
++		m_key.push_back(static_cast<uint32_t>(annotation.operands.size()));
++		m_key.insert(m_key.end(), annotation.operands.begin(), annotation.operands.end());
+ 	}
+-	if (const auto it = m_declaration_ids.find(key); it != m_declaration_ids.end()) {
+-		return it->second;
++	uint32_t id = 0;
++	if (const auto found = FindOrReserveDeclaration(id); found != 0) {
++		return found;
+ 	}
+-	const auto id = AllocateId();
+-	m_declaration_ids.emplace(std::move(key), id);
+ 	std::vector<uint32_t> words {opcode, id};
+ 	words.insert(words.end(), operands.begin(), operands.end());
+ 	AppendInstructionWords(m_declarations, words.data(), words.size());
+@@ -110,23 +118,24 @@ uint32_t Builder::DecoratedType(uint32_t opcode, std::initializer_list<uint32_t>
+ 
+ uint32_t Builder::Constant(uint32_t opcode, uint32_t type,
+                            std::initializer_list<uint32_t> operands) {
+-	return Constant(opcode, type, std::vector<uint32_t>(operands));
++	return Constant(opcode, type, operands.begin(), operands.size());
+ }
+ 
+ uint32_t Builder::Constant(uint32_t opcode, uint32_t type, const std::vector<uint32_t>& operands) {
+-	std::vector<uint32_t> key;
+-	key.reserve(operands.size() + 2u);
+-	key.push_back(opcode);
+-	key.push_back(type);
+-	key.insert(key.end(), operands.begin(), operands.end());
+-	if (const auto it = m_declaration_ids.find(key); it != m_declaration_ids.end()) {
+-		return it->second;
++	return Constant(opcode, type, operands.data(), operands.size());
++}
++
++uint32_t Builder::Constant(uint32_t opcode, uint32_t type, const uint32_t* operands, size_t count) {
++	m_key.assign({opcode, type});
++	m_key.insert(m_key.end(), operands, operands + count);
++	uint32_t id = 0;
++	if (const auto found = FindOrReserveDeclaration(id); found != 0) {
++		return found;
+ 	}
+-	const auto id = AllocateId();
+-	m_declaration_ids.emplace(std::move(key), id);
+-	std::vector<uint32_t> words {opcode, type, id};
+-	words.insert(words.end(), operands.begin(), operands.end());
+-	AppendInstructionWords(m_declarations, words.data(), words.size());
++	m_declarations.push_back((static_cast<uint32_t>(count + 3u) << 16u) | opcode);
++	m_declarations.push_back(type);
++	m_declarations.push_back(id);
++	m_declarations.insert(m_declarations.end(), operands, operands + count);
+ 	return id;
+ }
+ 
+diff --git a/src/graphics/shader/recompiler/backend/spirv/SpirvBuilder.h b/src/graphics/shader/recompiler/backend/spirv/SpirvBuilder.h
+index d9aeb9e..9668e28 100644
+--- a/src/graphics/shader/recompiler/backend/spirv/SpirvBuilder.h
++++ b/src/graphics/shader/recompiler/backend/spirv/SpirvBuilder.h
+@@ -7,6 +7,7 @@
+ #include <map>
+ #include <set>
+ #include <string>
++#include <unordered_map>
+ #include <vector>
+ 
+ namespace Libs::Graphics::ShaderRecompiler::Spirv {
+@@ -61,6 +62,10 @@ private:
+ 	static void AppendInstruction(std::vector<uint32_t>& section, uint32_t opcode,
+ 	                              std::initializer_list<uint32_t> operands);
+ 	static void AppendString(std::vector<uint32_t>& words, const char* text);
++	uint32_t    Type(uint32_t opcode, const uint32_t* operands, size_t count);
++	uint32_t    Constant(uint32_t opcode, uint32_t type, const uint32_t* operands, size_t count);
++	// The id of the declaration m_key describes, or 0 after reserving a new one for it.
++	uint32_t    FindOrReserveDeclaration(uint32_t& id);
+ 	void        AddCapability(std::initializer_list<uint32_t> operands);
+ 	void        AddExtension(const char* name);
+ 	void        AddExtInstImport(uint32_t id, const char* name);
+@@ -81,7 +86,16 @@ private:
+ 	std::set<uint32_t>                        m_required_capabilities;
+ 	std::set<std::string>                     m_required_extensions;
+ 	std::map<std::string, uint32_t>           m_import_ids;
+-	std::map<std::vector<uint32_t>, uint32_t> m_declaration_ids;
++	struct WordsHash {
++		size_t operator()(const std::vector<uint32_t>& words) const noexcept {
++			uint64_t hash = 0x9E3779B97F4A7C15ull ^ words.size();
++			for (const auto word: words) hash = (hash ^ word) * 0xFF51AFD7ED558CCDull;
++			return static_cast<size_t>(hash ^ (hash >> 32u));
++		}
++	};
++	// Only looked up (ids are assigned in first-use order), so hashed; m_key is the lookup key's scratch.
++	std::unordered_map<std::vector<uint32_t>, uint32_t, WordsHash> m_declaration_ids;
++	std::vector<uint32_t>                     m_key;
+ 	size_t                                    m_unpatched_phi_incomings = 0;
+ };
+ 
+diff --git a/src/graphics/shader/recompiler/backend/spirv/SpirvEmitter.cpp b/src/graphics/shader/recompiler/backend/spirv/SpirvEmitter.cpp
+index 3f052b4..1973c04 100644
+--- a/src/graphics/shader/recompiler/backend/spirv/SpirvEmitter.cpp
++++ b/src/graphics/shader/recompiler/backend/spirv/SpirvEmitter.cpp
+@@ -327,7 +327,7 @@ std::vector<uint32_t> EmitProgram(const IR::Program& program,
+ 		Fail(program, "SPIR-V emitter requires a fully planned native shader program");
+ 	}
+ 	ValidateNativeProgram(program);
+-	IR::ValidateProgram(program, true);
++	if (IR::ValidationEnabled()) IR::ValidateProgram(program, true);
+ 	EmitterState state(program, input_info);
+ 	state.stage     = program.stage;
+ 	state.lod_stats_subgroup = program.bindings.lod_stats_count != 0 &&
+diff --git a/src/graphics/shader/recompiler/frontend/ComputeFrontendCache.h b/src/graphics/shader/recompiler/frontend/ComputeFrontendCache.h
+new file mode 100644
+index 0000000..e8e0a6b
+--- /dev/null
++++ b/src/graphics/shader/recompiler/frontend/ComputeFrontendCache.h
+@@ -0,0 +1,69 @@
++#pragma once
++#include "graphics/shader/recompiler/frontend/cfg/ShaderCFG.h"
++#include <algorithm>
++#include <deque>
++#include <mutex>
++#include <span>
++#include <string>
++#include <vector>
++namespace Libs::Graphics::ShaderRecompiler::FrontendCache {
++struct CachedComputeFrontend {
++	uint64_t shader_hash = 0;
++	std::vector<uint32_t> code;
++	std::vector<Decoder::Instruction> instructions;
++	CFG::Graph graph;
++	bool dispatcher_fallback = false;
++	std::string dispatcher_reason;
++	size_t estimated_bytes = 0;
++};
++
++inline std::mutex g_compute_frontend_mutex;
++inline std::deque<CachedComputeFrontend> g_compute_frontends;
++constexpr size_t MaxCachedComputeFrontends = 512;
++constexpr size_t MaxCachedComputeFrontendBytes = 256ull * 1024 * 1024;
++inline size_t g_compute_frontend_bytes = 0;
++
++inline bool FindCachedComputeFrontend(std::span<const uint32_t> code, uint64_t hash,
++                               Decoder::Program& decoded, CFG::Graph& graph,
++                               bool& dispatcher_fallback, std::string& dispatcher_reason) {
++	std::lock_guard lock(g_compute_frontend_mutex);
++	for (auto& entry: g_compute_frontends) {
++		if (entry.shader_hash != hash || entry.code.size() != code.size() ||
++		    !std::equal(entry.code.begin(), entry.code.end(), code.begin())) {
++			continue;
++		}
++		decoded.code = code;
++		decoded.instructions = entry.instructions;
++		graph = entry.graph;
++		dispatcher_fallback = entry.dispatcher_fallback;
++		dispatcher_reason = entry.dispatcher_reason;
++		return true;
++	}
++	return false;
++}
++
++inline void RememberComputeFrontend(std::span<const uint32_t> code, uint64_t hash,
++                             const Decoder::Program& decoded, const CFG::Graph& graph,
++                             bool dispatcher_fallback, const std::string& dispatcher_reason) {
++	if (code.size() > 16384) {
++		return;
++	}
++	// Conservatively account for nested CFG vectors as well as instruction storage.
++	const size_t estimated_bytes = code.size() * sizeof(uint32_t) +
++	    decoded.instructions.size() * sizeof(Decoder::Instruction) +
++	    graph.blocks.size() * sizeof(CFG::BasicBlock) * 4;
++	if (estimated_bytes > MaxCachedComputeFrontendBytes) {
++		return;
++	}
++	std::lock_guard lock(g_compute_frontend_mutex);
++	while (!g_compute_frontends.empty() &&
++	       (g_compute_frontends.size() >= MaxCachedComputeFrontends ||
++	        g_compute_frontend_bytes > MaxCachedComputeFrontendBytes - estimated_bytes)) {
++		g_compute_frontend_bytes -= g_compute_frontends.front().estimated_bytes;
++		g_compute_frontends.pop_front();
++	}
++	g_compute_frontends.push_back({hash, {code.begin(), code.end()}, decoded.instructions,
++	                               graph, dispatcher_fallback, dispatcher_reason, estimated_bytes});
++	g_compute_frontend_bytes += estimated_bytes;
++}
++}
+diff --git a/src/graphics/shader/recompiler/frontend/translate/Translate.cpp b/src/graphics/shader/recompiler/frontend/translate/Translate.cpp
+index 3831f55..d15ed9c 100644
+--- a/src/graphics/shader/recompiler/frontend/translate/Translate.cpp
++++ b/src/graphics/shader/recompiler/frontend/translate/Translate.cpp
+@@ -1239,7 +1239,7 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph&
+ 		}
+ 		translator.AddBranchCondition(cfg_block, result.block_info[typed_index]);
+ 	}
+-	IR::ValidateProgram(result, false);
++	if (IR::ValidationEnabled()) IR::ValidateProgram(result, false);
+ 	return result;
+ }
+ 
+diff --git a/src/graphics/shader/recompiler/ir/Program.cpp b/src/graphics/shader/recompiler/ir/Program.cpp
+index 7f955ad..8962860 100644
+--- a/src/graphics/shader/recompiler/ir/Program.cpp
++++ b/src/graphics/shader/recompiler/ir/Program.cpp
+@@ -1,6 +1,7 @@
+ #include "common/assert.h"
+ #include "graphics/shader/recompiler/ir/ShaderIR.h"
+ 
++#include <cstdlib>
+ #include <fmt/format.h>
+ #include <map>
+ #include <new>
+@@ -98,8 +99,9 @@ bool EquivalentValue(const ResourcePlan& program, Value left, Value right,
+ } // namespace
+ 
+ ResourcePlan::~ResourcePlan() {
++	// Plan values only refer to each other (CompileResult clones them), so they die together.
+ 	for (auto& inst: value_storage) {
+-		inst.Invalidate();
++		inst.DropLinks();
+ 	}
+ }
+ 
+@@ -112,13 +114,16 @@ ResourcePlan& ResourcePlan::operator=(ResourcePlan&& other) noexcept {
+ }
+ 
+ Program::~Program() {
+-	// Values may cross block boundaries. Detach all arguments before any block starts destroying
+-	// its instruction storage so reverse-use links always point to live definitions.
+-	for (auto* block: blocks) {
++	// Values cross block boundaries and the plan values: drop every link before any storage is destroyed,
++	// all at once rather than unlinking edge by edge.
++	for (auto& block: block_storage) {
+ 		for (auto& inst: *block) {
+-			inst.Invalidate();
++			inst.DropLinks();
+ 		}
+ 	}
++	for (auto& inst: value_storage) {
++		inst.DropLinks();
++	}
+ }
+ 
+ Program& Program::operator=(Program&& other) noexcept {
+@@ -150,7 +155,9 @@ CompiledShaderInfo Program::TakeCompiledInfo() && {
+ }
+ 
+ bool EquivalentValue(const ResourcePlan& program, Value left, Value right) {
+-	std::vector<std::pair<const Inst*, const Inst*>> visited;
++	// Called per candidate pair while planning: one allocation per thread, not per call.
++	thread_local std::vector<std::pair<const Inst*, const Inst*>> visited;
++	visited.clear();
+ 	return EquivalentValue(program, left, right, visited);
+ }
+ 
+@@ -185,6 +192,11 @@ Value ResolveInvariantPhi(const ResourcePlan& program, Value value) {
+ 	return invariant;
+ }
+ 
++bool ValidationEnabled() {
++	static const bool enabled = KYTY_BUILD != KYTY_BUILD_RELEASE || std::getenv("KYTY_IR_VALIDATE") != nullptr;
++	return enabled;
++}
++
+ void ValidateProgram(const Program& program, bool require_ssa) {
+ 	if (program.blocks.size() != program.block_info.size() ||
+ 	    program.blocks.size() != program.block_storage.size()) {
+diff --git a/src/graphics/shader/recompiler/ir/Value.cpp b/src/graphics/shader/recompiler/ir/Value.cpp
+index 2c3de14..8379103 100644
+--- a/src/graphics/shader/recompiler/ir/Value.cpp
++++ b/src/graphics/shader/recompiler/ir/Value.cpp
+@@ -228,9 +228,14 @@ void Inst::AddPhiOperand(Block* predecessor, Value value) {
+ }
+ 
+ void Inst::ReplaceUsesWith(Value replacement, bool preserve) {
+-	const auto old_uses = uses;
++	// Every use moves: take the list whole instead of erasing its entries one by one from the front.
++	const auto old_uses = std::exchange(uses, {});
++	auto*      new_inst = replacement.TryInstruction();
+ 	for (const auto& use: old_uses) {
+-		use.user->SetArg(use.operand, replacement);
++		use.user->args[use.operand] = replacement;
++		if (new_inst != nullptr) {
++			use.user->AddUse(new_inst, use.operand);
++		}
+ 	}
+ 	Invalidate();
+ 	if (preserve) {
+@@ -255,9 +260,7 @@ void Inst::Invalidate() {
+ }
+ 
+ void Inst::AddUse(Inst* used, size_t operand) {
+-	const auto found = std::ranges::find_if(
+-	    used->uses, [&](const Use& use) { return use.user == this && use.operand == operand; });
+-	EXIT_IF(found != used->uses.end());
++	EXIT_IF(ValidationEnabled() && std::ranges::find(used->uses, Use {this, operand}) != used->uses.end());
+ 	used->uses.push_back({this, operand});
+ }
+ 
+@@ -268,6 +271,13 @@ void Inst::RemoveUse(Inst* used, size_t operand) {
+ 	used->uses.erase(found);
+ }
+ 
++void Inst::DropLinks() {
++	args.clear();
++	phi_blocks.clear();
++	uses.clear();
++	opcode = ValueOpcode::Void;
++}
++
+ void Inst::ClearArgs() {
+ 	for (size_t index = 0; index < args.size(); index++) {
+ 		if (auto* value_inst = args[index].TryInstruction(); value_inst != nullptr) {
+diff --git a/src/graphics/shader/recompiler/ir/Value.h b/src/graphics/shader/recompiler/ir/Value.h
+index dd00283..e3d48d9 100644
+--- a/src/graphics/shader/recompiler/ir/Value.h
++++ b/src/graphics/shader/recompiler/ir/Value.h
+@@ -16,6 +16,11 @@ namespace Libs::Graphics::ShaderRecompiler::IR {
+ class Block;
+ class Inst;
+ 
++// Whether translations run the IR consistency checks (ValidateProgram, duplicate uses): debug builds, or
++// KYTY_IR_VALIDATE in release. They only ever stop the emulator, and they were a fifth of a release
++// translation's time (the first-encounter hitches).
++bool ValidationEnabled();
++
+ class Value {
+ public:
+ 	Value() = default;
+@@ -128,6 +133,8 @@ public:
+ 	void ReplaceUsesWith(Value replacement, bool preserve = true);
+ 	void ReplaceOpcode(ValueOpcode opcode);
+ 	void Invalidate();
++	// Invalidate without unlinking the uses: only when every value of the IR is destroyed together.
++	void DropLinks();
+ 
+ 	template <typename T>
+ 	requires(sizeof(T) <= sizeof(uint64_t) && std::is_trivially_copyable_v<T>)
+diff --git a/src/graphics/shader/recompiler/ir/passes/DeadCodeElimination.cpp b/src/graphics/shader/recompiler/ir/passes/DeadCodeElimination.cpp
+index 3d98052..119445b 100644
+--- a/src/graphics/shader/recompiler/ir/passes/DeadCodeElimination.cpp
++++ b/src/graphics/shader/recompiler/ir/passes/DeadCodeElimination.cpp
+@@ -1,6 +1,7 @@
+ #include "graphics/shader/recompiler/ir/passes/DeadCodeElimination.h"
+ 
+ #include <algorithm>
++#include <unordered_set>
+ #include <vector>
+ 
+ namespace Libs::Graphics::ShaderRecompiler::IR {
+@@ -24,10 +25,11 @@ static bool RemoveDeadPhiWebs(const BlockList& blocks) {
+ 	std::vector<Inst*> dead;
+ 	std::vector<Inst*> web;
+ 	std::vector<Inst*> stack;
++	// Membership of `dead` (looked up per phi and, when erasing, per instruction).
++	std::unordered_set<const Inst*> dead_set;
+ 	for (auto* block: blocks) {
+ 		for (auto& inst: block->Instructions()) {
+-			if (inst.GetOpcode() != ValueOpcode::Phi ||
+-			    std::ranges::find(dead, &inst) != dead.end()) {
++			if (inst.GetOpcode() != ValueOpcode::Phi || dead_set.contains(&inst)) {
+ 				continue;
+ 			}
+ 			web.clear();
+@@ -53,6 +55,7 @@ static bool RemoveDeadPhiWebs(const BlockList& blocks) {
+ 				continue;
+ 			}
+ 			dead.insert(dead.end(), web.begin(), web.end());
++			dead_set.insert(web.begin(), web.end());
+ 		}
+ 	}
+ 	if (dead.empty()) {
+@@ -64,7 +67,7 @@ static bool RemoveDeadPhiWebs(const BlockList& blocks) {
+ 	for (auto* block: blocks) {
+ 		auto& instructions = block->Instructions();
+ 		for (auto inst = instructions.begin(); inst != instructions.end();) {
+-			if (std::ranges::find(dead, &*inst) != dead.end()) {
++			if (dead_set.contains(&*inst)) {
+ 				inst = instructions.erase(inst);
+ 			} else {
+ 				inst++;
+diff --git a/src/graphics/shader/recompiler/ir/passes/SrtWalker.cpp b/src/graphics/shader/recompiler/ir/passes/SrtWalker.cpp
+index 4d267aa..40e34fe 100644
+--- a/src/graphics/shader/recompiler/ir/passes/SrtWalker.cpp
++++ b/src/graphics/shader/recompiler/ir/passes/SrtWalker.cpp
+@@ -473,26 +473,23 @@ private:
+ 		if (inst == nullptr) {
+ 			Fail(use_pc, "invalid typed planning value");
+ 		}
+-		const auto cycle = std::ranges::find(m_visiting, inst);
+-		if (cycle != m_visiting.end()) {
+-			const auto contains_phi = std::any_of(cycle, m_visiting.end(), [](const Inst* value) {
+-				return value->GetOpcode() == ValueOpcode::Phi;
+-			});
+-			if (contains_phi) {
++		// A value is collected once; one reached again on its own path closes a cycle, which is fine through a
++		// phi (m_phis[d] counts the phis above depth d) and an error otherwise.
++		const auto [state, fresh] = m_states.try_emplace(inst, static_cast<uint32_t>(m_phis.size() - 1));
++		if (!fresh) {
++			if (state->second == Collected || m_phis.back() > m_phis[state->second]) {
+ 				return;
+ 			}
+ 			Fail(use_pc, fmt::format("cyclic typed planning value {} without a phi",
+ 			                         ValueOpcodeName(inst->GetOpcode())));
+ 		}
+-		if (std::ranges::find(m_visited, inst) != m_visited.end()) {
+-			return;
+-		}
+-		m_visiting.push_back(inst);
++		auto& depth = state->second;
++		m_phis.push_back(m_phis.back() + (inst->GetOpcode() == ValueOpcode::Phi ? 1 : 0));
+ 		for (size_t index = 0; index < inst->NumArgs(); index++) {
+ 			Collect(inst->Arg(index), use_pc);
+ 		}
+-		m_visiting.pop_back();
+-		m_visited.push_back(inst);
++		m_phis.pop_back();
++		depth = Collected;
+ 		if (!IsRawRead(m_program, *inst)) {
+ 			return;
+ 		}
+@@ -504,7 +501,10 @@ private:
+ 			}
+ 			return;
+ 		}
+-		for (uint32_t slot = 0; slot < m_program.srt_reads.size(); slot++) {
++		// Only reads of one structural hash can be equivalent; within it the earliest slot wins, as
++		// when every read was compared (big compute shaders: thousands of reads, 100+ ms a translation).
++		auto& bucket = m_buckets[StructuralHash(value)];
++		for (const auto slot: bucket) {
+ 			if (EquivalentValue(m_program, value, m_program.srt_reads[slot].value)) {
+ 				m_patches.push_back({inst, slot, false});
+ 				return;
+@@ -512,15 +512,49 @@ private:
+ 		}
+ 		const auto slot = static_cast<uint32_t>(m_program.srt_reads.size());
+ 		m_program.srt_reads.push_back({value, slot});
++		bucket.push_back(slot);
+ 		m_patches.push_back({inst, slot, true});
+ 	}
+ 
++	// Equal for every pair EquivalentValue accepts: it hashes only what that compares (opcode, type,
++	// argument count, immediates, arguments; a phi's blocks, not its arguments, so no cycle is followed).
++	uint64_t StructuralHash(Value value) {
++		const auto mix = [](uint64_t hash, uint64_t part) {
++			return hash ^ (part + 0x9e3779b97f4a7c15ull + (hash << 6u) + (hash >> 2u));
++		};
++		value           = value.Resolve();
++		const auto type = static_cast<uint64_t>(value.GetType());
++		if (value.IsImmediate()) {
++			return mix(type, value.GetType() == Type::U32 ? value.U32() : value.GetType() == Type::U64 ? value.U64() : 0);
++		}
++		const auto* inst = value.TryInstruction();
++		if (inst == nullptr) {
++			return type;
++		}
++		if (const auto found = m_hashes.find(inst); found != m_hashes.end()) {
++			return found->second;
++		}
++		auto hash = mix(mix(type, static_cast<uint64_t>(inst->GetOpcode())), inst->NumArgs());
++		for (size_t index = 0; index < inst->NumArgs(); index++) {
++			hash = mix(hash, inst->GetOpcode() == ValueOpcode::Phi ? reinterpret_cast<uintptr_t>(inst->PhiBlock(index))
++			                                                         : StructuralHash(inst->Arg(index)));
++		}
++		m_hashes.emplace(inst, hash);
++		return hash;
++	}
++
+ 	void PatchReads() {
++		// Each patched read's place in its block, found in one pass (inserting keeps list positions valid).
++		std::unordered_map<const Inst*, decltype(m_program.blocks.front()->Instructions().begin())> places;
++		for (const auto& patch: m_patches) places.emplace(patch.inst, decltype(places)::mapped_type {});
++		for (auto* block: m_program.blocks) {
++			auto& list = block->Instructions();
++			for (auto it = list.begin(); it != list.end(); ++it)
++				if (const auto place = places.find(&*it); place != places.end()) place->second = it;
++		}
+ 		for (const auto& patch: m_patches) {
+ 			auto* block = patch.inst->Parent();
+-			auto& list  = block->Instructions();
+-			auto  where =
+-			    std::ranges::find_if(list, [&](const Inst& inst) { return &inst == patch.inst; });
++			auto  where = places.at(patch.inst);
+ 			const auto resource =
+ 			    Value(&*block->PrependNewInst(where, ValueOpcode::GetSrtResource));
+ 			const auto flat = Value(&*block->PrependNewInst(where, ValueOpcode::ReadConst,
+@@ -547,10 +581,14 @@ private:
+ 		}
+ 	}
+ 
+-	Program&           m_program;
+-	std::vector<Inst*> m_visiting;
+-	std::vector<Inst*> m_visited;
+-	std::vector<Patch> m_patches;
++	static constexpr uint32_t Collected = UINT32_MAX;
++
++	Program&                                                m_program;
++	std::unordered_map<const Inst*, uint32_t>               m_states; // depth on the path, or Collected
++	std::vector<uint32_t>                                   m_phis {0};
++	std::vector<Patch>                                      m_patches;
++	std::unordered_map<uint64_t, std::vector<uint32_t>>     m_buckets; // srt_reads slots by StructuralHash
++	std::unordered_map<const Inst*, uint64_t>               m_hashes;
+ };
+ 
+ // Entries live only for one evaluation. Open addressing avoids allocating a
+diff --git a/src/local/proven-gpu-worker.h b/src/local/proven-gpu-worker.h
+new file mode 100644
+index 0000000..7bce813
+--- /dev/null
++++ b/src/local/proven-gpu-worker.h
+@@ -0,0 +1,92 @@
++#pragma once
++#if defined(_WIN32) && defined(KYTY_B32_FAST_CPU_SETS)
++#ifndef NOMINMAX
++#define NOMINMAX
++#endif
++#include <windows.h>
++#include <algorithm>
++#include <cstddef>
++#include <cstdlib>
++#include <vector>
++#include "common/logging/log.h"
++#endif
++#if defined(_WIN32) && defined(KYTY_B32_FAST_CPU_SETS)
++static void PreferFastCpuSetsForGpuWorker() {
++	const char* setting = std::getenv("KYTY_B32_FAST_CPU_SETS");
++	if (setting != nullptr && setting[0] == '0' && setting[1] == '\0') {
++		LOGF("Build32 GPU worker CPU sets: disabled by environment\n");
++		return;
++	}
++	// The GPU command worker is on the frame's critical path. Raise only this
++	// thread within the normal process priority class; never use real-time mode.
++	const char* priority_setting = std::getenv("KYTY_B32_GPU_PRIORITY");
++	if (priority_setting != nullptr && priority_setting[0] == '0' &&
++	    priority_setting[1] == '\0') {
++		LOGF("Build32 GPU worker priority: disabled by environment\n");
++	} else {
++		const BOOL applied = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
++		LOGF("Build32 GPU worker priority: requested=highest applied=%u current=%d\n",
++		     static_cast<unsigned>(applied != 0), GetThreadPriority(GetCurrentThread()));
++	}
++	THREAD_POWER_THROTTLING_STATE qos {};
++	qos.Version     = THREAD_POWER_THROTTLING_CURRENT_VERSION;
++	qos.ControlMask = THREAD_POWER_THROTTLING_EXECUTION_SPEED;
++	qos.StateMask   = 0;
++	const BOOL qos_applied = SetThreadInformation(GetCurrentThread(), ThreadPowerThrottling,
++	                                               &qos, sizeof(qos));
++	LOGF("Build32 GPU worker full-speed QoS: applied=%u\n",
++	     static_cast<unsigned>(qos_applied != 0));
++	ULONG bytes = 0;
++	(void)GetSystemCpuSetInformation(nullptr, 0, &bytes, GetCurrentProcess(), 0);
++	if (bytes < sizeof(SYSTEM_CPU_SET_INFORMATION) || bytes > 1024 * 1024) {
++		LOGF("Build32 GPU worker CPU sets: enumeration unavailable\n");
++		return;
++	}
++	std::vector<std::max_align_t> storage(
++	    (bytes + sizeof(std::max_align_t) - 1) / sizeof(std::max_align_t));
++	ULONG returned = 0;
++	if (!GetSystemCpuSetInformation(
++	        reinterpret_cast<PSYSTEM_CPU_SET_INFORMATION>(storage.data()),
++	        static_cast<ULONG>(storage.size() * sizeof(std::max_align_t)), &returned,
++	        GetCurrentProcess(), 0) || returned > storage.size() * sizeof(std::max_align_t)) {
++		LOGF("Build32 GPU worker CPU sets: enumeration failed\n");
++		return;
++	}
++	struct Candidate { ULONG id; BYTE efficiency; bool parked; };
++	std::vector<Candidate> candidates;
++	BYTE slowest = 255, fastest = 0;
++	const auto* data = reinterpret_cast<const unsigned char*>(storage.data());
++	for (size_t offset = 0; offset + sizeof(SYSTEM_CPU_SET_INFORMATION) <= returned;) {
++		const auto* info = reinterpret_cast<const SYSTEM_CPU_SET_INFORMATION*>(data + offset);
++		if (info->Size < sizeof(SYSTEM_CPU_SET_INFORMATION) || info->Size > returned - offset)
++			break;
++		if (info->Type == CpuSetInformation) {
++			const BYTE flags = info->CpuSet.AllFlags;
++			if ((flags & 0x08u) == 0 && ((flags & 0x02u) == 0 || (flags & 0x04u) != 0)) {
++				const auto efficiency = info->CpuSet.EfficiencyClass;
++				candidates.push_back({info->CpuSet.Id, efficiency, (flags & 0x01u) != 0});
++				slowest = std::min(slowest, efficiency);
++				fastest = std::max(fastest, efficiency);
++			}
++		}
++		offset += info->Size;
++	}
++	if (candidates.empty() || fastest == slowest) {
++		LOGF("Build32 GPU worker CPU sets: uniform or unavailable, OS scheduling retained\n");
++		return;
++	}
++	std::vector<ULONG> selected;
++	for (const auto& cpu: candidates) {
++		if (cpu.efficiency == fastest && !cpu.parked) selected.push_back(cpu.id);
++	}
++	if (selected.empty()) {
++		LOGF("Build32 GPU worker CPU sets: fast cores parked, OS scheduling retained\n");
++		return;
++	}
++	const BOOL applied = SetThreadSelectedCpuSets(GetCurrentThread(), selected.data(),
++	                                              static_cast<ULONG>(selected.size()));
++	LOGF("Build32 GPU worker CPU sets: eligible=%zu selected=%zu classes=%u..%u applied=%u\n",
++	     candidates.size(), selected.size(), static_cast<unsigned>(slowest),
++	     static_cast<unsigned>(fastest), static_cast<unsigned>(applied != 0));
++}
++#endif
+diff --git a/tests/ComputeFrontendCacheTests.cpp b/tests/ComputeFrontendCacheTests.cpp
+new file mode 100644
+index 0000000..2190f45
+--- /dev/null
++++ b/tests/ComputeFrontendCacheTests.cpp
+@@ -0,0 +1,50 @@
++#include "graphics/shader/recompiler/frontend/ComputeFrontendCache.h"
++#include <atomic>
++#include <cstdio>
++#include <cstdlib>
++#include <thread>
++
++using namespace Libs::Graphics::ShaderRecompiler;
++namespace Cache = FrontendCache;
++static void Check(bool condition, const char* message) {
++    if (!condition) { std::fprintf(stderr, "%s\n", message); std::abort(); }
++}
++int main() {
++    std::vector<uint32_t> code {1, 2, 3}, equivalent {1, 2, 3}, collision {1, 2, 4};
++    Decoder::Program input;
++    input.instructions.resize(1);
++    input.instructions[0].pc = 12;
++    CFG::Graph graph;
++    graph.entry_block = 17;
++    Cache::RememberComputeFrontend(code, 42, input, graph, true, "fallback");
++    Decoder::Program output;
++    CFG::Graph result;
++    bool fallback = false;
++    std::string reason;
++    Check(Cache::FindCachedComputeFrontend(equivalent, 42, output, result, fallback, reason), "Equivalent source missed the cache");
++    Check(output.code.data() == equivalent.data(), "Cached decode retains the wrong source lifetime");
++    Check(output.instructions[0].pc == 12 && result.entry_block == 17 && fallback && reason == "fallback", "Cached frontend lost its graph or fallback state");
++    Check(!Cache::FindCachedComputeFrontend(collision, 42, output, result, fallback, reason), "Hash collision reused a different shader");
++    Check(!Cache::FindCachedComputeFrontend(code, 43, output, result, fallback, reason), "Different shader identity reused the cache");
++    output.instructions[0].pc = 99;
++    result.entry_block = 99;
++    Check(Cache::FindCachedComputeFrontend(code, 42, output, result, fallback, reason) && output.instructions[0].pc == 12 && result.entry_block == 17, "Mutating a returned graph changed the stored frontend");
++    std::atomic<bool> valid {true};
++    std::vector<std::thread> threads;
++    for (int i = 0; i < 4; ++i) threads.emplace_back([&] {
++        for (int n = 0; n < 100; ++n) {
++            Decoder::Program copy; CFG::Graph cfg; bool dispatch = false; std::string why;
++            if (!Cache::FindCachedComputeFrontend(code, 42, copy, cfg, dispatch, why) || copy.instructions[0].pc != 12) valid.store(false);
++        }
++    });
++    for (auto& thread : threads) thread.join();
++    Check(valid.load(), "Parallel shader warmup reads changed frontend data");
++    for (size_t i = 0; i < Cache::MaxCachedComputeFrontends; ++i) {
++        std::vector<uint32_t> other {static_cast<uint32_t>(i + 100)};
++        Cache::RememberComputeFrontend(other, i + 100, input, graph, false, "");
++    }
++    Check(Cache::g_compute_frontends.size() == Cache::MaxCachedComputeFrontends, "Frontend cache exceeded its entry cap");
++    Check(Cache::g_compute_frontend_bytes <= Cache::MaxCachedComputeFrontendBytes, "Frontend cache exceeded its estimated byte cap");
++    Check(!Cache::FindCachedComputeFrontend(code, 42, output, result, fallback, reason), "Old frontend was not evicted at the cache limit");
++    std::puts("Frontend cache identity, lifetime, graph isolation, concurrency and eviction passed");
++}
