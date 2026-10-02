@@ -1,0 +1,439 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 9dbd00e..37f8fea 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -868,3 +868,9 @@ endif()
+ if(KYTY_CLANG_CL)
+ 	install(FILES "${KYTY_THIRD_PARTY_DIR}/winpthread/bin/libwinpthread-1.dll" DESTINATION .)
+ endif()
++
++# Ported #103 frontend cache: CPU-only lifetime, identity and eviction checks.
++find_package(Threads REQUIRED)
++add_executable(compute_frontend_cache_tests EXCLUDE_FROM_ALL tests/ComputeFrontendCacheTests.cpp)
++target_link_libraries(compute_frontend_cache_tests PRIVATE Threads::Threads)
++add_test(NAME compute_frontend_cache COMMAND compute_frontend_cache_tests)
+diff --git a/src/graphics/guest_gpu/graphicsRun.cpp b/src/graphics/guest_gpu/graphicsRun.cpp
+index 23159fa..03ba947 100644
+--- a/src/graphics/guest_gpu/graphicsRun.cpp
++++ b/src/graphics/guest_gpu/graphicsRun.cpp
+@@ -28,6 +28,7 @@
+ #include "frame-capture.h"
+ #include "live-control.h"
+ #include "performance-switches.h"
++#include "proven-gpu-worker.h"
+ #include "xpr-capture.h"
+ #ifdef KYTY_LOCAL_VULKAN_RECORDING
+ #include "vulkan-recording.h"
+@@ -543,6 +544,9 @@ void GuestGpu::ThreadRun(void* data) {
+ 	g_gpu_state  = gpu;
+ 	LiveTrace::g_mark_thread = true;
+ 	InitializePerformanceSwitches();
++#if defined(_WIN32) && defined(KYTY_B32_FAST_CPU_SETS)
++	PreferFastCpuSetsForGpuWorker();
++#endif
+ 	LiveControl::Start();
+ 	XprCapture::Initialize();
+ #ifdef KYTY_LOCAL_VULKAN_RECORDING
+diff --git a/src/graphics/shader/recompiler/ShaderRecompiler.cpp b/src/graphics/shader/recompiler/ShaderRecompiler.cpp
+index 1b63474..53c61f0 100644
+--- a/src/graphics/shader/recompiler/ShaderRecompiler.cpp
++++ b/src/graphics/shader/recompiler/ShaderRecompiler.cpp
+@@ -4,6 +4,7 @@
+ #include "common/logging/log.h"
+ #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
+ #include "graphics/shader/recompiler/frontend/cfg/ShaderCFG.h"
++#include "graphics/shader/recompiler/frontend/ComputeFrontendCache.h"
+ #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
+ #include "graphics/shader/recompiler/frontend/translate/Translate.h"
+ #include "graphics/shader/recompiler/ir/ShaderIR.h"
+@@ -29,6 +30,12 @@
+ #include <span>
+ #include <utility>
+ 
++#if defined(KYTY_B32_QUIET_SHADER_PHASES)
++#define B32_PHASE_LOG(...) ((void)0)
++#else
++#define B32_PHASE_LOG(...) LOGF(__VA_ARGS__)
++#endif
++
+ namespace Libs::Graphics::ShaderRecompiler {
+ 
+ namespace {
+@@ -587,20 +594,28 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
+ 		                                 .count());
+ 	};
+ 
+-	LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " code_words=%" PRIu64 " decode\n",
++	B32_PHASE_LOG("%s phase begin: stage=%s hash=0x%016" PRIx64 " code_words=%" PRIu64 " decode\n",
+ 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
+ 	     static_cast<uint64_t>(code.size()));
+ 
+ 	Decoder::Program decoded;
++	CFG::Graph cfg;
++	bool dispatcher_fallback = false;
++	std::string dispatcher_reason;
++	const bool cache_eligible = options.stage == ShaderType::Compute && options.back_code.empty();
++	const bool frontend_hit = cache_eligible && FrontendCache::FindCachedComputeFrontend(
++	    code, options.shader_hash, decoded, cfg, dispatcher_fallback, dispatcher_reason);
+ 	std::vector<uint32_t> joined_code;
+-	if (!options.back_code.empty()) {
+-		decoded = DecodeFusedProgram(code, options.back_code, joined_code);
+-	} else {
+-		Decoder::DecodeProgram(code, decoded);
++	if (!frontend_hit) {
++		if (!options.back_code.empty()) {
++			decoded = DecodeFusedProgram(code, options.back_code, joined_code);
++		} else {
++			Decoder::DecodeProgram(code, decoded);
++		}
+ 	}
+ 	DumpDecodedShader(options, joined_code.empty() ? code : std::span<const uint32_t> {joined_code},
+ 	                  decoded);
+-	LOGF("%s phase end: stage=%s hash=0x%016" PRIx64 " decode instructions=%" PRIu64
++	B32_PHASE_LOG("%s phase end: stage=%s hash=0x%016" PRIx64 " decode instructions=%" PRIu64
+ 	     " elapsed_ms=%" PRIu64 "\n",
+ 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
+ 	     static_cast<uint64_t>(decoded.instructions.size()), phase_ms());
+@@ -613,23 +628,24 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
+ 		}
+ 	}
+ 
+-	LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " CFG BuildGraph\n", GetDumpLabel(options),
++	B32_PHASE_LOG("%s phase begin: stage=%s hash=0x%016" PRIx64 " CFG BuildGraph\n", GetDumpLabel(options),
+ 	     StageName(options.stage), options.shader_hash);
+-	auto cfg = CFG::BuildGraph(decoded);
+-	LOGF("%s phase end: stage=%s hash=0x%016" PRIx64 " CFG BuildGraph blocks=%" PRIu64
++	if (!frontend_hit) cfg = CFG::BuildGraph(decoded);
++	B32_PHASE_LOG("%s phase end: stage=%s hash=0x%016" PRIx64 " CFG BuildGraph blocks=%" PRIu64
+ 	     " loops=%" PRIu64 " back_edges=%" PRIu64 " elapsed_ms=%" PRIu64 "\n",
+ 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
+ 	     static_cast<uint64_t>(cfg.blocks.size()), static_cast<uint64_t>(cfg.natural_loops.size()),
+ 	     static_cast<uint64_t>(cfg.back_edges.size()), phase_ms());
+-	bool        dispatcher_fallback = false;
+-	std::string dispatcher_reason;
+-	if (cfg.irreducible) {
++	if (frontend_hit) {
++		// Reuse the previously structured graph; later resource processing still
++		// runs with this invocation's inputs.
++	} else if (cfg.irreducible) {
+ 		dispatcher_fallback = true;
+ 		dispatcher_reason   = cfg.unsupported_reason;
+ 		LogDispatcherFallback(options, cfg, "build", dispatcher_reason);
+ 	} else {
+ 		const auto unstructured_cfg = cfg;
+-		LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " CFG Structurize\n",
++		B32_PHASE_LOG("%s phase begin: stage=%s hash=0x%016" PRIx64 " CFG Structurize\n",
+ 		     GetDumpLabel(options), StageName(options.stage), options.shader_hash);
+ 		if (!CFG::Structurize(cfg)) {
+ 			dispatcher_fallback      = true;
+@@ -643,10 +659,10 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
+ 			cfg.failure_block      = failure_block;
+ 			cfg.unsupported_reason = dispatcher_reason;
+ 		} else {
+-			LOGF("%s structured CFG success: blocks=%" PRIu64 "\n", GetDumpLabel(options),
++			B32_PHASE_LOG("%s structured CFG success: blocks=%" PRIu64 "\n", GetDumpLabel(options),
+ 			     static_cast<uint64_t>(cfg.blocks.size()));
+ 		}
+-		LOGF("%s phase end: stage=%s hash=0x%016" PRIx64 " CFG Structurize blocks=%" PRIu64
++		B32_PHASE_LOG("%s phase end: stage=%s hash=0x%016" PRIx64 " CFG Structurize blocks=%" PRIu64
+ 		     " loops=%" PRIu64 " elapsed_ms=%" PRIu64 "\n",
+ 		     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
+ 		     static_cast<uint64_t>(cfg.blocks.size()),
+@@ -693,10 +709,10 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
+ 	    .compute             = compute,
+ 	    .embedded_fetch      = embedded_fetch.loads.empty() ? nullptr : &embedded_fetch,
+ 	};
+-	LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " IR TranslateProgram\n",
++	B32_PHASE_LOG("%s phase begin: stage=%s hash=0x%016" PRIx64 " IR TranslateProgram\n",
+ 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash);
+ 	auto ir = Frontend::TranslateProgram(decoded, cfg, translate_options);
+-	LOGF("%s phase end: stage=%s hash=0x%016" PRIx64 " IR TranslateProgram blocks=%" PRIu64
++	B32_PHASE_LOG("%s phase end: stage=%s hash=0x%016" PRIx64 " IR TranslateProgram blocks=%" PRIu64
+ 	     " elapsed_ms=%" PRIu64 "\n",
+ 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
+ 	     static_cast<uint64_t>(ir.blocks.size()), phase_ms());
+@@ -732,6 +748,10 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
+ 	}
+ 	IR::TrackResources(ir);
+ 	IR::EliminateDeadCode(ir.blocks);
++	if (cache_eligible && !frontend_hit && phase_ms() >= 16) {
++		FrontendCache::RememberComputeFrontend(code, options.shader_hash, decoded, cfg,
++		                                      dispatcher_fallback, dispatcher_reason);
++	}
+ 	TranslateResult result;
+ 	result.program = std::move(ir);
+ 	if (options.dump_ir) {
+@@ -777,10 +797,10 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
+ 		}
+ 	}
+ 
+-	LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " SPIR-V EmitProgram\n",
++	B32_PHASE_LOG("%s phase begin: stage=%s hash=0x%016" PRIx64 " SPIR-V EmitProgram\n",
+ 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash);
+ 	auto spirv = Spirv::EmitProgram(ir, options.input_info);
+-	LOGF("%s phase end: stage=%s hash=0x%016" PRIx64 " SPIR-V EmitProgram words=%" PRIu64
++	B32_PHASE_LOG("%s phase end: stage=%s hash=0x%016" PRIx64 " SPIR-V EmitProgram words=%" PRIu64
+ 	     " elapsed_ms=%" PRIu64 "\n",
+ 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
+ 	     static_cast<uint64_t>(spirv.size()),
+diff --git a/src/graphics/shader/recompiler/frontend/ComputeFrontendCache.h b/src/graphics/shader/recompiler/frontend/ComputeFrontendCache.h
+new file mode 100644
+index 0000000..44090c8
+--- /dev/null
++++ b/src/graphics/shader/recompiler/frontend/ComputeFrontendCache.h
+@@ -0,0 +1,70 @@
++#pragma once
++#include "graphics/shader/recompiler/frontend/cfg/ShaderCFG.h"
++#include <algorithm>
++#include <deque>
++#include <mutex>
++#include <span>
++#include <string>
++#include <vector>
++namespace Libs::Graphics::ShaderRecompiler::FrontendCache {
++struct CachedComputeFrontend {
++	uint64_t shader_hash = 0;
++	std::vector<uint32_t> code;
++	std::vector<Decoder::Instruction> instructions;
++	CFG::Graph graph;
++	bool dispatcher_fallback = false;
++	std::string dispatcher_reason;
++	size_t estimated_bytes = 0;
++};
++
++inline std::mutex g_compute_frontend_mutex;
++inline std::deque<CachedComputeFrontend> g_compute_frontends;
++constexpr size_t MaxCachedComputeFrontends = 512;
++constexpr size_t MaxCachedComputeFrontendBytes = 256ull * 1024 * 1024;
++inline size_t g_compute_frontend_bytes = 0;
++
++inline bool FindCachedComputeFrontend(std::span<const uint32_t> code, uint64_t hash,
++                               Decoder::Program& decoded, CFG::Graph& graph,
++                               bool& dispatcher_fallback, std::string& dispatcher_reason) {
++	std::lock_guard lock(g_compute_frontend_mutex);
++	for (auto& entry: g_compute_frontends) {
++		if (entry.shader_hash != hash || entry.code.size() != code.size() ||
++		    !std::equal(entry.code.begin(), entry.code.end(), code.begin())) {
++			continue;
++		}
++		decoded.code = code;
++		decoded.instructions = entry.instructions;
++		graph = entry.graph;
++		dispatcher_fallback = entry.dispatcher_fallback;
++		dispatcher_reason = entry.dispatcher_reason;
++		return true;
++	}
++	return false;
++}
++
++inline void RememberComputeFrontend(std::span<const uint32_t> code, uint64_t hash,
++                             const Decoder::Program& decoded, const CFG::Graph& graph,
++                             bool dispatcher_fallback, const std::string& dispatcher_reason) {
++	if (code.size() > 16384) {
++		return;
++	}
++	// Conservatively account for nested CFG vectors as well as instruction storage.
++	const size_t estimated_bytes = code.size() * sizeof(uint32_t) +
++	    decoded.instructions.size() * sizeof(Decoder::Instruction) +
++	    graph.blocks.size() * sizeof(CFG::BasicBlock) * 4;
++	if (estimated_bytes > MaxCachedComputeFrontendBytes) {
++		return;
++	}
++	std::lock_guard lock(g_compute_frontend_mutex);
++	while (!g_compute_frontends.empty() &&
++	       (g_compute_frontends.size() >= MaxCachedComputeFrontends ||
++	        g_compute_frontend_bytes > MaxCachedComputeFrontendBytes - estimated_bytes)) {
++		g_compute_frontend_bytes -= g_compute_frontends.front().estimated_bytes;
++		g_compute_frontends.pop_front();
++	}
++	g_compute_frontends.push_back({hash, {code.begin(), code.end()}, decoded.instructions,
++	                               graph, dispatcher_fallback, dispatcher_reason, estimated_bytes});
++	g_compute_frontend_bytes += estimated_bytes;
++}
++}
++
+diff --git a/src/graphics/shader/recompiler/ir/passes/SrtWalker.cpp b/src/graphics/shader/recompiler/ir/passes/SrtWalker.cpp
+index 4d267aa..b7eb1cd 100644
+--- a/src/graphics/shader/recompiler/ir/passes/SrtWalker.cpp
++++ b/src/graphics/shader/recompiler/ir/passes/SrtWalker.cpp
+@@ -484,7 +484,7 @@ private:
+ 			Fail(use_pc, fmt::format("cyclic typed planning value {} without a phi",
+ 			                         ValueOpcodeName(inst->GetOpcode())));
+ 		}
+-		if (std::ranges::find(m_visited, inst) != m_visited.end()) {
++		if (m_visited.contains(inst)) {
+ 			return;
+ 		}
+ 		m_visiting.push_back(inst);
+@@ -492,7 +492,7 @@ private:
+ 			Collect(inst->Arg(index), use_pc);
+ 		}
+ 		m_visiting.pop_back();
+-		m_visited.push_back(inst);
++		m_visited.insert(inst);
+ 		if (!IsRawRead(m_program, *inst)) {
+ 			return;
+ 		}
+@@ -549,7 +549,7 @@ private:
+ 
+ 	Program&           m_program;
+ 	std::vector<Inst*> m_visiting;
+-	std::vector<Inst*> m_visited;
++	std::unordered_set<Inst*> m_visited;
+ 	std::vector<Patch> m_patches;
+ };
+ 
+diff --git a/src/local/proven-gpu-worker.h b/src/local/proven-gpu-worker.h
+new file mode 100644
+index 0000000..7bce813
+--- /dev/null
++++ b/src/local/proven-gpu-worker.h
+@@ -0,0 +1,92 @@
++#pragma once
++#if defined(_WIN32) && defined(KYTY_B32_FAST_CPU_SETS)
++#ifndef NOMINMAX
++#define NOMINMAX
++#endif
++#include <windows.h>
++#include <algorithm>
++#include <cstddef>
++#include <cstdlib>
++#include <vector>
++#include "common/logging/log.h"
++#endif
++#if defined(_WIN32) && defined(KYTY_B32_FAST_CPU_SETS)
++static void PreferFastCpuSetsForGpuWorker() {
++	const char* setting = std::getenv("KYTY_B32_FAST_CPU_SETS");
++	if (setting != nullptr && setting[0] == '0' && setting[1] == '\0') {
++		LOGF("Build32 GPU worker CPU sets: disabled by environment\n");
++		return;
++	}
++	// The GPU command worker is on the frame's critical path. Raise only this
++	// thread within the normal process priority class; never use real-time mode.
++	const char* priority_setting = std::getenv("KYTY_B32_GPU_PRIORITY");
++	if (priority_setting != nullptr && priority_setting[0] == '0' &&
++	    priority_setting[1] == '\0') {
++		LOGF("Build32 GPU worker priority: disabled by environment\n");
++	} else {
++		const BOOL applied = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
++		LOGF("Build32 GPU worker priority: requested=highest applied=%u current=%d\n",
++		     static_cast<unsigned>(applied != 0), GetThreadPriority(GetCurrentThread()));
++	}
++	THREAD_POWER_THROTTLING_STATE qos {};
++	qos.Version     = THREAD_POWER_THROTTLING_CURRENT_VERSION;
++	qos.ControlMask = THREAD_POWER_THROTTLING_EXECUTION_SPEED;
++	qos.StateMask   = 0;
++	const BOOL qos_applied = SetThreadInformation(GetCurrentThread(), ThreadPowerThrottling,
++	                                               &qos, sizeof(qos));
++	LOGF("Build32 GPU worker full-speed QoS: applied=%u\n",
++	     static_cast<unsigned>(qos_applied != 0));
++	ULONG bytes = 0;
++	(void)GetSystemCpuSetInformation(nullptr, 0, &bytes, GetCurrentProcess(), 0);
++	if (bytes < sizeof(SYSTEM_CPU_SET_INFORMATION) || bytes > 1024 * 1024) {
++		LOGF("Build32 GPU worker CPU sets: enumeration unavailable\n");
++		return;
++	}
++	std::vector<std::max_align_t> storage(
++	    (bytes + sizeof(std::max_align_t) - 1) / sizeof(std::max_align_t));
++	ULONG returned = 0;
++	if (!GetSystemCpuSetInformation(
++	        reinterpret_cast<PSYSTEM_CPU_SET_INFORMATION>(storage.data()),
++	        static_cast<ULONG>(storage.size() * sizeof(std::max_align_t)), &returned,
++	        GetCurrentProcess(), 0) || returned > storage.size() * sizeof(std::max_align_t)) {
++		LOGF("Build32 GPU worker CPU sets: enumeration failed\n");
++		return;
++	}
++	struct Candidate { ULONG id; BYTE efficiency; bool parked; };
++	std::vector<Candidate> candidates;
++	BYTE slowest = 255, fastest = 0;
++	const auto* data = reinterpret_cast<const unsigned char*>(storage.data());
++	for (size_t offset = 0; offset + sizeof(SYSTEM_CPU_SET_INFORMATION) <= returned;) {
++		const auto* info = reinterpret_cast<const SYSTEM_CPU_SET_INFORMATION*>(data + offset);
++		if (info->Size < sizeof(SYSTEM_CPU_SET_INFORMATION) || info->Size > returned - offset)
++			break;
++		if (info->Type == CpuSetInformation) {
++			const BYTE flags = info->CpuSet.AllFlags;
++			if ((flags & 0x08u) == 0 && ((flags & 0x02u) == 0 || (flags & 0x04u) != 0)) {
++				const auto efficiency = info->CpuSet.EfficiencyClass;
++				candidates.push_back({info->CpuSet.Id, efficiency, (flags & 0x01u) != 0});
++				slowest = std::min(slowest, efficiency);
++				fastest = std::max(fastest, efficiency);
++			}
++		}
++		offset += info->Size;
++	}
++	if (candidates.empty() || fastest == slowest) {
++		LOGF("Build32 GPU worker CPU sets: uniform or unavailable, OS scheduling retained\n");
++		return;
++	}
++	std::vector<ULONG> selected;
++	for (const auto& cpu: candidates) {
++		if (cpu.efficiency == fastest && !cpu.parked) selected.push_back(cpu.id);
++	}
++	if (selected.empty()) {
++		LOGF("Build32 GPU worker CPU sets: fast cores parked, OS scheduling retained\n");
++		return;
++	}
++	const BOOL applied = SetThreadSelectedCpuSets(GetCurrentThread(), selected.data(),
++	                                              static_cast<ULONG>(selected.size()));
++	LOGF("Build32 GPU worker CPU sets: eligible=%zu selected=%zu classes=%u..%u applied=%u\n",
++	     candidates.size(), selected.size(), static_cast<unsigned>(slowest),
++	     static_cast<unsigned>(fastest), static_cast<unsigned>(applied != 0));
++}
++#endif
+diff --git a/tests/ComputeFrontendCacheTests.cpp b/tests/ComputeFrontendCacheTests.cpp
+new file mode 100644
+index 0000000..2190f45
+--- /dev/null
++++ b/tests/ComputeFrontendCacheTests.cpp
+@@ -0,0 +1,50 @@
++#include "graphics/shader/recompiler/frontend/ComputeFrontendCache.h"
++#include <atomic>
++#include <cstdio>
++#include <cstdlib>
++#include <thread>
++
++using namespace Libs::Graphics::ShaderRecompiler;
++namespace Cache = FrontendCache;
++static void Check(bool condition, const char* message) {
++    if (!condition) { std::fprintf(stderr, "%s\n", message); std::abort(); }
++}
++int main() {
++    std::vector<uint32_t> code {1, 2, 3}, equivalent {1, 2, 3}, collision {1, 2, 4};
++    Decoder::Program input;
++    input.instructions.resize(1);
++    input.instructions[0].pc = 12;
++    CFG::Graph graph;
++    graph.entry_block = 17;
++    Cache::RememberComputeFrontend(code, 42, input, graph, true, "fallback");
++    Decoder::Program output;
++    CFG::Graph result;
++    bool fallback = false;
++    std::string reason;
++    Check(Cache::FindCachedComputeFrontend(equivalent, 42, output, result, fallback, reason), "Equivalent source missed the cache");
++    Check(output.code.data() == equivalent.data(), "Cached decode retains the wrong source lifetime");
++    Check(output.instructions[0].pc == 12 && result.entry_block == 17 && fallback && reason == "fallback", "Cached frontend lost its graph or fallback state");
++    Check(!Cache::FindCachedComputeFrontend(collision, 42, output, result, fallback, reason), "Hash collision reused a different shader");
++    Check(!Cache::FindCachedComputeFrontend(code, 43, output, result, fallback, reason), "Different shader identity reused the cache");
++    output.instructions[0].pc = 99;
++    result.entry_block = 99;
++    Check(Cache::FindCachedComputeFrontend(code, 42, output, result, fallback, reason) && output.instructions[0].pc == 12 && result.entry_block == 17, "Mutating a returned graph changed the stored frontend");
++    std::atomic<bool> valid {true};
++    std::vector<std::thread> threads;
++    for (int i = 0; i < 4; ++i) threads.emplace_back([&] {
++        for (int n = 0; n < 100; ++n) {
++            Decoder::Program copy; CFG::Graph cfg; bool dispatch = false; std::string why;
++            if (!Cache::FindCachedComputeFrontend(code, 42, copy, cfg, dispatch, why) || copy.instructions[0].pc != 12) valid.store(false);
++        }
++    });
++    for (auto& thread : threads) thread.join();
++    Check(valid.load(), "Parallel shader warmup reads changed frontend data");
++    for (size_t i = 0; i < Cache::MaxCachedComputeFrontends; ++i) {
++        std::vector<uint32_t> other {static_cast<uint32_t>(i + 100)};
++        Cache::RememberComputeFrontend(other, i + 100, input, graph, false, "");
++    }
++    Check(Cache::g_compute_frontends.size() == Cache::MaxCachedComputeFrontends, "Frontend cache exceeded its entry cap");
++    Check(Cache::g_compute_frontend_bytes <= Cache::MaxCachedComputeFrontendBytes, "Frontend cache exceeded its estimated byte cap");
++    Check(!Cache::FindCachedComputeFrontend(code, 42, output, result, fallback, reason), "Old frontend was not evicted at the cache limit");
++    std::puts("Frontend cache identity, lifetime, graph isolation, concurrency and eviction passed");
++}
