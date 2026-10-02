@@ -1,0 +1,72 @@
+--- a/src/local/native-xpr.inc
++++ b/src/local/native-xpr.inc
+@@ -557,7 +557,8 @@
+ 		vk::DescriptorPool pool;
+ 		vk::DescriptorSet  set;
+ 	};
+-	static constexpr size_t FreeSetsPerLayout = 32, FreeSetsMax = 2048;
++	// Keep retired sets for camera-turn rebinding instead of freeing and allocating them again.
++	static constexpr size_t FreeSetsPerLayout = 2048, FreeSetsMax = 16384;
+ 	std::unordered_map<VkDescriptorSetLayout, std::vector<FreeSet>> free_sets;
+ 	std::unordered_map<VkDescriptorSet, VkDescriptorSetLayout>      set_layouts;
+ 	size_t                                                          free_count = 0;
+@@ -2795,6 +2796,12 @@
+ 	                        emit.index_type == index_type;
+ 	std::pair<Buffer*, uint64_t> indices {};
+ 	if (!same_index) {
++		// Clean a CPU-written index range once; subsequent guest writes make it dirty again.
++		// GPU-written indices retain the existing synchronization path.
++		if (index_bytes <= BufferCache::CACHING_PAGESIZE &&
++		    buffer_cache.IsRegionCpuModified(index_base, index_bytes) &&
++		    !buffer_cache.IsRegionGpuModified(index_base, index_bytes))
++			buffer_cache.EnsureBufferContents(index_base, index_bytes);
+ 		const auto [owner, offset] = buffer_cache.ObtainBuffer(index_base, index_bytes, false);
+ 		if (owner == nullptr) return false;
+ 		indices = {owner, offset};
+diff --git a/tests/VulkanRecordingTests.cpp b/tests/VulkanRecordingTests.cpp
+index b0cd7b3..fa3e65e 100644
+--- a/tests/VulkanRecordingTests.cpp
++++ b/tests/VulkanRecordingTests.cpp
+@@ -11,6 +11,7 @@
+ 
+ VULKAN_HPP_DEFAULT_DISPATCH_LOADER_DYNAMIC_STORAGE
+ extern "C" volatile std::atomic<uint32_t> kyty_local_vulkan_recording_mode;
++extern "C" volatile std::atomic<uint32_t> kyty_local_deferred_submit_mode;
+ namespace {
+ void Check(bool condition) { if (!condition) std::abort(); }
+ std::atomic<uint64_t> draws {0};
+@@ -30,6 +31,12 @@ void Packet(std::span<const LocalVulkanRecording::Segment> segments,
+     packet_epoch = epoch;
+     dispatch.vkCmdDraw(nullptr, 3, 1, item.sequence, 7);
+ }
++void DeferredPacket(std::span<const LocalVulkanRecording::Segment> segments,
++                    const vk::detail::DispatchLoaderDynamic& dispatch) {
++    Check(segments.size() == 1 && segments[0].size == sizeof(uint32_t));
++    dispatch.vkCmdDraw(nullptr, 3, 1, *static_cast<const uint32_t*>(segments[0].data), 7);
++    LocalVulkanRecording::NoteDeferredSubmitDone();
++}
+ VKAPI_ATTR void VKAPI_CALL LineWidth(VkCommandBuffer, float value) { Check(value == 1.0f); }
+ 
+ VKAPI_ATTR void VKAPI_CALL Draw(VkCommandBuffer, uint32_t vertices, uint32_t instances,
+@@ -190,6 +197,20 @@ int main() {
+         Check(!LocalVulkanRecording::EnqueuePacket(Packet, large));
+         const LocalVulkanRecording::Segment invalid[] {{nullptr, 1}};
+         Check(!LocalVulkanRecording::EnqueuePacket(Packet, invalid));
++        // Submission packets own their inputs and follow pending recording work.
++        kyty_local_deferred_submit_mode.store(1);
++        Check(LocalVulkanRecording::DeferredSubmitEnabled());
++        api.vkCmdDraw(nullptr, 3, 1, 20135, 7);
++        uint32_t submit_sequence = 20136;
++        const LocalVulkanRecording::Segment submit[] {{&submit_sequence, sizeof(submit_sequence)}};
++        LocalVulkanRecording::NoteDeferredSubmitQueued();
++        Check(LocalVulkanRecording::EnqueueDeferred(DeferredPacket, submit, true));
++        submit_sequence = UINT32_MAX;
++        LocalVulkanRecording::WaitDeferredSubmits();
++        Check(draws.load() == 20137);
++        kyty_local_deferred_submit_mode.store(0);
++        Check(!LocalVulkanRecording::DeferredSubmitEnabled());
++        Check(!LocalVulkanRecording::EnqueueDeferred(DeferredPacket, submit, true));
+     }
+-    std::puts("Vulkan recording: raw/packet ordering, pointer/plan ownership, state invalidation, ring reuse, query and fallback passed");
++    std::puts("Vulkan recording: raw/packet/deferred ordering, pointer/plan ownership, state invalidation, ring reuse, query and fallback passed");
+ }
