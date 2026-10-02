@@ -104,12 +104,22 @@ jobs:
           New-Item -ItemType Directory -Force $out | Out-Null
           Copy-Item _Build/windows/kyty_emulator.exe,_Build/windows/kyty_shader_precompile.exe,_Build/windows/libwinpthread-1.dll $out
           Copy-Item source/run-windows.ps1,source/precompile-windows.ps1 $out
+          [IO.File]::WriteAllBytes("$out/settings.ps1", [Convert]::FromBase64String('cGFyYW0oW3N3aXRjaF0kQ2hlY2tPbmx5KQokRXJyb3JBY3Rpb25QcmVmZXJlbmNlID0gJ1N0b3AnCiRjb25maWdQYXRoID0gSm9pbi1QYXRoICRQU1NjcmlwdFJvb3QgJ2xhdW5jaC5qc29uJwokbGF1bmNoID0gR2V0LUNvbnRlbnQgJGNvbmZpZ1BhdGggLVJhdyAtRW5jb2RpbmcgVVRGOCB8IENvbnZlcnRGcm9tLUpzb24KJGNvbW1hbmQgPSBAKCRsYXVuY2guY29tbWFuZCkKZnVuY3Rpb24gR2V0LU9wdGlvbihbc3RyaW5nXSRuYW1lLCBbc3RyaW5nXSRmYWxsYmFjaykgewogICAgJGF0ID0gW0FycmF5XTo6SW5kZXhPZigkY29tbWFuZCwgJG5hbWUpCiAgICBpZiAoJGF0IC1nZSAwIC1hbmQgJGF0ICsgMSAtbHQgJGNvbW1hbmQuQ291bnQpIHsgcmV0dXJuIFtzdHJpbmddJGNvbW1hbmRbJGF0ICsgMV0gfQogICAgcmV0dXJuICRmYWxsYmFjawp9CmZ1bmN0aW9uIFNldC1MYXVuY2hPcHRpb25zKFtpbnRdJHdpZHRoLCBbaW50XSRoZWlnaHQsIFtib29sXSRmdWxsc2NyZWVuLAogICAgW3N0cmluZ10kcHJlc2VudCwgW3N0cmluZ10kb3B0aW1pemF0aW9uLCBbc3RyaW5nXSRzaGFkZXJMb2csIFtzdHJpbmddJGd1ZXN0TG9nLCBbaW50XSRncHUpIHsKICAgICRvd25lZCA9IEAoJy0tc2NyZWVuLXdpZHRoJywgJy0tc2NyZWVuLWhlaWdodCcsICctLXByZXNlbnQtbW9kZScsCiAgICAgICAgJy0tc2hhZGVyLW9wdGltaXphdGlvbi10eXBlJywgJy0tc2hhZGVyLWxvZy1kaXJlY3Rpb24nLCAnLS1wcmludGYtZGlyZWN0aW9uJywgJy0tZ3B1JykKICAgICRyZXN1bHQgPSBOZXctT2JqZWN0IFN5c3RlbS5Db2xsZWN0aW9ucy5HZW5lcmljLkxpc3Rbc3RyaW5nXQogICAgZm9yICgkaSA9IDA7ICRpIC1sdCAkY29tbWFuZC5Db3VudDsgJGkrKykgewogICAgICAgIGlmICgkY29tbWFuZFskaV0gLWVxICctLWZ1bGxzY3JlZW4nKSB7IGNvbnRpbnVlIH0KICAgICAgICBpZiAoJGNvbW1hbmRbJGldIC1pbiAkb3duZWQpIHsgJGkrKzsgY29udGludWUgfQogICAgICAgICRyZXN1bHQuQWRkKFtzdHJpbmddJGNvbW1hbmRbJGldKQogICAgfQogICAgJHJlc3VsdC5BZGQoJy0tc2NyZWVuLXdpZHRoJyk7ICRyZXN1bHQuQWRkKFtzdHJpbmddJHdpZHRoKQogICAgJHJlc3VsdC5BZGQoJy0tc2NyZWVuLWhlaWdodCcpOyAkcmVzdWx0LkFkZChbc3RyaW5nXSRoZWlnaHQpCiAgICBpZiAoJGZ1bGxzY3JlZW4pIHsgJHJlc3VsdC5BZGQoJy0tZnVsbHNjcmVlbicpIH0KICAgICRwYWlycyA9IEAoCiAgICAgICAgQCgnLS1wcmVzZW50LW1vZGUnLCAkcHJlc2VudCksCiAgICAgICAgQCgnLS1zaGFkZXItb3B0aW1pemF0aW9uLXR5cGUnLCAkb3B0aW1pemF0aW9uKSwKICAgICAgICBAKCctLXNoYWRlci1sb2ctZGlyZWN0aW9uJywgJHNoYWRlckxvZyksCiAgICAgICAgQCgnLS1wcmludGYtZGlyZWN0aW9uJywgJGd1ZXN0TG9nKSkKICAgIGZvcmVhY2ggKCRwYWlyIGluICRwYWlycykgewogICAgICAgIGlmICgkcGFpclsxXSAtbmUgJ0RlZmF1bHQnKSB7ICRyZXN1bHQuQWRkKCRwYWlyWzBdKTsgJHJlc3VsdC5BZGQoJHBhaXJbMV0pIH0KICAgIH0KICAgIGlmICgkZ3B1IC1nZSAwKSB7ICRyZXN1bHQuQWRkKCctLWdwdScpOyAkcmVzdWx0LkFkZChbc3RyaW5nXSRncHUpIH0KICAgIHJldHVybiAsJHJlc3VsdC5Ub0FycmF5KCkKfQppZiAoJENoZWNrT25seSkgewogICAgJHRlc3QgPSBTZXQtTGF1bmNoT3B0aW9ucyAxOTIwIDEwODAgJHRydWUgJ01haWxib3gnICdQZXJmb3JtYW5jZScgJ1NpbGVudCcgJ0NvbnNvbGUnIDAKICAgIGlmIChbQXJyYXldOjpJbmRleE9mKCR0ZXN0LCAnLS1zY3JlZW4td2lkdGgnKSAtbHQgMCAtb3IKICAgICAgICBbQXJyYXldOjpJbmRleE9mKCR0ZXN0LCAnLS1mdWxsc2NyZWVuJykgLWx0IDAgLW9yCiAgICAgICAgW0FycmF5XTo6SW5kZXhPZigkdGVzdCwgJy0tc2hhZGVyLW9wdGltaXphdGlvbi10eXBlJykgLWx0IDApIHsgdGhyb3cgJ1NldHRpbmdzIG9wdGlvbiBjb25zdHJ1Y3Rpb24gZmFpbGVkJyB9CiAgICBXcml0ZS1Ib3N0ICgnU0VUVElOR1NfQ0hFQ0sgJyArICgkdGVzdCAtam9pbiAnICcpKQogICAgcmV0dXJuCn0KQWRkLVR5cGUgLUFzc2VtYmx5TmFtZSBTeXN0ZW0uV2luZG93cy5Gb3JtcywgU3lzdGVtLkRyYXdpbmcKW1N5c3RlbS5XaW5kb3dzLkZvcm1zLkFwcGxpY2F0aW9uXTo6RW5hYmxlVmlzdWFsU3R5bGVzKCkKJGZvcm0gPSBOZXctT2JqZWN0IFN5c3RlbS5XaW5kb3dzLkZvcm1zLkZvcm0KJGZvcm0uVGV4dCA9ICdLeXR5UFM1IEVtdWxhdG9yIFNldHRpbmdzJwokZm9ybS5DbGllbnRTaXplID0gTmV3LU9iamVjdCBTeXN0ZW0uRHJhd2luZy5TaXplIDQ5MCwgNDQwCiRmb3JtLlN0YXJ0UG9zaXRpb24gPSAnQ2VudGVyU2NyZWVuJwokZm9ybS5Gb3JtQm9yZGVyU3R5bGUgPSAnRml4ZWREaWFsb2cnCiRmb3JtLk1heGltaXplQm94ID0gJGZhbHNlCiRmb3JtLkZvbnQgPSBOZXctT2JqZWN0IFN5c3RlbS5EcmF3aW5nLkZvbnQgJ1NlZ29lIFVJJywgMTAKZnVuY3Rpb24gQWRkLUxhYmVsKFtzdHJpbmddJHRleHQsIFtpbnRdJHkpIHsKICAgICRsYWJlbCA9IE5ldy1PYmplY3QgU3lzdGVtLldpbmRvd3MuRm9ybXMuTGFiZWwKICAgICRsYWJlbC5UZXh0ID0gJHRleHQ7ICRsYWJlbC5Mb2NhdGlvbiA9IE5ldy1PYmplY3QgU3lzdGVtLkRyYXdpbmcuUG9pbnQgMjAsICR5CiAgICAkbGFiZWwuU2l6ZSA9IE5ldy1PYmplY3QgU3lzdGVtLkRyYXdpbmcuU2l6ZSAxOTAsIDI2CiAgICAkZm9ybS5Db250cm9scy5BZGQoJGxhYmVsKQp9CmZ1bmN0aW9uIEFkZC1OdW1iZXIoW2ludF0keSwgW2ludF0kdmFsdWUsIFtpbnRdJG1pbmltdW0sIFtpbnRdJG1heGltdW0pIHsKICAgICRjb250cm9sID0gTmV3LU9iamVjdCBTeXN0ZW0uV2luZG93cy5Gb3Jtcy5OdW1lcmljVXBEb3duCiAgICAkY29udHJvbC5NaW5pbXVtID0gJG1pbmltdW07ICRjb250cm9sLk1heGltdW0gPSAkbWF4aW11bQogICAgJGNvbnRyb2wuVmFsdWUgPSBbTWF0aF06Ok1heCgkbWluaW11bSwgW01hdGhdOjpNaW4oJG1heGltdW0sICR2YWx1ZSkpCiAgICAkY29udHJvbC5Mb2NhdGlvbiA9IE5ldy1PYmplY3QgU3lzdGVtLkRyYXdpbmcuUG9pbnQgMjIwLCAkeQogICAgJGNvbnRyb2wuU2l6ZSA9IE5ldy1PYmplY3QgU3lzdGVtLkRyYXdpbmcuU2l6ZSAyMzAsIDI2CiAgICAkZm9ybS5Db250cm9scy5BZGQoJGNvbnRyb2wpCiAgICByZXR1cm4gJGNvbnRyb2wKfQpmdW5jdGlvbiBBZGQtQ2hvaWNlKFtpbnRdJHksIFtzdHJpbmdbXV0kdmFsdWVzLCBbc3RyaW5nXSRzZWxlY3RlZCkgewogICAgJGNvbnRyb2wgPSBOZXctT2JqZWN0IFN5c3RlbS5XaW5kb3dzLkZvcm1zLkNvbWJvQm94CiAgICAkY29udHJvbC5Ecm9wRG93blN0eWxlID0gJ0Ryb3BEb3duTGlzdCcKICAgICRjb250cm9sLkxvY2F0aW9uID0gTmV3LU9iamVjdCBTeXN0ZW0uRHJhd2luZy5Qb2ludCAyMjAsICR5CiAgICAkY29udHJvbC5TaXplID0gTmV3LU9iamVjdCBTeXN0ZW0uRHJhd2luZy5TaXplIDIzMCwgMjYKICAgICRjb250cm9sLkl0ZW1zLkFkZFJhbmdlKFtvYmplY3RbXV0kdmFsdWVzKQogICAgJGNvbnRyb2wuU2VsZWN0ZWRJbmRleCA9IFtBcnJheV06OkluZGV4T2YoJHZhbHVlcywgJHNlbGVjdGVkKQogICAgaWYgKCRjb250cm9sLlNlbGVjdGVkSW5kZXggLWx0IDApIHsgJGNvbnRyb2wuU2VsZWN0ZWRJbmRleCA9IDAgfQogICAgJGZvcm0uQ29udHJvbHMuQWRkKCRjb250cm9sKQogICAgcmV0dXJuICRjb250cm9sCn0KQWRkLUxhYmVsICdXaW5kb3cgd2lkdGgnIDIwCiR3aWR0aEJveCA9IEFkZC1OdW1iZXIgMjAgKFtpbnRdKEdldC1PcHRpb24gJy0tc2NyZWVuLXdpZHRoJyAnMTI4MCcpKSAzMjAgMTYzODQKQWRkLUxhYmVsICdXaW5kb3cgaGVpZ2h0JyA1OAokaGVpZ2h0Qm94ID0gQWRkLU51bWJlciA1OCAoW2ludF0oR2V0LU9wdGlvbiAnLS1zY3JlZW4taGVpZ2h0JyAnNzIwJykpIDI0MCAxNjM4NApBZGQtTGFiZWwgJ0Rpc3BsYXkgbW9kZScgOTYKJG1vZGVCb3ggPSBBZGQtQ2hvaWNlIDk2IEAoJ1dpbmRvd2VkJywgJ0Z1bGxzY3JlZW4nKSAkKGlmICgkY29tbWFuZCAtY29udGFpbnMgJy0tZnVsbHNjcmVlbicpIHsgJ0Z1bGxzY3JlZW4nIH0gZWxzZSB7ICdXaW5kb3dlZCcgfSkKQWRkLUxhYmVsICdQcmVzZW50YXRpb24gbW9kZScgMTM0CiRwcmVzZW50Qm94ID0gQWRkLUNob2ljZSAxMzQgQCgnRGVmYXVsdCcsICdGaWZvJywgJ01haWxib3gnLCAnSW1tZWRpYXRlJykgKEdldC1PcHRpb24gJy0tcHJlc2VudC1tb2RlJyAnRGVmYXVsdCcpCkFkZC1MYWJlbCAnU2hhZGVyIG9wdGltaXphdGlvbicgMTcyCiRvcHRpbWl6YXRpb25Cb3ggPSBBZGQtQ2hvaWNlIDE3MiBAKCdEZWZhdWx0JywgJ05vbmUnLCAnU2l6ZScsICdQZXJmb3JtYW5jZScpIChHZXQtT3B0aW9uICctLXNoYWRlci1vcHRpbWl6YXRpb24tdHlwZScgJ0RlZmF1bHQnKQpBZGQtTGFiZWwgJ1NoYWRlciBsb2dnaW5nJyAyMTAKJHNoYWRlckxvZ0JveCA9IEFkZC1DaG9pY2UgMjEwIEAoJ0RlZmF1bHQnLCAnU2lsZW50JywgJ0NvbnNvbGUnLCAnRmlsZScpIChHZXQtT3B0aW9uICctLXNoYWRlci1sb2ctZGlyZWN0aW9uJyAnRGVmYXVsdCcpCkFkZC1MYWJlbCAnR2FtZSBsb2dnaW5nJyAyNDgKJGd1ZXN0TG9nQm94ID0gQWRkLUNob2ljZSAyNDggQCgnRGVmYXVsdCcsICdTaWxlbnQnLCAnQ29uc29sZScsICdGaWxlJykgKEdldC1PcHRpb24gJy0tcHJpbnRmLWRpcmVjdGlvbicgJ0RlZmF1bHQnKQpBZGQtTGFiZWwgJ0dQVSBpbmRleCAoLTEgPSBkZWZhdWx0KScgMjg2CiRncHVCb3ggPSBBZGQtTnVtYmVyIDI4NiAoW2ludF0oR2V0LU9wdGlvbiAnLS1ncHUnICctMScpKSAtMSAxNgokbm90ZSA9IE5ldy1PYmplY3QgU3lzdGVtLldpbmRvd3MuRm9ybXMuTGFiZWwKJG5vdGUuVGV4dCA9ICdDaGFuZ2VzIGFwcGx5IHRoZSBuZXh0IHRpbWUgeW91IGxhdW5jaCB0aGUgZ2FtZS4nCiRub3RlLkxvY2F0aW9uID0gTmV3LU9iamVjdCBTeXN0ZW0uRHJhd2luZy5Qb2ludCAyMCwgMzMwCiRub3RlLlNpemUgPSBOZXctT2JqZWN0IFN5c3RlbS5EcmF3aW5nLlNpemUgNDUwLCAyOAokZm9ybS5Db250cm9scy5BZGQoJG5vdGUpCiRzYXZlID0gTmV3LU9iamVjdCBTeXN0ZW0uV2luZG93cy5Gb3Jtcy5CdXR0b24KJHNhdmUuVGV4dCA9ICdTYXZlJzsgJHNhdmUuTG9jYXRpb24gPSBOZXctT2JqZWN0IFN5c3RlbS5EcmF3aW5nLlBvaW50IDI2MCwgMzg1CiRzYXZlLlNpemUgPSBOZXctT2JqZWN0IFN5c3RlbS5EcmF3aW5nLlNpemUgOTUsIDMyCiRjYW5jZWwgPSBOZXctT2JqZWN0IFN5c3RlbS5XaW5kb3dzLkZvcm1zLkJ1dHRvbgokY2FuY2VsLlRleHQgPSAnQ2FuY2VsJzsgJGNhbmNlbC5Mb2NhdGlvbiA9IE5ldy1PYmplY3QgU3lzdGVtLkRyYXdpbmcuUG9pbnQgMzY1LCAzODUKJGNhbmNlbC5TaXplID0gTmV3LU9iamVjdCBTeXN0ZW0uRHJhd2luZy5TaXplIDk1LCAzMgokY2FuY2VsLkRpYWxvZ1Jlc3VsdCA9ICdDYW5jZWwnCiRzYXZlLkFkZF9DbGljayh7CiAgICB0cnkgewogICAgICAgICRsYXVuY2guY29tbWFuZCA9IFNldC1MYXVuY2hPcHRpb25zIChbaW50XSR3aWR0aEJveC5WYWx1ZSkgKFtpbnRdJGhlaWdodEJveC5WYWx1ZSkgKCRtb2RlQm94LlNlbGVjdGVkSXRlbSAtZXEgJ0Z1bGxzY3JlZW4nKSAoW3N0cmluZ10kcHJlc2VudEJveC5TZWxlY3RlZEl0ZW0pIChbc3RyaW5nXSRvcHRpbWl6YXRpb25Cb3guU2VsZWN0ZWRJdGVtKSAoW3N0cmluZ10kc2hhZGVyTG9nQm94LlNlbGVjdGVkSXRlbSkgKFtzdHJpbmddJGd1ZXN0TG9nQm94LlNlbGVjdGVkSXRlbSkgKFtpbnRdJGdwdUJveC5WYWx1ZSkKICAgICAgICAkdGVtcCA9ICRjb25maWdQYXRoICsgJy50bXAnCiAgICAgICAgJGxhdW5jaCB8IENvbnZlcnRUby1Kc29uIC1EZXB0aCAxMCB8IFNldC1Db250ZW50ICR0ZW1wIC1FbmNvZGluZyBVVEY4CiAgICAgICAgTW92ZS1JdGVtICR0ZW1wICRjb25maWdQYXRoIC1Gb3JjZQogICAgICAgICRmb3JtLkRpYWxvZ1Jlc3VsdCA9ICdPSycKICAgICAgICAkZm9ybS5DbG9zZSgpCiAgICB9IGNhdGNoIHsKICAgICAgICBbU3lzdGVtLldpbmRvd3MuRm9ybXMuTWVzc2FnZUJveF06OlNob3coJF8uRXhjZXB0aW9uLk1lc3NhZ2UsICdDb3VsZCBub3Qgc2F2ZSBzZXR0aW5ncycpIHwgT3V0LU51bGwKICAgIH0KfSkKJGZvcm0uQ29udHJvbHMuQWRkKCRzYXZlKTsgJGZvcm0uQ29udHJvbHMuQWRkKCRjYW5jZWwpCiRmb3JtLkFjY2VwdEJ1dHRvbiA9ICRzYXZlOyAkZm9ybS5DYW5jZWxCdXR0b24gPSAkY2FuY2VsClt2b2lkXSRmb3JtLlNob3dEaWFsb2coKQokZm9ybS5EaXNwb3NlKCkK'))
+          Set-Content "$out/settings.cmd" -Encoding ASCII -Value @(
+            '@echo off',
+            'powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0settings.ps1"',
+            'if errorlevel 1 pause')
           # No files, patches, or configuration from ci/perf40 or the user's builds.
           @{ checkpoint='clean-public-fork-indexed-shader-init'; environment=@{}; command=@('--','kyty_emulator.exe') } |
             ConvertTo-Json -Depth 4 | Set-Content "$out/launch.json" -Encoding UTF8
           Set-Content "$out/run.cmd" -Encoding ASCII -Value @(
             '@echo off',
+            'if /I "%~1"=="settings" goto settings',
             'powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0run-windows.ps1" -Baseline -Prompt %*',
+            'goto finish',
+            ':settings',
+            'powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0settings.ps1"',
+            ':finish',
             'if errorlevel 1 pause')
           Set-Content "$out/precompile.cmd" -Encoding ASCII -Value @(
             '@echo off',
@@ -120,6 +130,8 @@ jobs:
             'Fix: indexed indirect draws initialize the shader before checking its mesh stage.',
             'Extract into a NEW empty folder. Do not copy old launch.json, caches, patches, or DLLs.',
             'Run run.cmd and choose the folder containing eboot.bin.',
+            'Open settings.cmd (or run.cmd settings) to change display, GPU, shader optimization and logging settings.',
+            'Click Save, then relaunch the game. Settings are stored in launch.json.',
             'Uses the upstream -Baseline mode with no performance environment configuration.',
             'The upstream Windows red-zone protection, cache handling and logs remain enabled.',
             'This is not the private benchmark package. No private PGO, SRT AOT or game shader seeds.',
@@ -150,6 +162,7 @@ jobs:
             prior_candidate_configuration_included=$false
             source_modifications=@('ATRAC9 public dependency substitution','Initialize indexed shader before mesh-stage inspection')
             launcher_mode='upstream -Baseline'
+            settings_window_included=$true
             test_modes=@('resource_tracking legacy','resource_materialization')
             pgo_included=$false
             srt_aot_dll_included=$false
@@ -158,6 +171,30 @@ jobs:
           Get-ChildItem $out -File | ForEach-Object {
             "$((Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant())  $($_.Name)"
           } | Set-Content "$out/SHA256SUMS.txt"
+      - name: Verify Windows settings and launcher configuration
+        shell: powershell
+        run: |
+          $out = (Resolve-Path '_Build/package').Path
+          foreach ($file in @('settings.ps1','run-windows.ps1')) {
+            $tokens = $null; $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile("$out/$file", [ref]$tokens, [ref]$errors) | Out-Null
+            if ($errors.Count) { throw ($errors | Out-String) }
+          }
+          & "$out/settings.ps1" -CheckOnly
+          if ($LASTEXITCODE) { throw 'Settings option check failed' }
+          $fake = Join-Path $env:RUNNER_TEMP 'launcher-config-check'
+          New-Item -ItemType Directory -Force $fake | Out-Null
+          New-Item -ItemType File -Force "$fake/eboot.bin" | Out-Null
+          $config = Get-Content "$out/launch.json" -Raw | ConvertFrom-Json
+          $config.command = @('--','kyty_emulator.exe','--screen-width','1920','--screen-height','1080','--fullscreen','--present-mode','Mailbox','--shader-optimization-type','Performance')
+          $testConfig = Join-Path $env:RUNNER_TEMP 'launcher-test.json'
+          $config | ConvertTo-Json -Depth 4 | Set-Content $testConfig -Encoding UTF8
+          $text = (& "$out/run-windows.ps1" -Config $testConfig -Game $fake -Baseline -DryRun 6>&1 | Out-String)
+          foreach ($expected in @('--screen-width 1920','--screen-height 1080','--fullscreen','--present-mode Mailbox','--shader-optimization-type Performance')) {
+            if (!$text.Contains($expected)) { throw "Launcher ignored setting: $expected" }
+          }
+          Remove-Item "$out/game-path.txt" -ErrorAction SilentlyContinue
+          Write-Host 'Settings syntax, option construction and upstream launcher consumption passed.'
       - name: Verify packaged shader preparation imports
         shell: pwsh
         run: |
