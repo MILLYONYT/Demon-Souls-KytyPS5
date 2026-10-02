@@ -110,12 +110,12 @@ jobs:
             'powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0settings.ps1"',
             'if errorlevel 1 pause')
           # No files, patches, or configuration from ci/perf40 or the user's builds.
-          @{ checkpoint='clean-public-fork-indexed-shader-init'; environment=@{}; command=@('--','kyty_emulator.exe') } |
+          @{ checkpoint='standalone-legacy-shader-bindings'; environment=@{}; command=@('--','kyty_emulator.exe') } |
             ConvertTo-Json -Depth 4 | Set-Content "$out/launch.json" -Encoding UTF8
           Set-Content "$out/run.cmd" -Encoding ASCII -Value @(
             '@echo off',
             'if /I "%~1"=="settings" goto settings',
-            'powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0run-windows.ps1" -Baseline -Prompt %*',
+            'powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0run-windows.ps1" -Baseline -Prompt -Set KYTY_PORTABLE_SHADERS=0,KYTY_DRIVER_CACHE_KEY=ae183c1a3e4b1da3fe960d72f6884df438b72c79f4e0ca955d9e71b569c75ce9 %*',
             'goto finish',
             ':settings',
             'powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0settings.ps1"',
@@ -133,7 +133,9 @@ jobs:
             'Open settings.cmd (or run.cmd settings) to change display, GPU, shader optimization and logging settings.',
             'Click Save, then relaunch the game. Settings are stored in launch.json.',
             'Uses the upstream -Baseline mode with no performance environment configuration.',
-            'The upstream Windows red-zone protection, cache handling and logs remain enabled.',
+            'The upstream Windows red-zone protection and logs remain enabled.',
+            'Texture compatibility test: legacy shader bindings (KYTY_PORTABLE_SHADERS=0) with a separate driver cache key.',
+            'The fork default portable binding path is disabled by run.cmd. Rendering still requires a gameplay test.',
             'This is not the private benchmark package. No private PGO, SRT AOT or game shader seeds.',
             'ATRAC9 uses public revision ec8899dadf393f655f2871a94e0fe4b3d6220c9a because the source gitlink is unavailable.',
             'Unchanged legacy resource tracking and materialization tests run in CI.',
@@ -163,6 +165,9 @@ jobs:
             source_modifications=@('ATRAC9 public dependency substitution','Initialize indexed shader before mesh-stage inspection')
             launcher_mode='upstream -Baseline'
             settings_window_included=$true
+            portable_shaders_enabled=$false
+            driver_cache_key='ae183c1a3e4b1da3fe960d72f6884df438b72c79f4e0ca955d9e71b569c75ce9'
+            rendering_fix_confirmed=$false
             test_modes=@('resource_tracking legacy','resource_materialization')
             pgo_included=$false
             srt_aot_dll_included=$false
@@ -189,9 +194,12 @@ jobs:
           $config.command = @('--','kyty_emulator.exe','--screen-width','1920','--screen-height','1080','--fullscreen','--present-mode','Mailbox','--shader-optimization-type','Performance')
           $testConfig = Join-Path $env:RUNNER_TEMP 'launcher-test.json'
           $config | ConvertTo-Json -Depth 4 | Set-Content $testConfig -Encoding UTF8
-          $text = (& "$out/run-windows.ps1" -Config $testConfig -Game $fake -Baseline -DryRun 6>&1 | Out-String)
+          $text = (& "$out/run-windows.ps1" -Config $testConfig -Game $fake -Baseline -Set KYTY_PORTABLE_SHADERS=0,KYTY_DRIVER_CACHE_KEY=ae183c1a3e4b1da3fe960d72f6884df438b72c79f4e0ca955d9e71b569c75ce9 -DryRun 6>&1 | Out-String)
           foreach ($expected in @('--screen-width 1920','--screen-height 1080','--fullscreen','--present-mode Mailbox','--shader-optimization-type Performance')) {
             if (!$text.Contains($expected)) { throw "Launcher ignored setting: $expected" }
+          }
+          if (!$text.Contains('KYTY_PORTABLE_SHADERS=0') -or !$text.Contains('KYTY_DRIVER_CACHE_KEY=ae183c1a3e4b1da3fe960d72f6884df438b72c79f4e0ca955d9e71b569c75ce9')) {
+            throw 'Launcher ignored the legacy binding or isolated cache override'
           }
           Remove-Item "$out/game-path.txt" -ErrorAction SilentlyContinue
           Write-Host 'Settings syntax, option construction and upstream launcher consumption passed.'
