@@ -1,17 +1,18 @@
-name: KytyPS5 B127 index and descriptor reuse without recording worker
+name: KytyPS5 B131 allocation and shader preparation
 on:
   push:
-    branches: [best127-worker-index-descriptors]
+    branches: [best131-inplace-shader-preparation]
     paths:
       - .github/workflows/b32-cache-source-test.yml
       - patches/b123-combined-renderer-performance.patch
       - patches/b127-index-descriptor-reuse.patch
+      - patches/b131-inplace-shader-preparation.patch
   workflow_dispatch:
 permissions:
   contents: read
 jobs:
   windows-x64:
-    name: Build frozen B127 plus index and descriptor reuse; recording worker disabled
+    name: Build frozen B131 plus shader preparation allocation reductions
     runs-on: windows-2022
     steps:
       - uses: actions/checkout@v4
@@ -91,6 +92,13 @@ jobs:
           if ($LASTEXITCODE) { throw 'B127 incremental reuse patch does not match' }
           git -C source apply ../patches/b127-index-descriptor-reuse.patch
           if ($LASTEXITCODE) { throw 'B127 incremental reuse patch failed' }
+      - name: Apply B131 shader preparation allocation reductions
+        shell: pwsh
+        run: |
+          git -C source apply --check ../patches/b131-inplace-shader-preparation.patch
+          if ($LASTEXITCODE) { throw 'Shader preparation patch does not match frozen B131 source' }
+          git -C source apply ../patches/b131-inplace-shader-preparation.patch
+          if ($LASTEXITCODE) { throw 'Shader preparation patch failed' }
       - name: Configure portable optimized build
         shell: cmd
         run: >
@@ -98,7 +106,7 @@ jobs:
           -DCMAKE_BUILD_TYPE=Release -DKYTY_BUILD_LAUNCHER=OFF
           -DKYTY_MARCH=x86-64-v3 -DKYTY_THIN_LTO=ON
           -DKYTY_BUILD_ORIGIN=Fork -DKYTY_BUILD_REPOSITORY=${{ github.repository }}
-          -DKYTY_RELEASE_TAG=B127-RESOURCE-REUSE-${{ github.run_number }}
+          -DKYTY_RELEASE_TAG=B131-SHADER-PREP-${{ github.run_number }}
           "-DCMAKE_CXX_FLAGS=/DWIN32 /D_WINDOWS /W3 /GR /EHsc /DKYTY_B32_FAST_CPU_SETS /DKYTY_B32_QUIET_SHADER_PHASES"
           -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl
       - name: Verify required Windows compiler flags
@@ -138,6 +146,10 @@ jobs:
           if ($LASTEXITCODE) { throw 'Frozen indexed shader fix missing' }
           git -C source apply --reverse --check ../draw-run-cpu-selector.patch
           if ($LASTEXITCODE) { throw 'CPU draw argument selector missing' }
+          git -C source apply --reverse --check ../patches/b131-inplace-shader-preparation.patch
+          if ($LASTEXITCODE) { throw 'Shader preparation patch missing' }
+          git -C source apply --reverse ../patches/b131-inplace-shader-preparation.patch
+          if ($LASTEXITCODE) { throw 'Shader preparation verification undo failed' }
           git -C source apply --reverse --check ../patches/b127-index-descriptor-reuse.patch
           if ($LASTEXITCODE) { throw 'B127 reuse patch missing' }
           git -C source apply --reverse ../patches/b127-index-descriptor-reuse.patch
@@ -146,6 +158,8 @@ jobs:
           if ($LASTEXITCODE) { throw 'Compiled source differs from the reviewed performance port' }
           git -C source apply ../patches/b127-index-descriptor-reuse.patch
           if ($LASTEXITCODE) { throw 'Incremental verification restore failed' }
+          git -C source apply ../patches/b131-inplace-shader-preparation.patch
+          if ($LASTEXITCODE) { throw 'Shader preparation verification restore failed' }
       - name: Package portable candidate
         shell: pwsh
         run: |
@@ -175,7 +189,7 @@ jobs:
             'powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0settings.ps1"',
             'if errorlevel 1 pause')
           # No files, patches, or configuration from ci/perf40 or the user's builds.
-          @{ checkpoint='b127-index-descriptors-worker-off'; environment=@{}; command=@('--','kyty_emulator.exe','--shader-optimization-type','Performance','--shader-log-direction','Silent','--printf-direction','Silent') } |
+          @{ checkpoint='b131-inplace-shader-preparation'; environment=@{}; command=@('--','kyty_emulator.exe','--shader-optimization-type','Performance','--shader-log-direction','Silent','--printf-direction','Silent') } |
             ConvertTo-Json -Depth 4 | Set-Content "$out/launch.json" -Encoding UTF8
           Set-Content "$out/run.cmd" -Encoding ASCII -Value @(
             '@echo off',
@@ -193,11 +207,11 @@ jobs:
           $verify = (Get-Content "$out/run.cmd" -Raw).Replace('KYTY_NATIVE_XPR=1','KYTY_NATIVE_XPR=2')
           [IO.File]::WriteAllText("$out/run-verify.cmd", $verify, [Text.ASCIIEncoding]::new())
           Set-Content "$out/README.txt" -Value @(
-            'Frozen user-confirmed B127 plus index cleanup and descriptor reuse. Recording worker and deferred submission disabled after the user reported regression in B129.',
+            'Frozen user-confirmed B131 plus in-place shader resource specialization, in-place interface collection and reusable indirect descriptor sort storage.',
             'Uses B127 synchronous recording/submission; KYTY_VULKAN_RECORDING=0 and KYTY_DEFERRED_SUBMIT=0 are explicitly enforced.',
             'CPU-dirty small index ranges synchronize once until the next guest write.',
             'GPU-completed descriptor reuse retains up to 2048 per layout and 16384 total.',
-            'Preserves the exact B127 legacy cache key and shader code; keep your working B127 cache.',
+            'Preserves the exact B127 legacy cache key and shader code; keep your working B131 cache.',
             'Driver cache survives warmup saves and keeps caching later gameplay pipelines.',
             'Shader compiler uses hash-bucketed SRT planning, linear use-list rewrites and cheaper SPIR-V declarations.',
             'Release skips redundant IR validation; compiler tests also run with KYTY_IR_VALIDATE=1.',
@@ -206,12 +220,12 @@ jobs:
             'GPU range proofs and async uploads reduce redundant synchronization and unrelated unmap waits.',
             'BDA buffers up to 64 MiB share VMA blocks; exact fp32 helpers emit fewer GPU instructions.',
             'run-verify.cmd compares native draw records with normal preparation for rendering diagnostics.',
-            'B127 is frozen separately at best127-frozen-cache-warmed-fps-textures-audio.',
+            'B131 is frozen separately at best131-frozen-stable-vblank-textures-audio; B127 remains available.',
             'Shader replay records on first use; judge smoothness on a second launch through the same scene.',
             'Restores B102 replay, B103 compute frontend reuse and quiet logging, GPU worker CPU sets/priority/QoS, SRT visited-set lookup, scratch capacity reuse and 128-dispatch batching.',
             'Fix: indexed indirect draws initialize the shader before checking its mesh stage.',
-            'Extract into a new folder. Keep your B127 folder as the comparison baseline.',
-            'You may COPY the working B127 _PipelineCache into this candidate; keep the original cache too.',
+            'Extract into a new folder. Keep your B131 folder as the comparison baseline.',
+            'You may COPY the working B131 _PipelineCache into this candidate; keep the original cache too.',
             'Do not copy old launch.json, patches or DLLs into the candidate.',
             'Run run.cmd and choose the folder containing eboot.bin.',
             'Open settings.cmd (or run.cmd settings) to change display, GPU, vblank frequency, shader optimization and logging settings.',
@@ -221,7 +235,7 @@ jobs:
             'The upstream Windows red-zone protection and logs remain enabled.',
             'Texture compatibility test: legacy shader bindings (KYTY_PORTABLE_SHADERS=0) with a separate driver cache key.',
             'Portable shaders stay disabled. Native XPR and async readback enabled; draw packets and partial image dirty experiments stay off.',
-            'B127 has user-confirmed warmed-cache FPS gains. This index/descriptor-only candidate requires gameplay validation.',
+            'B131 is user-confirmed stable. This shader-preparation candidate targets compilation/allocation stalls and requires gameplay validation.',
             'This is not the private benchmark package. No private PGO, SRT AOT or game shader seeds.',
             'ATRAC9 uses public revision ec8899dadf393f655f2871a94e0fe4b3d6220c9a because the source gitlink is unavailable.',
             'Legacy resource tracking, materialization scratch/reentrancy checks and frontend cache lifetime/collision/concurrency/eviction checks run in CI.',
@@ -248,7 +262,7 @@ jobs:
             packaging_commit=$env:GITHUB_SHA
             user_emulator_patches_included=$true
             prior_candidate_configuration_included=$false
-            source_modifications=@('ATRAC9 public dependency substitution','Initialize indexed shader before mesh-stage inspection','Reviewed performance ports from accepted B102/B103 lineage','Driver cache survives Save','Hash-bucketed SRT planning and shader compiler optimizations','GPU readback batching','Native XPR relocation retention and rebinding','Per-region BDA proofs and range-scoped upload waits','BryKytyPS5 BDA suballocation and exact fp32 math','Small CPU index range synchronization','GPU-completed descriptor reuse pool expansion','Recording worker and deferred submission disabled after B129 regression')
+            source_modifications=@('ATRAC9 public dependency substitution','Initialize indexed shader before mesh-stage inspection','Reviewed performance ports from accepted B102/B103 lineage','Driver cache survives Save','Hash-bucketed SRT planning and shader compiler optimizations','GPU readback batching','Native XPR relocation retention and rebinding','Per-region BDA proofs and range-scoped upload waits','BryKytyPS5 BDA suballocation and exact fp32 math','Small CPU index range synchronization','GPU-completed descriptor reuse pool expansion','Recording worker and deferred submission disabled after B129 regression','In-place shader resource specialization and fused image remap traversal','In-place shader interface collection','Workspace-owned indirect sort storage reuse')
             launcher_mode='upstream -Baseline'
             settings_window_included=$true
             settings_vblank_range_hz=@(30,360)
@@ -256,8 +270,8 @@ jobs:
             settings_vblank_persists=$true
             portable_shaders_enabled=$false
             driver_cache_key='98edcf312ef7ea126af9bb5a876005fc746955313ea0535ba2563c766289753b'
-            frozen_baseline_commit='4da4f8c5c49688abc0d0df05507fdb0ae496aca0'
-            frozen_baseline_branch='best127-frozen-cache-warmed-fps-textures-audio'
+            frozen_baseline_commit='fbebfd208be50ca1ce758da0aaf2c674f2348c28'
+            frozen_baseline_branch='best131-frozen-stable-vblank-textures-audio'
             frozen_base_rendering_and_audio_user_confirmed=$true
             new_performance_result_confirmed=$false
             restored_performance=@('B102 shader recording and replay','B103 512-entry compute frontend cache','B103 quiet phase logs','accepted GPU worker CPU sets priority and QoS','SRT visited set','legacy resource scratch reuse','128 dispatch batch')
@@ -266,8 +280,9 @@ jobs:
             upstream_fix_commits=@('e5738defa60a579dd076563f83d104b6d33be399','5a12d808ce9384db464484943ca0fb80bef3a4f8','a28de66fe2f431bcd3ee50c20c1388e00935e82b')
             cache_save_adaptation='Retain cache lifetime fix; always save content without size-only unchanged heuristic'
             upstream_renderer_commit='60a012f2852cbff1b825dac6ea373b9d6e432268'
-            previous_candidate_commit='7958023136e36fede2c06218eb0024f57f6c27a1'
-            previous_candidate_performance_user_report='worse; isolate resource reuse with recording and deferred submission disabled'
+            previous_candidate_commit='fbebfd208be50ca1ce758da0aaf2c674f2348c28'
+            previous_candidate_performance_user_report='B131 crashes fixed and runs as intended; accepted as new frozen baseline'
+            rejected_b129_performance='worse; recording/deferred remain disabled'
             previous_candidate_ci_passed=$true
             brykyty_ports=@('4068f4ac886dcd25acc52b6e3fa3e3800dc576a9 BDA suballocation adapted','5e224812df1354f89c7451e58fc540c476843dc0 exact fp32 helpers adapted')
             baseline_warmed_cache_performance_user_confirmed=$true
@@ -278,6 +293,10 @@ jobs:
             free_descriptor_sets_per_layout=2048
             free_descriptor_sets_total=16384
             shader_codegen_changed_from_b127=$false
+            shader_preparation_upstream_ports=@('684330c9e474f2e65d5aa620d4616683fb4a70dc in-place specialization and fused IR traversal adapted only','f3dc5ee4a9e0725b17bd3e0a4ad1bdbeb0afc8a9 in-place shader interface collection')
+            buffer_refresh_fusion_not_ported=$true
+            indirect_sort_scratch_reuse=$true
+            steady_state_fps_gain_confirmed=$false
             native_xpr_enabled=$true
             native_xpr_store_budget=256
             native_xpr_keep_frames=600
@@ -339,7 +358,8 @@ jobs:
       - name: Upload clean standalone public fork
         uses: actions/upload-artifact@v4
         with:
-          name: KytyPS5-B127-RESOURCE-REUSE-Windows-x64-${{ github.run_number }}
+          name: KytyPS5-B131-SHADER-PREP-Windows-x64-${{ github.run_number }}
           path: _Build/package/**
           if-no-files-found: error
+
 
