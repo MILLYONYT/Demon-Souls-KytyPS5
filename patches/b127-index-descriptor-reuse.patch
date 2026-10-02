@@ -70,3 +70,13 @@ index b0cd7b3..fa3e65e 100644
 -    std::puts("Vulkan recording: raw/packet ordering, pointer/plan ownership, state invalidation, ring reuse, query and fallback passed");
 +    std::puts("Vulkan recording: raw/packet/deferred ordering, pointer/plan ownership, state invalidation, ring reuse, query and fallback passed");
  }
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -820,6 +820,7 @@
+ 	endforeach()
+ 	add_executable(vulkan_recording_tests EXCLUDE_FROM_ALL
+ 		"${KYTY_TESTS_DIR}/VulkanRecordingTests.cpp"
++		"${KYTY_SOURCE_DIR}/local/local-platform.cpp"
+ 		"${KYTY_SOURCE_DIR}/local/vulkan-recording.cpp" "${recording_generated}")
+ 	target_include_directories(vulkan_recording_tests PRIVATE ${inc_headers} "${CMAKE_CURRENT_BINARY_DIR}")
+ 	target_link_libraries(vulkan_recording_tests PRIVATE Threads::Threads Vulkan::Headers)
