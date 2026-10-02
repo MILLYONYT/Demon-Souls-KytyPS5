@@ -1,0 +1,130 @@
+--- a/src/graphics/shader/recompiler/ir/passes/ResourceMaterialization.cpp
++++ b/src/graphics/shader/recompiler/ir/passes/ResourceMaterialization.cpp
+@@ -54,6 +54,7 @@
+ 	std::vector<uint8_t> active_sources;
+ 	ResourceSpecializationGuard guard_candidate;
+ 	std::vector<uint32_t> padded_candidates; // BuildResourceSpecialization: per indirect table
++	std::vector<uint32_t> indirect_order; // Reused index sorting storage, owned by this workspace
+ };
+ 
+ bool SpecializationFail(MaterializeReport* report, std::string_view message) {
+@@ -1076,7 +1077,8 @@
+ 			root.indirect_search_iterations = std::bit_width(table.keys.size());
+ 		}
+ 		next_snapshot.flattened_srt.resize(mapping + 1u + table.keys.size() * 2u);
+-		std::vector<uint32_t> order(table.keys.size());
++		auto& order = workspace.indirect_order;
++		order.resize(table.keys.size());
+ 		std::iota(order.begin(), order.end(), 0u);
+ 		std::ranges::sort(order, {}, [&](uint32_t index) { return table.keys[index]; });
+ 		next_snapshot.flattened_srt[mapping] = static_cast<uint32_t>(table.keys.size());
+@@ -1800,20 +1802,21 @@
+ 	EXIT_IF(program.info.buffers.size() != specialization.buffers.size() ||
+ 	        program.info.images.size() > specialization.images.size());
+ 
+-	auto buffers = program.info.buffers;
++	auto& buffers = program.info.buffers;
+ 	for (size_t index = 0; index < buffers.size(); index++) {
+ 		buffers[index].packed_stride      = specialization.buffers[index].packed_stride;
+ 		buffers[index].descriptor_format  = specialization.buffers[index].descriptor_format;
+ 		buffers[index].descriptor_swizzle = specialization.buffers[index].descriptor_swizzle;
+ 		buffers[index].byte_base_offset   = specialization.buffers[index].byte_base_offset;
+ 	}
+-	auto images = program.info.images;
++	auto& images = program.info.images;
++	const auto original_image_count = images.size();
+ 	images.reserve(specialization.images.size());
+ 	for (uint32_t index = 0; index < specialization.images.size(); index++) {
+ 		const auto& source = specialization.images[index];
+ 		if (index >= images.size()) {
+-			EXIT_IF(source.indirect_root >= program.info.images.size());
+-			images.push_back(program.info.images[source.indirect_root]);
++			EXIT_IF(source.indirect_root >= original_image_count);
++			images.push_back(images[source.indirect_root]);
+ 		}
+ 		auto& image                      = images[index];
+ 		image.numeric_class              = source.numeric_class;
+@@ -1837,10 +1840,11 @@
+ 
+ 	SamplerPlan sampler_plan;
+ 	EXIT_IF(!BuildSamplerPlan(program.info, images, sampler_plan));
+-	auto samplers      = program.info.samplers;
+-	auto sampled_pairs = program.info.sampled_pairs;
++	auto& samplers      = program.info.samplers;
++	auto& sampled_pairs = program.info.sampled_pairs;
++	const auto original_sampler_count = samplers.size();
+ 	samplers.reserve(sampler_plan.sampler_count);
+-	for (uint32_t index = 0; index < program.info.samplers.size(); index++) {
++	for (uint32_t index = 0; index < original_sampler_count; index++) {
+ 		const auto target = sampler_plan.point_sampler[index];
+ 		if (target == UINT32_MAX) {
+ 			continue;
+@@ -1862,11 +1866,15 @@
+ 		samplers[pair.sampler].depth_compare |= images[pair.image].depth_compare;
+ 	}
+ 
+-	auto memory_info = program.memory_info;
++	auto& memory_info = program.memory_info;
+ 	const ImageRemap image_remap(specialization);
+ 	for (auto* block: program.blocks) {
+ 		for (auto it = block->begin(); it != block->end(); ++it) {
+ 			auto& inst = *it;
++			if (inst.GetOpcode() == ValueOpcode::GetImageResource) {
++				inst.SetFlags(image_remap.indices.at(inst.Flags<uint32_t>()));
++				continue;
++			}
+ 			const auto image_opcode = ImageOpcodeInfoOf(inst.GetOpcode());
+ 			if (image_opcode.access == ImageAccess::None) {
+ 				continue;
+@@ -1894,19 +1902,12 @@
+ 				continue;
+ 			}
+ 			if (image_opcode.needs_sampler && RequiresPointSampler(image) &&
+-			    memory.sampler < program.info.samplers.size()) {
++			    memory.sampler < original_sampler_count) {
+ 				EXIT_IF(sampler_plan.point_sampler[memory.sampler] == UINT32_MAX);
+ 				memory.sampler = sampler_plan.point_sampler[memory.sampler];
+ 			}
+ 			EXIT_IF(image.indirect_root == memory.resource &&
+ 			        inst.GetOpcode() != ValueOpcode::ImageSampleRaw);
+-		}
+-	}
+-	for (auto* block: program.blocks) {
+-		for (auto& inst: *block) {
+-			if (inst.GetOpcode() == ValueOpcode::GetImageResource) {
+-				inst.SetFlags(image_remap.indices.at(inst.Flags<uint32_t>()));
+-			}
+ 		}
+ 	}
+ 	for (auto& memory: memory_info) {
+@@ -1931,11 +1932,6 @@
+ 		}
+ 	}
+ 	image_remap.Apply(images);
+-	program.info.buffers       = std::move(buffers);
+-	program.info.images        = std::move(images);
+-	program.info.samplers      = std::move(samplers);
+-	program.info.sampled_pairs = std::move(sampled_pairs);
+-	program.memory_info        = std::move(memory_info);
+ }
+ 
+ } // namespace Libs::Graphics::ShaderRecompiler::IR
+--- a/src/graphics/shader/recompiler/ir/passes/ShaderInfoCollection.cpp
++++ b/src/graphics/shader/recompiler/ir/passes/ShaderInfoCollection.cpp
+@@ -400,7 +400,7 @@
+ 	ValidateOptions(program, options);
+ 	ValidateValueReferences(program, options);
+ 
+-	auto next = program.info;
++	auto& next = program.info;
+ 	next.inputs.clear();
+ 	next.outputs.clear();
+ 	next.has_bitwise_xor =
+@@ -418,7 +418,6 @@
+ 	}
+ 	CollectBuiltinInputs(program, next);
+ 	CollectOutputs(program, options.vertex, options.pixel, next);
+-	program.info                 = std::move(next);
+ 	program.shader_info_complete = true;
+ }
+ 
