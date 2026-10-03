@@ -119,6 +119,15 @@ try {
     foreach ($required in @('KYTY_PORTABLE_SHADERS=0','KYTY_VULKAN_RECORDING=0','KYTY_DEFERRED_SUBMIT=0')) {
         if ($pairs -notcontains $required) { throw "Missing stable build setting: $required" }
     }
+    $driverPairs = @($pairs | Where-Object { $_ -match '^KYTY_DRIVER_CACHE_KEY=' })
+    if ($driverPairs.Count -ne 1) { throw 'Expected one gameplay driver-cache identity in run.cmd.' }
+    $driverKey = ($driverPairs[0] -split '=', 2)[1]
+    if ($driverKey -notmatch '^[0-9a-fA-F]{64}$') { throw 'Invalid gameplay driver-cache identity.' }
+    $hasher = [Security.Cryptography.SHA256]::Create()
+    try {
+        $staticDriverKey = [BitConverter]::ToString($hasher.ComputeHash([Text.Encoding]::UTF8.GetBytes($driverKey + ':static-precompile-v1'))).Replace('-','').ToLowerInvariant()
+    } finally { $hasher.Dispose() }
+    if ($staticDriverKey -eq $driverKey) { throw 'Static preparation must not use the gameplay driver cache.' }
     $seedRoot = Join-Path $PSScriptRoot "_PipelineCache/precompile-inputs/$title/$version"
     $seeds = Join-Path $seedRoot 'seeds.seeds'
     $recording = Join-Path $PSScriptRoot '_PipelineCache/warmup-legacy/recording.shaders'
@@ -146,6 +155,9 @@ try {
         } else {
             Write-Host "PRECOMPILE_SEEDS $seeds"
             Write-Host 'PRECOMPILE_RECORDED_SEEDS none; generate from selected game files'
+            Write-Host "PRECOMPILE_STATIC_DRIVER_CACHE $staticDriverKey"
+            Write-Host "PRECOMPILE_GAMEPLAY_DRIVER_CACHE $driverKey"
+            Write-Host 'PRECOMPILE_RUNTIME_VARIANTS replay existing recording after static preparation'
         }
         # A deliberately failing import is part of the CI probe, not this plan's result.
         $global:LASTEXITCODE = 0
@@ -167,7 +179,22 @@ try {
             Set-Item "env:$key" $value
         }
         Remove-Item Env:KYTY_SHADER_WARMUP_ONLY -ErrorAction SilentlyContinue
-        & "$PSScriptRoot/precompile-windows.ps1" -Game $Game -Seeds $seeds -Recorded ''
+        # Every static shard saves its own driver cache. Keep those writes away from
+        # gameplay's trained cache; the shared static binaries and inputs are unchanged.
+        $savedDriverKey = $env:KYTY_DRIVER_CACHE_KEY
+        try {
+            $env:KYTY_DRIVER_CACHE_KEY = $staticDriverKey
+            Write-Host 'Preparing static shaders with an isolated driver cache; gameplay cache preserved.'
+            & "$PSScriptRoot/precompile-windows.ps1" -Game $Game -Seeds $seeds -Recorded ''
+        } finally { $env:KYTY_DRIVER_CACHE_KEY = $savedDriverKey }
+        if (Test-Path $recording) {
+            Write-Host 'Preparing additional runtime variants from your recorded gameplay...'
+            & "$PSScriptRoot/run-windows.ps1" -Game $Game -Baseline -Precompile -Set ($pairs -join ',')
+            if ($LASTEXITCODE) { throw "Runtime variant warmup exited with code $LASTEXITCODE; see logs." }
+        } else {
+            Write-Host 'Static preparation completed. Play once to record runtime variants, then use Recorded cache.'
+        }
+        Write-Host 'New areas or resource states can still introduce shader variants absent from the static scan.'
     }
     Write-Host 'Shader preparation finished. Relaunch with run.cmd.'
 } catch {
