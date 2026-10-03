@@ -9,7 +9,16 @@ function Test-PythonExecutable([string]$path) {
     # Windows advertises Store launchers as python.exe even when Python is absent.
     if (!$path -or $path -match '[\\/]Microsoft[\\/]WindowsApps[\\/]' -or !(Test-Path $path -PathType Leaf)) { return $false }
     try {
-        & $path -c 'import sys,struct; sys.exit(0 if (3,11) <= sys.version_info[:2] < (3,15) and struct.calcsize("P")==8 else 1)' 2>$null | Out-Null
+        # Windows PowerShell 5.1 strips embedded double quotes from native arguments.
+        # Keep this program quote-free so a valid interpreter is not rejected.
+        & $path -c 'import sys; sys.exit(0 if (3,11) <= sys.version_info[:2] < (3,15) and sys.maxsize > 2**32 else 1)' 2>$null | Out-Null
+        return $LASTEXITCODE -eq 0
+    } catch { return $false }
+}
+function Test-PythonImport([string]$path, [string]$module) {
+    if ($module -notmatch '^[A-Za-z_][A-Za-z0-9_]*$') { throw 'Invalid Python module name.' }
+    try {
+        & $path -c ("import " + $module) 2>$null | Out-Null
         return $LASTEXITCODE -eq 0
     } catch { return $false }
 }
@@ -44,21 +53,19 @@ function Ensure-ShaderPython {
             $install = Start-Process $installer -ArgumentList $arguments -Wait -PassThru
             if ($install.ExitCode -notin @(0,3010)) { throw "Python setup failed with exit code $($install.ExitCode)." }
             $base = Join-Path $target 'python.exe'
-            if (!(Test-PythonExecutable $base)) { throw 'Python setup completed but its interpreter could not start.' }
+            if (!(Test-PythonExecutable $base)) { throw "Python setup completed but validation failed at $base. Expected a working 64-bit Python 3.11-3.14 interpreter." }
             Remove-Item $installer -ErrorAction SilentlyContinue
         }
         Write-Host 'Creating the shader-preparation Python environment...'
         & $base -m venv $venvRoot | Out-Host
         if ($LASTEXITCODE -or !(Test-PythonExecutable $python)) { throw 'Could not create the shader-preparation Python environment.' }
     }
-    & $python -c 'import importlib.util,sys; sys.exit(0 if importlib.util.find_spec("numpy") else 1)'
-    if ($LASTEXITCODE) {
+    if (!(Test-PythonImport $python 'numpy')) {
         Write-Host 'Installing NumPy for shader preparation...'
         & $python -m pip install --disable-pip-version-check --only-binary=:all: numpy | Out-Host
         if ($LASTEXITCODE) { throw 'NumPy download/install failed. Check the Internet connection and rerun Full game precompile.' }
     }
-    try { & $python -c 'import numpy' 2>$null } catch { throw 'NumPy is installed but could not load in the shader-preparation environment.' }
-    if ($LASTEXITCODE) { throw 'NumPy is installed but could not load in the shader-preparation environment.' }
+    if (!(Test-PythonImport $python 'numpy')) { throw 'NumPy is installed but could not load in the shader-preparation environment.' }
     return $python
 }
 $result = 0
@@ -98,14 +105,29 @@ try {
     if ($CheckOnly) {
         if (Test-PythonExecutable (Join-Path $env:LOCALAPPDATA 'Microsoft/WindowsApps/python.exe')) { throw 'Microsoft Store Python alias was incorrectly accepted.' }
         Write-Host 'PYTHON_ALIAS_CHECK passed'
+        if ($env:GITHUB_ACTIONS -eq 'true') {
+            # Exercise the actual native-command probes under the workflow's powershell.exe.
+            $candidates = @((Get-Command python -CommandType Application -ErrorAction SilentlyContinue).Source)
+            if ($env:RUNNER_TOOL_CACHE) {
+                $candidates += @(Get-ChildItem (Join-Path $env:RUNNER_TOOL_CACHE 'Python/*/x64/python.exe') -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName })
+            }
+            $ciPython = $candidates | Where-Object { Test-PythonExecutable $_ } | Select-Object -First 1
+            if (!$ciPython) { throw 'CI did not accept an installed supported Python interpreter.' }
+            if (!(Test-PythonImport $ciPython 'sys')) { throw 'Python import probe rejected a built-in module.' }
+            if (Test-PythonImport $ciPython 'kyty_intentionally_missing_probe_module') { throw 'Python import probe accepted a missing module.' }
+            Write-Host 'PYTHON_INTERPRETER_AND_IMPORT_CHECK passed'
+        }
         Write-Host "PRECOMPILE_PLAN mode=$Mode title=$title version=$version"
         Write-Host ('PRECOMPILE_FLAGS ' + ($pairs -join ','))
         if ($Mode -eq 'Recorded') {
             & "$PSScriptRoot/run-windows.ps1" -Game $Game -Baseline -Precompile -Set ($pairs -join ',') -DryRun
+            if ($LASTEXITCODE) { throw 'Recorded precompile dry-run failed.' }
         } else {
             Write-Host "PRECOMPILE_SEEDS $seeds"
             Write-Host 'PRECOMPILE_RECORDED_SEEDS none; generate from selected game files'
         }
+        # A deliberately failing import is part of the CI probe, not this plan's result.
+        $global:LASTEXITCODE = 0
         return
     }
     Set-Content "$PSScriptRoot/game-path.txt" $Game -Encoding UTF8
