@@ -5,22 +5,42 @@ param(
     [switch]$NoPause
 )
 $ErrorActionPreference = 'Stop'
+function Test-PythonProgram([string]$path, [string]$program) {
+    # Own the process exit code; optional probes must not contaminate LASTEXITCODE.
+    # These small programs contain no embedded double quotes.
+    $process = New-Object System.Diagnostics.Process
+    try {
+        $process.StartInfo.FileName = $path
+        $process.StartInfo.Arguments = '-c "' + $program + '"'
+        $process.StartInfo.UseShellExecute = $false
+        $process.StartInfo.CreateNoWindow = $true
+        $process.StartInfo.RedirectStandardOutput = $true
+        $process.StartInfo.RedirectStandardError = $true
+        [void]$process.Start()
+        $stdout = $process.StandardOutput.ReadToEndAsync()
+        $stderr = $process.StandardError.ReadToEndAsync()
+        if (!$process.WaitForExit(30000)) {
+            $process.Kill()
+            $process.WaitForExit()
+            $script:PythonProbeFailure = 'Python validation timed out.'
+            return $false
+        }
+        [void]$stdout.Result
+        $script:PythonProbeFailure = $stderr.Result.Trim()
+        return $process.ExitCode -eq 0
+    } catch {
+        $script:PythonProbeFailure = $_.Exception.Message
+        return $false
+    } finally { $process.Dispose() }
+}
 function Test-PythonExecutable([string]$path) {
     # Windows advertises Store launchers as python.exe even when Python is absent.
     if (!$path -or $path -match '[\\/]Microsoft[\\/]WindowsApps[\\/]' -or !(Test-Path $path -PathType Leaf)) { return $false }
-    try {
-        # Windows PowerShell 5.1 strips embedded double quotes from native arguments.
-        # Keep this program quote-free so a valid interpreter is not rejected.
-        & $path -c 'import sys; sys.exit(0 if (3,11) <= sys.version_info[:2] < (3,15) and sys.maxsize > 2**32 else 1)' 2>$null | Out-Null
-        return $LASTEXITCODE -eq 0
-    } catch { return $false }
+    return (Test-PythonProgram $path 'import sys; sys.exit(0 if (3,11) <= sys.version_info[:2] < (3,15) and sys.maxsize > 2**32 else 1)')
 }
 function Test-PythonImport([string]$path, [string]$module) {
     if ($module -notmatch '^[A-Za-z_][A-Za-z0-9_]*$') { throw 'Invalid Python module name.' }
-    try {
-        & $path -c ("import " + $module) 2>$null | Out-Null
-        return $LASTEXITCODE -eq 0
-    } catch { return $false }
+    return (Test-PythonProgram $path ("import " + $module))
 }
 function Ensure-ShaderPython {
     $toolRoot = Join-Path $env:LOCALAPPDATA 'KytyPS5/ShaderTools'
@@ -53,7 +73,7 @@ function Ensure-ShaderPython {
             $install = Start-Process $installer -ArgumentList $arguments -Wait -PassThru
             if ($install.ExitCode -notin @(0,3010)) { throw "Python setup failed with exit code $($install.ExitCode)." }
             $base = Join-Path $target 'python.exe'
-            if (!(Test-PythonExecutable $base)) { throw "Python setup completed but validation failed at $base. Expected a working 64-bit Python 3.11-3.14 interpreter." }
+            if (!(Test-PythonExecutable $base)) { throw "Python setup completed but validation failed at $base. Expected a working 64-bit Python 3.11-3.14 interpreter. $script:PythonProbeFailure" }
             Remove-Item $installer -ErrorAction SilentlyContinue
         }
         Write-Host 'Creating the shader-preparation Python environment...'
@@ -114,14 +134,15 @@ try {
             $ciPython = $candidates | Where-Object { Test-PythonExecutable $_ } | Select-Object -First 1
             if (!$ciPython) { throw 'CI did not accept an installed supported Python interpreter.' }
             if (!(Test-PythonImport $ciPython 'sys')) { throw 'Python import probe rejected a built-in module.' }
+            $probeExitBefore = $global:LASTEXITCODE
             if (Test-PythonImport $ciPython 'kyty_intentionally_missing_probe_module') { throw 'Python import probe accepted a missing module.' }
+            if ($global:LASTEXITCODE -ne $probeExitBefore) { throw 'Optional Python probe changed the launcher exit status.' }
             Write-Host 'PYTHON_INTERPRETER_AND_IMPORT_CHECK passed'
         }
         Write-Host "PRECOMPILE_PLAN mode=$Mode title=$title version=$version"
         Write-Host ('PRECOMPILE_FLAGS ' + ($pairs -join ','))
         if ($Mode -eq 'Recorded') {
             & "$PSScriptRoot/run-windows.ps1" -Game $Game -Baseline -Precompile -Set ($pairs -join ',') -DryRun
-            if ($LASTEXITCODE) { throw 'Recorded precompile dry-run failed.' }
         } else {
             Write-Host "PRECOMPILE_SEEDS $seeds"
             Write-Host 'PRECOMPILE_RECORDED_SEEDS none; generate from selected game files'
@@ -150,6 +171,7 @@ try {
     }
     Write-Host 'Shader preparation finished. Relaunch with run.cmd.'
 } catch {
+    if ($CheckOnly) { throw }
     $result = 1
     Write-Host "Shader preparation failed: $($_.Exception.Message)" -ForegroundColor Red
 } finally {
