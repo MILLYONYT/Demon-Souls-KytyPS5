@@ -5,6 +5,62 @@ param(
     [switch]$NoPause
 )
 $ErrorActionPreference = 'Stop'
+function Test-PythonExecutable([string]$path) {
+    # Windows advertises Store launchers as python.exe even when Python is absent.
+    if (!$path -or $path -match '[\\/]Microsoft[\\/]WindowsApps[\\/]' -or !(Test-Path $path -PathType Leaf)) { return $false }
+    try {
+        & $path -c 'import sys,struct; sys.exit(0 if (3,11) <= sys.version_info[:2] < (3,15) and struct.calcsize("P")==8 else 1)' 2>$null | Out-Null
+        return $LASTEXITCODE -eq 0
+    } catch { return $false }
+}
+function Ensure-ShaderPython {
+    $toolRoot = Join-Path $env:LOCALAPPDATA 'KytyPS5/ShaderTools'
+    $venvRoot = Join-Path $toolRoot 'venv'
+    $python = Join-Path $venvRoot 'Scripts/python.exe'
+    if (!(Test-PythonExecutable $python)) {
+        $base = Join-Path $toolRoot 'Python314/python.exe'
+        if (!(Test-PythonExecutable $base)) {
+            $base = $null
+            foreach ($candidate in @(Get-Command python,python3 -CommandType Application -All -ErrorAction SilentlyContinue)) {
+                if (Test-PythonExecutable $candidate.Source) { $base = $candidate.Source; break }
+            }
+        }
+        if (!$base) {
+            Write-Host 'No working Python installation found. Setting up Python for shader preparation...'
+            New-Item -ItemType Directory -Force $toolRoot | Out-Null
+            $installer = Join-Path $toolRoot 'python-3.14.8-amd64.exe'
+            [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+            Invoke-WebRequest 'https://www.python.org/ftp/python/3.14.8/python-3.14.8-amd64.exe' -OutFile $installer -UseBasicParsing
+            $hash = (Get-FileHash $installer -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($hash -ne '759be887b96e736a3ca886daf8d575f18fcae1a09efab6902f42d59e8999f8ef') {
+                throw 'The Python installer checksum does not match the official release. Download cancelled.'
+            }
+            $signature = Get-AuthenticodeSignature $installer
+            if ($signature.Status -ne 'Valid' -or $signature.SignerCertificate.Subject -notmatch 'CN=Python Software Foundation(?:,|$)') {
+                throw 'The Python installer signature could not be verified.'
+            }
+            $target = Join-Path $toolRoot 'Python314'
+            $arguments = '/quiet /norestart InstallAllUsers=0 PrependPath=0 AssociateFiles=0 Include_launcher=0 Include_test=0 Include_doc=0 Include_pip=1 Include_tcltk=0 Shortcuts=0 TargetDir="' + $target + '"'
+            $install = Start-Process $installer -ArgumentList $arguments -Wait -PassThru
+            if ($install.ExitCode -notin @(0,3010)) { throw "Python setup failed with exit code $($install.ExitCode)." }
+            $base = Join-Path $target 'python.exe'
+            if (!(Test-PythonExecutable $base)) { throw 'Python setup completed but its interpreter could not start.' }
+            Remove-Item $installer -ErrorAction SilentlyContinue
+        }
+        Write-Host 'Creating the shader-preparation Python environment...'
+        & $base -m venv $venvRoot | Out-Host
+        if ($LASTEXITCODE -or !(Test-PythonExecutable $python)) { throw 'Could not create the shader-preparation Python environment.' }
+    }
+    & $python -c 'import importlib.util,sys; sys.exit(0 if importlib.util.find_spec("numpy") else 1)'
+    if ($LASTEXITCODE) {
+        Write-Host 'Installing NumPy for shader preparation...'
+        & $python -m pip install --disable-pip-version-check --only-binary=:all: numpy | Out-Host
+        if ($LASTEXITCODE) { throw 'NumPy download/install failed. Check the Internet connection and rerun Full game precompile.' }
+    }
+    try { & $python -c 'import numpy' 2>$null } catch { throw 'NumPy is installed but could not load in the shader-preparation environment.' }
+    if ($LASTEXITCODE) { throw 'NumPy is installed but could not load in the shader-preparation environment.' }
+    return $python
+}
 $result = 0
 try {
     if (!$Game -and (Test-Path "$PSScriptRoot/game-path.txt")) {
@@ -40,6 +96,8 @@ try {
     $seeds = Join-Path $seedRoot 'seeds.seeds'
     $recording = Join-Path $PSScriptRoot '_PipelineCache/warmup-legacy/recording.shaders'
     if ($CheckOnly) {
+        if (Test-PythonExecutable (Join-Path $env:LOCALAPPDATA 'Microsoft/WindowsApps/python.exe')) { throw 'Microsoft Store Python alias was incorrectly accepted.' }
+        Write-Host 'PYTHON_ALIAS_CHECK passed'
         Write-Host "PRECOMPILE_PLAN mode=$Mode title=$title version=$version"
         Write-Host ('PRECOMPILE_FLAGS ' + ($pairs -join ','))
         if ($Mode -eq 'Recorded') {
@@ -58,9 +116,9 @@ try {
         & "$PSScriptRoot/run-windows.ps1" -Game $Game -Baseline -Precompile -Set ($pairs -join ',')
         if ($LASTEXITCODE) { throw "Recorded shader precompile exited with code $LASTEXITCODE; see logs." }
     } else {
-        if (!(Get-Command python -ErrorAction SilentlyContinue)) { throw 'Full game precompile requires Python 3 and NumPy. Install Python, then run: python -m pip install numpy' }
-        & python -c 'import numpy'
-        if ($LASTEXITCODE) { throw 'NumPy is missing. Install it with: python -m pip install numpy' }
+        $python = Ensure-ShaderPython
+        # The scanner launches python by name; resolve it to the verified environment.
+        $env:PATH = (Split-Path $python) + ';' + $env:PATH
         foreach ($pair in $pairs) {
             $key, $value = $pair -split '=', 2
             Set-Item "env:$key" $value
