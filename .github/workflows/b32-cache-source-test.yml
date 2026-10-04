@@ -1,4 +1,4 @@
-name: KytyPS5 B144 fiber stack stability
+name: KytyPS5 B145 fiber stack stability
 on:
   push:
     branches: [best132-shader-precompile-settings]
@@ -14,7 +14,7 @@ permissions:
   contents: read
 jobs:
   windows-x64:
-    name: Build B144 with preserved shader caches and guarded fiber stacks
+    name: Build B145 with preserved shader caches and guarded fiber stacks
     runs-on: windows-2022
     steps:
       - uses: actions/checkout@v4
@@ -116,7 +116,7 @@ jobs:
         run: |
           python tools/ci/fiber-stack-preflight.py source _Build/fiber-preflight.cpp
           if ($LASTEXITCODE) { throw 'Fiber preflight extraction failed' }
-          clang-cl /std:c++20 /O2 /EHsc /clang:-flto=thin /clang:-march=x86-64-v3 _Build/fiber-preflight.cpp /Fe:_Build/fiber-preflight.exe
+          clang-cl /std:c++20 /O2 /EHsc /clang:-flto=thin /clang:-fuse-ld=lld /clang:-march=x86-64-v3 _Build/fiber-preflight.cpp /Fe:_Build/fiber-preflight.exe
           if ($LASTEXITCODE) { throw 'Fiber preflight compilation failed' }
           $process = Start-Process _Build/fiber-preflight.exe -NoNewWindow -PassThru
           $null = $process.Handle
@@ -129,7 +129,7 @@ jobs:
           -DCMAKE_BUILD_TYPE=Release -DKYTY_BUILD_LAUNCHER=OFF
           -DKYTY_MARCH=x86-64-v3 -DKYTY_THIN_LTO=ON
           -DKYTY_BUILD_ORIGIN=Fork -DKYTY_BUILD_REPOSITORY=${{ github.repository }}
-          -DKYTY_RELEASE_TAG=B144-FIBER-STACKS-${{ github.run_number }}
+          -DKYTY_RELEASE_TAG=B145-FIBER-STACKS-${{ github.run_number }}
           "-DCMAKE_CXX_FLAGS=/DWIN32 /D_WINDOWS /W3 /GR /EHsc /DKYTY_B32_FAST_CPU_SETS /DKYTY_B32_QUIET_SHADER_PHASES"
           -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl
       - name: Verify required Windows compiler flags
@@ -299,7 +299,7 @@ jobs:
             user_emulator_patches_included=$true
             fiber_stack_fix_upstream='6e7c1dab156b9ef66d4490ebed3fe93d08a2d122'
             fiber_stack_headroom_bytes=262144
-            windows_stack_regression='fresh GetCurrentThreadStackLimits calls; original stack base and caller containment; allow native guard-page growth'
+            windows_stack_regression='fresh volatile NT_TIB reads; original stack base and caller containment; allow native guard-page growth'
             fiber_migration_tls_fix='noinline context-changing and ownership APIs; resolve final return context on destination thread'
             windows_fiber_stack_bounds='update NT_TIB StackBase/StackLimit before each transfer; restore caller bounds on yield/termination'
             memory_stack_temporary_fix_upstream='9d1fabe240c274a64b0b54904bf1c399208b2f55'
@@ -417,7 +417,7 @@ jobs:
       - name: Upload clean standalone public fork
         uses: actions/upload-artifact@v4
         with:
-          name: KytyPS5-B144-FIBER-STACKS-Windows-x64-${{ github.run_number }}
+          name: KytyPS5-B145-FIBER-STACKS-Windows-x64-${{ github.run_number }}
           path: _Build/package/**
           if-no-files-found: error
 
