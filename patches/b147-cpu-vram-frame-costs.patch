@@ -1,0 +1,837 @@
+diff --git a/src/graphics/guest_gpu/graphicsRun.cpp b/src/graphics/guest_gpu/graphicsRun.cpp
+--- a/src/graphics/guest_gpu/graphicsRun.cpp
++++ b/src/graphics/guest_gpu/graphicsRun.cpp
+@@ -1,3 +1,4 @@
++#include "frame-costs.h"
+ #include "graphics/guest_gpu/graphicsRun.h"
+ 
+ #include "common/assert.h"
+@@ -564,7 +565,7 @@
+ 				gpu->m_processing = false;
+ 				gpu->m_idle.Signal();
+ 				LiveTrace::Event(LiveTrace::RenderIdle, 1, 0);
+-				gpu->m_work_available.Wait(&gpu->m_queue_mutex);
++				{ FrameCosts::Scope idle(FrameCosts::Idle); gpu->m_work_available.Wait(&gpu->m_queue_mutex); }
+ 				LiveTrace::Event(LiveTrace::RenderIdle, 0, 0);
+ 			}
+ 			if (gpu->m_stopping && gpu->m_commands.empty() && gpu->m_submission_count == 0) {
+@@ -589,7 +590,7 @@
+ 				if (selected_queue < 0) {
+ 					gpu->m_processing = false;
+ 					LiveTrace::Event(LiveTrace::RenderIdle, 1, 1);
+-					gpu->m_work_available.WaitFor(&gpu->m_queue_mutex, 100);
++					{ FrameCosts::Scope idle(FrameCosts::Idle); gpu->m_work_available.WaitFor(&gpu->m_queue_mutex, 100); }
+ 					LiveTrace::Event(LiveTrace::RenderIdle, 0, 1);
+ 					for (auto& queue: gpu->m_queues) {
+ 						if (!queue.empty()) {
+@@ -659,6 +660,7 @@
+ }
+ 
+ bool GuestGpu::Process(Submission& submission) {
++	FrameCosts::Scope frame_cost(FrameCosts::Translation);
+ 	if (submission.type == SubmissionType::FrameBoundary) {
+ 		EXIT_IF(submission.started || submission.queue_id != 0);
+ 		Common::LockGuard lock(m_queue_mutex);
+@@ -1864,9 +1866,10 @@
+ #ifdef KYTY_LOCAL_VULKAN_RECORDING
+ 	{
+ 		// KYTY_GLOBAL_BARRIER_DEDUPE: a barrier orders all earlier work in submission order, so
+-		// one with nothing recorded since the previous barrier orders nothing new.
++		// one with nothing recorded since the previous barrier orders nothing new (draws recorded as
++		// packets are work too).
+ 		static uint64_t last_work = UINT64_MAX;
+-		const auto      work      = LocalVulkanRecording::WorkCalls();
++		const auto      work      = LocalVulkanRecording::RecordedWork();
+ 		if (work == last_work && kyty_local_global_barrier_dedupe.load(std::memory_order_relaxed) != 0) return;
+ 		last_work = work + 1; // this barrier's own recorded call
+ 	}
+@@ -1983,6 +1986,7 @@
+ }
+ 
+ void CommandProcessor::Flip() {
++	FrameCosts::Frame();
+ 	LiveControl::Flip();
+ 	FrameCapture::OnFlip();
+ 	CheckBuffer();
+@@ -2001,6 +2005,7 @@
+ }
+ 
+ void CommandProcessor::Flip(void* dst_gpu_addr, uint32_t value) {
++	FrameCosts::Frame();
+ 	CheckBuffer();
+ 
+ 	if (GraphicsRunDebugDumpEnabled()) {
+@@ -2023,6 +2028,7 @@
+ 
+ void CommandProcessor::FlipWithInterrupt(uint32_t eop_event_type, uint32_t cache_action,
+                                          void* dst_gpu_addr, uint32_t value) {
++	FrameCosts::Frame();
+ 	CheckBuffer();
+ 
+ 	if (GraphicsRunDebugDumpEnabled()) {
+diff --git a/src/graphics/host_gpu/graphicContext.h b/src/graphics/host_gpu/graphicContext.h
+--- a/src/graphics/host_gpu/graphicContext.h
++++ b/src/graphics/host_gpu/graphicContext.h
+@@ -152,6 +152,7 @@
+ 	vk::PipelineStageFlags2 pl_stage    = vk::PipelineStageFlagBits2::eAllCommands;
+ 	vk::AccessFlags2        access_mask = vk::AccessFlagBits2::eNone;
+ 	vk::ImageLayout         layout      = vk::ImageLayout::eUndefined;
++	bool                    guest       = false; // set by a guest draw's or dispatch's bindings (a transit group)
+ };
+ 
+ struct VulkanImage {
+diff --git a/src/graphics/host_gpu/renderer/cache/textureCache.cpp b/src/graphics/host_gpu/renderer/cache/textureCache.cpp
+--- a/src/graphics/host_gpu/renderer/cache/textureCache.cpp
++++ b/src/graphics/host_gpu/renderer/cache/textureCache.cpp
+@@ -1,3 +1,5 @@
++#include "frame-costs.h"
++#include "vram-pressure.h"
+ #include "graphics/host_gpu/renderer/cache/textureCache.h"
+ #include "slow-log.h"
+ 
+@@ -1481,6 +1483,7 @@
+ }
+ 
+ void TextureCache::InitializeImage(ImageId id) {
++	FrameCosts::Scope frame_cost(FrameCosts::Texture);
+ 	using Clock = std::chrono::steady_clock;
+ 	auto&             image = m_slot_images[id];
+ 	Clock::time_point marks[3] {Clock::now()};
+@@ -3177,6 +3180,29 @@
+ 	if (m_graphics.CanReportMemoryUsage()) {
+ 		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
+ 	}
++    // Reclaim only unused, CPU-backed sampled textures under the CURRENT
++    // budget. GPU-written targets/depth/stencil and their data stay untouched.
++    // Existing deferred destruction keeps in-flight commands safe.
++    if (VramPressure::Enabled() && m_graphics.CanReportMemoryUsage()) {
++        const auto budget=m_graphics.GetTotalMemoryBudget();
++        if (VramPressure::Reclaim(m_total_used_memory,budget) && tick>=16) {
++            m_graphics.TrimImagePool();
++            m_total_used_memory=m_graphics.GetDeviceMemoryUsage();
++            std::vector<ImageId> clean_candidates;
++            clean_candidates.reserve(8);
++            size_t visited=0;
++            if (VramPressure::Reclaim(m_total_used_memory,budget)) m_lru_cache.ForEachItemBelow(tick-16,[&](ImageId id) {
++                auto* image=m_slot_images.try_get(id);
++                if(image && VramPressure::CpuBackedSampled(*image,ImageMetadataKind::None))
++                    clean_candidates.push_back(id);
++                return ++visited>=128 || clean_candidates.size()>=8;
++            });
++            for(const auto id:clean_candidates) DeleteImage(id);
++            if(tick%60==0) std::printf("VRAM-PRESSURE usage=%llu budget=%llu clean-textures-retired=%zu\n",
++                static_cast<unsigned long long>(m_total_used_memory),
++                static_cast<unsigned long long>(budget),clean_candidates.size());
++        }
++    }
+ 	if (m_total_used_memory < m_trigger_gc_memory) {
+ 		return;
+ 	}
+diff --git a/src/graphics/host_gpu/renderer/commandScheduler.cpp b/src/graphics/host_gpu/renderer/commandScheduler.cpp
+--- a/src/graphics/host_gpu/renderer/commandScheduler.cpp
++++ b/src/graphics/host_gpu/renderer/commandScheduler.cpp
+@@ -1,3 +1,4 @@
++#include "frame-costs.h"
+ #include "graphics/host_gpu/renderer/commandScheduler.h"
+ 
+ #include "common/assert.h"
+@@ -480,7 +481,7 @@
+ void ReplaySubmit(std::span<const LocalVulkanRecording::Segment> segments,
+                   const vk::detail::DispatchLoaderDynamic& dispatch) {
+ 	const auto& submit = *static_cast<const DeferredSubmit*>(segments[0].data);
+-	AsyncUpload::Wait(submit.upload_sequence);
++	{ FrameCosts::Scope upload_wait(FrameCosts::UploadWait); AsyncUpload::Wait(submit.upload_sequence); }
+ 	LiveTrace::Event(LiveTrace::GpuSubmit, submit.tick, 1);
+ 	if (submit.timestamp_slot != UINT32_MAX && LiveTrace::g_timestamp_pool != nullptr) {
+ 		dispatch.vkCmdWriteTimestamp(submit.command, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+diff --git a/src/graphics/host_gpu/renderer/image/image.cpp b/src/graphics/host_gpu/renderer/image/image.cpp
+--- a/src/graphics/host_gpu/renderer/image/image.cpp
++++ b/src/graphics/host_gpu/renderer/image/image.cpp
+@@ -8,6 +8,7 @@
+ #include "graphics/host_gpu/renderer/renderTarget.h"
+ #include "kernel/memory.h"
+ #include "live-trace.h"
++#include "guest-barrier-policy.h"
+ 
+ #include <algorithm>
+ #include <array>
+@@ -136,6 +137,12 @@
+ 	// per transition was one of the render thread's most frequent allocations.
+ 	thread_local Barriers barriers;
+ 	barriers.clear();
++	// Guest draws and dispatches repeating a shader write in the same layout and access are ordered by the
++	// guest's own barriers (partial flushes and cache events record full barriers, EmitGlobalBarrier), as on
++	// the console, where nothing else orders the storage writes of consecutive draws: no barrier between them
++	// (each was also a render pass break: ~800 per frame in the deferred decal pass). A repeated write after
++	// any other access (an upload, a copy, the emulator's own compute) keeps its barrier.
++	const bool guest = GuestBarrierReuse() && g_transit_group != 0;
+ 	if (partial || has_subresource_states) {
+ 		if (!has_subresource_states) {
+ 			subresource_states.resize(info.resources.levels * info.resources.layers, state);
+@@ -155,7 +162,8 @@
+ 				                              vk::AccessFlagBits2::eShaderWrite |
+ 				                              vk::AccessFlagBits2::eMemoryWrite;
+ 				const bool     repeated_write =
+-				    static_cast<bool>(subresource_state.access_mask & write_access);
++				    static_cast<bool>(subresource_state.access_mask & write_access) &&
++				    !(guest && subresource_state.guest);
+ 				if (subresource_state.layout != destination_layout ||
+ 				    subresource_state.access_mask != destination_access || repeated_write) {
+ 					vk::ImageMemoryBarrier2 barrier {};
+@@ -174,7 +182,7 @@
+ 					barrier.subresourceRange.baseArrayLayer = layer;
+ 					barrier.subresourceRange.layerCount     = 1;
+ 					barriers.push_back(barrier);
+-					subresource_state = {destination_stage, destination_access, destination_layout};
++					subresource_state = {destination_stage, destination_access, destination_layout, guest};
+ 				}
+ 			}
+ 		}
+@@ -188,8 +196,8 @@
+ 		                                vk::AccessFlagBits2::eMemoryWrite;
+ 		const bool     repeated_write = static_cast<bool>(state.access_mask & write_access);
+ 		if (state.layout == destination_layout && state.access_mask == destination_access &&
+-		    (!repeated_write || (DedupeTransitGroups() && g_transit_group != 0 &&
+-		                         transit_group == g_transit_group))) {
++		    (!repeated_write || (guest && state.guest) ||
++		     (DedupeTransitGroups() && g_transit_group != 0 && transit_group == g_transit_group))) {
+ 			return barriers;
+ 		}
+ 
+@@ -211,7 +219,7 @@
+ 		barriers.push_back(barrier);
+ 	}
+ 
+-	state         = {destination_stage, destination_access, destination_layout};
++	state         = {destination_stage, destination_access, destination_layout, guest};
+ 	transit_group = g_transit_group;
+ 	return barriers;
+ }
+diff --git a/src/graphics/host_gpu/renderer/masterSemaphore.cpp b/src/graphics/host_gpu/renderer/masterSemaphore.cpp
+--- a/src/graphics/host_gpu/renderer/masterSemaphore.cpp
++++ b/src/graphics/host_gpu/renderer/masterSemaphore.cpp
+@@ -1,3 +1,4 @@
++#include "frame-costs.h"
+ #include "graphics/host_gpu/renderer/masterSemaphore.h"
+ 
+ #include "common/assert.h"
+@@ -45,6 +46,7 @@
+ 		return;
+ 	}
+ 
++	FrameCosts::Scope frame_cost(FrameCosts::GpuWait);
+ 	LiveCensus::Scope census(LiveCensus::GpuWait, reinterpret_cast<uint64_t>(__builtin_return_address(0)),
+ 	                         reinterpret_cast<uint64_t>(__builtin_return_address(1)));
+ 	vk::SemaphoreWaitInfo wait_info {};
+diff --git a/src/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp b/src/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp
+--- a/src/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp
++++ b/src/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp
+@@ -1,3 +1,4 @@
++#include "frame-costs.h"
+ #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
+ 
+ #include "common/assert.h"
+@@ -1623,6 +1624,7 @@
+ }
+ 
+ bool PipelineCache::SaveDriverCache() {
++	SlowLog::Scope checkpoint_cost([](double ms) { std::printf("SLOW DriverCacheCheckpoint %.1f ms\n", ms); }, SlowLog::HitchThreshold());
+ 	std::lock_guard save_lock(m_driver_save_mutex);
+ 	if (m_driver_cache == nullptr) return true;
+ 	// Snapshot into a private destination: the live caches stay available to their
+@@ -1669,6 +1671,9 @@
+ 	payload.resize(size);
+ 	auto       prefix       = DriverCacheSignature(m_graphics.GetPhysicalDeviceProperties(), m_driver_cache_key);
+ 	const auto payload_hash = XXH3_64bits(payload.data(), payload.size());
++	std::error_code exists_error;
++	if (m_checkpoint_content.Matches(payload_hash, payload.size(),
++	        std::filesystem::is_regular_file(m_driver_cache_path, exists_error))) return true;
+ 	prefix.append(reinterpret_cast<const char*>(&payload_hash), sizeof(payload_hash));
+ 	if (!Common::File::CreateDirectories(m_driver_cache_path.parent_path())) {
+ 		PipelineCacheLog("Vulkan pipeline cache: failed to create cache directory");
+@@ -1691,6 +1696,7 @@
+ 		                 Common::PathToString(m_driver_cache_path));
+ 		return false;
+ 	}
++	m_checkpoint_content.Saved(payload_hash, payload.size());
+ 	PipelineCacheLog("Vulkan pipeline cache: saved {} bytes to {}", payload.size(),
+ 	                 Common::PathToString(m_driver_cache_path));
+ 	// Save may run after warmup while gameplay still compiles pipelines.
+@@ -1879,6 +1885,7 @@
+     const ShaderPixelInputInfo* ps_input_info, vk::PrimitiveTopology topology,
+     bool primitive_restart_enable, const ShaderProgram& vertex_program,
+     const ShaderProgram& pixel_program, bool native_bindings, bool async) {
++	FrameCosts::Scope frame_cost(FrameCosts::Pipeline);
+ 	KYTY_PROFILER_BLOCK("PipelineCache::CreatePipeline(Gfx)", profiler::colors::DeepOrangeA200);
+ 
+ 	EXIT_IF(colors.size() > RENDER_COLOR_ATTACHMENTS_MAX);
+@@ -2130,6 +2137,7 @@
+ PipelineCache::Pipeline&
+ PipelineCache::CreateComputePipeline(const ShaderComputeInputInfo& input_info,
+                                      const ShaderProgram&          compute_program) {
++	FrameCosts::Scope frame_cost(FrameCosts::Pipeline);
+ 	KYTY_PROFILER_BLOCK("PipelineCache::CreatePipeline(Compute)", profiler::colors::RedA100);
+ 
+ 	EXIT_IF(!compute_program);
+diff --git a/src/graphics/host_gpu/renderer/pipeline/pipelineCache.h b/src/graphics/host_gpu/renderer/pipeline/pipelineCache.h
+--- a/src/graphics/host_gpu/renderer/pipeline/pipelineCache.h
++++ b/src/graphics/host_gpu/renderer/pipeline/pipelineCache.h
+@@ -1,6 +1,7 @@
+ #ifndef EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_PIPELINECACHE_H_
+ #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_PIPELINECACHE_H_
+ 
++#include "checkpoint-content.h"
+ #include "common/abi.h"
+ #include "common/assert.h"
+ #include "common/common.h"
+@@ -307,6 +308,7 @@
+ 	// Background optimization must not monopolize the cache probed by first-use draws.
+ 	vk::PipelineCache             m_optimizer_cache = nullptr;
+ 	std::mutex                   m_driver_save_mutex;
++	CheckpointContent            m_checkpoint_content;
+ 	std::unique_ptr<DriverCacheCheckpoint> m_driver_checkpoint;
+ 	// The static precompile's pipelines (_PipelineCache/static), kept across emulator builds:
+ 	// GraphicContext::static_pipeline_cache while loaded.
+diff --git a/src/graphics/host_gpu/renderer/renderDraw.cpp b/src/graphics/host_gpu/renderer/renderDraw.cpp
+--- a/src/graphics/host_gpu/renderer/renderDraw.cpp
++++ b/src/graphics/host_gpu/renderer/renderDraw.cpp
+@@ -1,3 +1,4 @@
++#include "guest-barrier-policy.h"
+ #include "graphics/host_gpu/renderer/renderDraw.h"
+ #include "live-trace-gpu.h"
+ 
+@@ -760,8 +761,17 @@
+ 			layout = vk::ImageLayout::eGeneral;
+ 		}
+ 		// The attachment store writes even when guest depth/stencil tests do not.
+-		const auto access = vk::AccessFlagBits2::eDepthStencilAttachmentRead |
+-		                    vk::AccessFlagBits2::eDepthStencilAttachmentWrite;
++		auto access = vk::AccessFlagBits2::eDepthStencilAttachmentRead |
++		              vk::AccessFlagBits2::eDepthStencilAttachmentWrite;
++		// A target shaders sampled in this layout keeps the shader reads in its access while no aspect they sample
++		// is written as an attachment (no hazard between the two uses): draws alternating between them (the decal
++		// pass: a stencil mark, then a decal sampling depth) need no barrier, nor a render pass break, each.
++		if (const auto& current = image.backing.state;
++		    GuestBarrierReuse() && image.backing.subresource_states.empty() && current.layout == layout &&
++		    static_cast<bool>(current.access_mask & vk::AccessFlagBits2::eShaderRead) &&
++		    !static_cast<bool>((image.binding.pixel_sampled_aspects | image.binding.other_sampled_aspects) & writable)) {
++			access |= vk::AccessFlagBits2::eShaderRead;
++		}
+ 		image.binding.attachment_layout = layout;
+ 		image.binding.attachment_access = access;
+ 		const auto& view                = depth.desc.view_info;
+diff --git a/src/graphics/host_gpu/vma.cpp b/src/graphics/host_gpu/vma.cpp
+--- a/src/graphics/host_gpu/vma.cpp
++++ b/src/graphics/host_gpu/vma.cpp
+@@ -1,3 +1,4 @@
++#include "vram-pressure.h"
+ #include "graphics/host_gpu/vulkanCommon.h"
+ 
+ #include <array>
+@@ -322,10 +323,14 @@
+ 	if (kyty_local_image_pool_mode.load(std::memory_order_relaxed) != 0) {
+ 		VmaAllocationInfo allocation_info {};
+ 		vmaGetAllocationInfo(allocator, image.allocation, &allocation_info);
+-		std::scoped_lock lock(g_image_pool_mutex);
++		const bool adaptive=VramPressure::Enabled() && CanReportMemoryUsage();
++        const auto current_usage=adaptive ? GetDeviceMemoryUsage() : uint64_t{0};
++        const auto current_budget=adaptive ? GetTotalMemoryBudget() : uint64_t{0};
++        std::scoped_lock lock(g_image_pool_mutex);
+ 		g_image_pool.push_back({ImagePoolKey(image), image.image, image.allocation, allocation_info.size});
+ 		g_image_pool_bytes += allocation_info.size;
+-		while (g_image_pool_bytes > g_image_pool_limit && !g_image_pool.empty()) {
++		const auto limit=adaptive ? VramPressure::PoolLimit(current_usage,current_budget,g_image_pool_bytes,g_image_pool_limit) : g_image_pool_limit;
++        while (g_image_pool_bytes > limit && !g_image_pool.empty()) {
+ 			auto& oldest = g_image_pool.front();
+ 			vmaDestroyImage(allocator, oldest.image, oldest.allocation);
+ 			g_image_pool_bytes -= oldest.bytes;
+diff --git a/src/graphics/shader/shader.cpp b/src/graphics/shader/shader.cpp
+--- a/src/graphics/shader/shader.cpp
++++ b/src/graphics/shader/shader.cpp
+@@ -1,5 +1,7 @@
+ #include "graphics/shader/shader.h"
+ #include "native-preparation-state.h"
++#include "shader-hash-memo.h"
++#include <cstdlib>
+ 
+ #include "common/assert.h"
+ #include "common/common.h"
+@@ -159,6 +161,14 @@
+ 	return XXH3_64bits(code.data(), code.size_bytes());
+ }
+ 
++static uint64_t CachedShaderCodeHash(uint64_t address, std::span<const uint32_t> code) {
++    static const int mode=[] { const char* v=std::getenv("KYTY_SHADER_HASH_CACHE"); return v ? std::atoi(v) : 1; }();
++    if (mode==0) return HashShaderCode(code);
++    thread_local auto cache=std::make_unique<ShaderHashMemo::Cache>();
++    return cache->Get(address, code.size_bytes(), g_shader_map_generation.load(std::memory_order_acquire),
++                      mode>=2, [&] { return HashShaderCode(code); });
++}
++
+ // Fills `params` in place: its user-data vector keeps its capacity across calls.
+ static void FillShaderParams(uint64_t shader_addr, const char* label, uint64_t declared_hash,
+                              std::span<const uint32_t> user_data, const ShaderMappedData& data,
+@@ -172,7 +182,7 @@
+ 	const auto code = std::span {reinterpret_cast<const uint32_t*>(shader_addr), code_words};
+ 	params.code = code;
+ 	params.user_data.assign(user_data.begin(), user_data.end());
+-	params.hash      = declared_hash != 0 ? declared_hash : HashShaderCode(code);
++	params.hash      = declared_hash != 0 ? declared_hash : CachedShaderCodeHash(shader_addr, code);
+ 	params.back_code = {};
+ }
+ 
+diff --git a/src/local/checkpoint-content.h b/src/local/checkpoint-content.h
+new file mode 100644
+--- /dev/null
++++ b/src/local/checkpoint-content.h
+@@ -0,0 +1,8 @@
++#pragma once
++#include <cstdint>
++#include <cstddef>
++struct CheckpointContent {
++    bool valid=false; uint64_t hash=0; size_t bytes=0;
++    bool Matches(uint64_t next_hash,size_t next_bytes,bool file_exists) const {return valid && file_exists && hash==next_hash && bytes==next_bytes;}
++    void Saved(uint64_t next_hash,size_t next_bytes) {hash=next_hash;bytes=next_bytes;valid=true;}
++};
+diff --git a/src/local/frame-costs.h b/src/local/frame-costs.h
+new file mode 100644
+--- /dev/null
++++ b/src/local/frame-costs.h
+@@ -0,0 +1,36 @@
++#pragma once
++#include <array>
++#include <chrono>
++#include <cstdio>
++#include <cstdlib>
++#include <cstdint>
++namespace FrameCosts {
++enum Kind {Translation, Texture, Pipeline, GpuWait, UploadWait, Idle, Count};
++inline bool Enabled() { static const bool enabled=[] {const char* v=std::getenv("KYTY_FRAME_COSTS"); return v && std::atoi(v)!=0;}(); return enabled; }
++// Exclusive nested accounting: GPU waits inside texture work are charged only
++// to waits. Reports describe this recording thread, not total CPU/GPU utilization.
++struct Ledger {
++    std::array<int64_t,Count> ns {}; int active=-1; int64_t start=0; unsigned frames=0;
++    void Charge(int64_t now) { if(active>=0) ns[active]+=now-start; start=now; }
++    int Enter(int kind,int64_t now) {Charge(now);int prior=active;active=kind;return prior;}
++    void Leave(int prior,int64_t now) {Charge(now);active=prior;}
++};
++inline thread_local Ledger ledger;
++inline int64_t Now() {return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();}
++class Scope {
++    bool enabled; int prior=-1;
++public:
++    explicit Scope(Kind kind):enabled(Enabled()) {if(enabled) prior=ledger.Enter(kind,Now());}
++    ~Scope() {if(enabled) ledger.Leave(prior,Now());}
++    Scope(const Scope&)=delete; Scope& operator=(const Scope&)=delete;
++};
++inline void Frame() {
++    if(!Enabled()) return;
++    ledger.Charge(Now());
++    if(++ledger.frames<60) return;
++    std::printf("FRAME-COSTS recording-thread avg/60frames ms translation=%.3f texture=%.3f pipeline=%.3f gpu-wait=%.3f upload-wait=%.3f idle=%.3f\n",
++        ledger.ns[Translation]/60e6,ledger.ns[Texture]/60e6,ledger.ns[Pipeline]/60e6,
++        ledger.ns[GpuWait]/60e6,ledger.ns[UploadWait]/60e6,ledger.ns[Idle]/60e6);
++    ledger.ns.fill(0); ledger.frames=0; ledger.start=Now();
++}
++}
+diff --git a/src/local/generate-vulkan-recording.py b/src/local/generate-vulkan-recording.py
+--- a/src/local/generate-vulkan-recording.py
++++ b/src/local/generate-vulkan-recording.py
+@@ -123,6 +123,11 @@
+         # Commands that do GPU work or synchronize: unchanged between two barriers = none in between.
+         if re.match(r'vkCmd(Draw|Dispatch|Copy|Fill|Clear|Blit|Resolve|UpdateBuffer|BeginRendering|PipelineBarrier|WriteTimestamp|ExecuteCommands)', name):
+             declarations.append('    ++g_work_calls;')
++        # Local diagnostic (live census): barriers by the code that records them.
++        if name.startswith('vkCmdPipelineBarrier'):
++            declarations.append('    if (LiveCensus::g_on.load(std::memory_order_relaxed) && LiveCensus::g_render) '
++                                'LiveCensus::Add(LiveCensus::Barrier, reinterpret_cast<uint64_t>(__builtin_return_address(0)), '
++                                f'{1 if "2" in name else 0} | LiveCensus::g_queue, 0);')
+         if ok:
+             deferred.append(name)
+             declarations.append('    if (auto* stream = pAllocator == nullptr ? RecordingStream() : nullptr) {'
+diff --git a/src/local/guest-barrier-policy.h b/src/local/guest-barrier-policy.h
+new file mode 100644
+--- /dev/null
++++ b/src/local/guest-barrier-policy.h
+@@ -0,0 +1,3 @@
++#pragma once
++#include <cstdlib>
++inline bool GuestBarrierReuse() {static const bool enabled=[] {const char* v=std::getenv("KYTY_GUEST_BARRIER_REUSE");return v ? std::atoi(v)!=0 : true;}();return enabled;}
+diff --git a/src/local/live-census.h b/src/local/live-census.h
+--- a/src/local/live-census.h
++++ b/src/local/live-census.h
+@@ -23,7 +23,8 @@
+ 	SrtInterpreter = 10, // a: shader hash, b: 1 no linear plan, 2 other sources, 3 other clean slots
+ 	CommandSync   = 11, // GPU-written command memory check before parsing (indirect tables)
+ 	DrawPhase     = 12, // a: pixel shader, b: phase (LogDrawPhase marks; DrawPhases below)
+-	Kinds         = 13
++	Barrier       = 13, // a: return address of the recorded vkCmdPipelineBarrier(2), b: 1 for the 2 form
++	Kinds         = 14
+ };
+ 
+ struct Entry {
+diff --git a/src/local/native-xpr.inc b/src/local/native-xpr.inc
+--- a/src/local/native-xpr.inc
++++ b/src/local/native-xpr.inc
+@@ -59,6 +59,10 @@
+ // N > 2: records stay N frames unused (2 before: a turn of the camera dropped every record behind it, and
+ // turning back stored them all again within the store budget, thousands of normal draws a frame for seconds).
+ [[gnu::used]] volatile std::atomic<uint32_t> kyty_local_native_xpr_keep_frames {0};
++// 1: a relocated key holds the object's descriptor bases (read through the draw's pointers) before its use in
++// the frame: the instances of one mesh keep their records when the frame draws them in another order (a culled
++// instance shifted every later use onto another instance's record, which rebound its descriptors).
++[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_native_xpr_instance_mode {0};
+ }
+ namespace {
+ // word_patch value of a logged word whose change reaches nothing the evaluation produces.
+@@ -604,6 +608,17 @@
+ 		bool     relocation_known = false;
+ 		bool     pointers_off     = false; // a record could not be traced through its pointers
+ 		uint64_t relocate         = 0;
++		// Relocation: descriptor base addresses (buffer and image dword 0) a record reads through a pointer of
++		// its roots' tables: the key words of the root, the pointer's offset from the root's base and the word's
++		// from the pointer's. They tell the pair's objects apart where their use in the frame does not (the
++		// tables are new copies every frame, the buffers they describe are the object's). From the pair's
++		// first traced record.
++		struct Identity {
++			uint8_t  low_word = 0, high_word = 0;
++			uint32_t pointer = 0, offset = 0;
++		};
++		std::vector<Identity> identity;
++		bool                  identity_known = false;
+ 	};
+ 	std::unordered_map<uint64_t, PairStats> pairs;
+ 	// Keys that missed, with the frame of their latest miss. A record pays off only
+@@ -682,6 +697,34 @@
+ 		}
+ 		return UINT32_MAX;
+ 	}
++	// Relocated objects (pair and mesh) whose record rebound its descriptors: their uses tell instances apart by
++	// their descriptor bases (NativeXprTry). Others keep their uses' records (no reads for the key).
++	std::vector<uint64_t> rebound = std::vector<uint64_t>(4096);
++	[[nodiscard]] bool    Rebound(uint64_t hash) const {
++		hash            = IndexHash(hash);
++		const auto mask = rebound.size() - 1;
++		for (uint64_t i = 0, at = hash & mask; i < 8; ++i, at = (at + 1) & mask) {
++			if (rebound[at] == hash) return true;
++			if (rebound[at] == 0) return false;
++		}
++		return false;
++	}
++	void MarkRebound(uint64_t hash) {
++		hash            = IndexHash(hash);
++		const auto mask = rebound.size() - 1;
++		for (uint64_t i = 0, at = hash & mask; i < 8; ++i, at = (at + 1) & mask) {
++			if (rebound[at] == hash) return;
++			if (rebound[at] == 0) {
++				rebound[at] = hash;
++				return;
++			}
++		}
++		rebound[hash & mask] = hash;
++	}
++	// The latest relocated try: its object (key without the use) and, keyed by descriptor bases, its key by use.
++	uint64_t              object_hash = 0;
++	std::vector<uint32_t> use_key;
++	size_t                suffix_at = 0; // where the words the try added start (tried_suffix)
+ 	uint64_t                                swept_frame = UINT64_MAX;
+ 	// Draw-state key of the latest draw (native or normal), for clean draws.
+ 	uint64_t state_key       = 0;
+@@ -1183,11 +1226,14 @@
+ 	record.push_stages = push_stages;
+ 	record.has_push    = has_push;
+ 	record.upload      = upload;
+-	// A new image object can get a destroyed view's handle: an identical payload
+-	// keeps the set only over the same image objects.
+-	const bool same_images = !runtime || std::ranges::equal(record.images, image_deps, [](const auto& a, const auto& b) {
+-		return a.id == b.id && a.serial == b.serial;
+-	});
++	// A new image object can get a destroyed view's handle, and a new buffer a destroyed buffer's (the
++	// driver's handles are its objects' addresses): an identical payload keeps the set only over the same
++	// image and buffer objects. A set kept over a buffer the cache destroyed and made again at the same
++	// range holds the old one's device address: the GPU reads freed memory and the device is lost.
++	const bool same_objects =
++	    !runtime || (std::ranges::equal(record.images, image_deps,
++	                                    [](const auto& a, const auto& b) { return a.id == b.id && a.serial == b.serial; }) &&
++	                 std::ranges::equal(record.buffers, buffer_deps, [](const auto& a, const auto& b) { return a.id == b.id; }));
+ 	if (runtime) {
+ 		record.buffers            = std::move(buffer_deps);
+ 		record.images             = std::move(image_deps);
+@@ -1216,7 +1262,7 @@
+ 		for (uint32_t st = 0; st < record.stage_count; ++st) snapshots[st] = &record.stages[st].snapshot;
+ 		record.image_signature = NativeXprImageSignature({snapshots.data(), record.stage_count});
+ 	}
+-	if (record.set && same_images && same_payload(record.set_buffers, buffer_infos) &&
++	if (record.set && same_objects && same_payload(record.set_buffers, buffer_infos) &&
+ 	    same_payload(record.set_images, image_infos))
+ 		return nullptr;
+ 	NativeXprDropVariants(record);
+@@ -1284,6 +1330,13 @@
+ 	if (record.pipelines.empty() || record.set_writes.empty()) return false;
+ 	auto& textures = m_context.GetTextureCache();
+ 	auto& buffers  = m_context.GetBufferCache();
++	// The set's other buffers are written again as they are (and an earlier set holds them too): each must
++	// still be the object resolved, else the write names a destroyed buffer. Otherwise resolve everything.
++	for (const auto& dep: record.buffers) {
++		if (std::ranges::find(buffer_slots, std::pair {dep.stage, dep.slot}) != buffer_slots.end()) continue;
++		const auto* owner = buffers.GetBufferIfLive(dep.id);
++		if (owner == nullptr || owner->Handle() != dep.handle) return false;
++	}
+ 	std::array<const ShaderRecompiler::IR::ResourceSnapshot*, 2> snapshots {};
+ 	for (uint32_t st = 0; st < record.stage_count; ++st) snapshots[st] = &record.stages[st].snapshot;
+ 	const auto signature = NativeXprImageSignature({snapshots.data(), record.stage_count});
+@@ -1682,6 +1735,39 @@
+ 		for (const auto& root: record->roots) pair_stats.relocate &= ~(3ull << root.low_word);
+ 		return refuse();
+ 	}
++	if (!record->roots.empty() && !pair_stats.identity_known) {
++		using Kind                = ShaderRecompiler::IR::SrtReadTrace::Kind;
++		pair_stats.identity_known = true;
++		const auto& gather        = record->gather;
++		// The span of a record root that holds the word at `index` (in `words`), or none.
++		const auto table_of = [&](uint32_t index) -> const NativeXprRecord::Gather::Span* {
++			for (const auto& span: gather.spans)
++				if (span.level == 0 && span.root < record->roots.size() && index >= span.first && index < span.first + span.count)
++					return &span;
++			return nullptr;
++		};
++		for (const auto& span: gather.spans) {
++			if (span.level != 1 || span.root < record->roots.size()) continue;
++			const auto& pointer = gather.pointers[span.root - record->roots.size()];
++			const auto  low = gather.value_word[pointer.low], high = gather.value_word[pointer.high];
++			const auto* table = table_of(low);
++			if (table == nullptr || high != low + 1 || table != table_of(high)) continue;
++			const auto& root = record->roots[table->root];
++			for (uint32_t i = 0; i < span.count && pair_stats.identity.size() < 8; ++i) {
++				const auto v = gather.word_value[span.first + i];
++				if (v < 0 || gather.pointer_value[v] != 0) continue;
++				for (auto f = gather.feeds_at[v]; f < gather.feeds_at[v + 1]; ++f) {
++					const auto kind = static_cast<Kind>((gather.feeds[f] >> 24u) & 0xfu);
++					if ((kind == Kind::Buffer || kind == Kind::Image) && (gather.feeds[f] & 0xffu) == 0) {
++						pair_stats.identity.push_back({root.low_word, root.high_word,
++						                               static_cast<uint32_t>(table->address + 4u * (low - table->first)),
++						                               static_cast<uint32_t>(span.address + 4u * i)});
++						break;
++					}
++				}
++			}
++		}
++	}
+ 
+ 	// Render targets as this draw left them; a reopened rendering loads.
+ 	NativeXprDrawState draw_state;
+@@ -2211,6 +2297,9 @@
+ 				return NativeXprPatch::Evaluate;
+ 			}
+ 		}
++	// Another instance's buffers or images through this use's pointers: the object is keyed by its descriptor
++	// bases from now on (NativeXprTry).
++	if (rebind && m_native_xpr->tried_relocate != 0) m_native_xpr->MarkRebound(m_native_xpr->object_hash);
+ 	for (const auto& [index, value]: m_native_xpr->changed) {
+ 		for (auto f = gather.feeds_at[index]; f < gather.feeds_at[index + 1]; ++f) {
+ 			const auto feed = gather.feeds[f];
+@@ -2968,6 +3057,7 @@
+ 	const bool relocating = relocation && direct != nullptr;
+ 	auto       pair       = relocating ? cache.pairs.find(NativeXprPairKey(cache.key)) : cache.pairs.end();
+ 	cache.tried_relocate  = 0;
++	cache.use_key.clear();
+ 	const auto relocate   = [&] {
+ 		cache.full_key = cache.key;
+ 		for (auto words = pair->second.relocate; words != 0; words &= words - 1) cache.key[std::countr_zero(words)] = 0;
+@@ -2981,8 +3071,42 @@
+ 		const uint64_t object = direct != nullptr ? index_base : commands[0];
+ 		cache.key.push_back(static_cast<uint32_t>(object));
+ 		cache.key.push_back(static_cast<uint32_t>(object >> 32u));
+-		cache.key.push_back(cache.NextOccurrence(XXH3_64bits(cache.key.data(), cache.key.size() * sizeof(uint32_t)),
+-		                                         m_context.FrameNumber()));
++		const auto frame  = m_context.FrameNumber();
++		cache.object_hash = XXH3_64bits(cache.key.data(), cache.key.size() * sizeof(uint32_t));
++		auto use          = cache.NextOccurrence(cache.object_hash, frame);
++		cache.use_key.clear();
++		// An object whose record rebound its descriptors (the instances of a mesh drawn in another order): its
++		// descriptor bases through this draw's pointers join the key and the uses count among draws of the
++		// same ones, so each instance keeps its record whatever order the frame draws them in (instances that
++		// share all of them differ in data words only, which a use patches). The key by use stays a second
++		// choice: an object whose descriptors move every frame keeps that record.
++		if (const auto& identity = pair->second.identity;
++		    !identity.empty() && kyty_local_native_xpr_instance_mode.load(std::memory_order_relaxed) != 0) {
++			if (cache.Rebound(cache.object_hash)) {
++				cache.use_key = cache.key;
++				cache.use_key.push_back(use);
++				std::array<uint32_t, 8> words {};
++				uint64_t                table  = 0;
++				bool                    mapped = false;
++				for (size_t i = 0; i < identity.size(); ++i) {
++					const auto& id = identity[i];
++					if (i == 0 || id.low_word != identity[i - 1].low_word || id.high_word != identity[i - 1].high_word ||
++					    id.pointer != identity[i - 1].pointer) {
++						const auto root = NativeXprBase(cache.full_key[id.low_word], cache.full_key[id.high_word]);
++						table           = root == 0 ? 0
++						                            : NativeXprBase(NativeXprReadGuestWord(root + id.pointer),
++						                                            NativeXprReadGuestWord(root + id.pointer + 4));
++						// A pointer read from memory may hold anything: what is read through it must be mapped.
++						mapped = table != 0 && Libs::LibKernel::Memory::IsFullyMapped(table + id.offset, 4);
++					}
++					if (mapped) words[i] = NativeXprReadGuestWord(table + id.offset);
++				}
++				cache.key.push_back(static_cast<uint32_t>(XXH3_64bits(words.data(), identity.size() * sizeof(uint32_t))));
++				use = cache.NextOccurrence(XXH3_64bits(cache.key.data(), cache.key.size() * sizeof(uint32_t)), frame);
++			}
++		}
++		cache.key.push_back(use);
++		cache.suffix_at = masked;
+ 		cache.tried_suffix.assign(cache.key.begin() + static_cast<std::ptrdiff_t>(masked), cache.key.end());
+ 	};
+ 	if (pair != cache.pairs.end() && pair->second.relocate != 0) relocate();
+@@ -3001,6 +3125,20 @@
+ 			found = cache.IndexFind(hash);
+ 		}
+ 	}
++	// A key by descriptor bases that misses: one the last frames had is stored (the normal path draws once);
++	// a new one (a new instance, or an object whose descriptors move every frame) takes the object's use
++	// instead, its record or a store by use.
++	std::optional<bool> seen_again;
++	if ((found == nullptr || !found->SameKey(cache.key)) && !cache.use_key.empty()) {
++		seen_again = cache.SeenAgain(hash, m_context.FrameNumber());
++		if (!*seen_again) {
++			seen_again.reset();
++			cache.key.swap(cache.use_key);
++			cache.tried_suffix.assign(cache.key.begin() + static_cast<std::ptrdiff_t>(cache.suffix_at), cache.key.end());
++			hash  = XXH3_64bits(cache.key.data(), cache.key.size() * sizeof(uint32_t));
++			found = cache.IndexFind(hash);
++		}
++	}
+ 	if (found != nullptr) NativeXprPrefetchFields(*found);
+ 	LiveCounters::Add(direct != nullptr ? LiveCounters::XprDirectTries : LiveCounters::XprTries);
+ 	// The key a store this try requests is refused under (a found record's too: dropped, it stores again).
+@@ -3030,7 +3168,7 @@
+ 			LiveCounters::Add(LiveCounters::XprMissRefused);
+ 			return false;
+ 		}
+-		if (!cache.SeenAgain(hash, m_context.FrameNumber())) {
++		if (!(seen_again ? *seen_again : cache.SeenAgain(hash, m_context.FrameNumber()))) {
+ 			LiveCounters::Add(LiveCounters::XprMissUnseen);
+ 			return false;
+ 		}
+diff --git a/src/local/performance-switches.h b/src/local/performance-switches.h
+--- a/src/local/performance-switches.h
++++ b/src/local/performance-switches.h
+@@ -38,6 +38,7 @@
+ extern volatile std::atomic_uint32_t kyty_local_native_xpr_relocate_mode;
+ extern volatile std::atomic_uint32_t kyty_local_native_xpr_store_budget;
+ extern volatile std::atomic_uint32_t kyty_local_native_xpr_keep_frames;
++extern volatile std::atomic_uint32_t kyty_local_native_xpr_instance_mode;
+ #endif
+ }
+ 
+@@ -105,6 +106,7 @@
+ 	    Switch {"KYTY_NATIVE_XPR_STORE_BUDGET", &kyty_local_native_xpr_store_budget, 0, 65536},
+ 	    // Frames an unused native XPR record stays (at least 2).
+ 	    Switch {"KYTY_NATIVE_XPR_KEEP_FRAMES", &kyty_local_native_xpr_keep_frames, 0, 1000000},
++	    Switch {"KYTY_NATIVE_XPR_INSTANCES", &kyty_local_native_xpr_instance_mode},
+ #endif
+ 	};
+ 	std::string enabled;
+diff --git a/src/local/shader-hash-memo.h b/src/local/shader-hash-memo.h
+new file mode 100644
+--- /dev/null
++++ b/src/local/shader-hash-memo.h
+@@ -0,0 +1,26 @@
++#pragma once
++#include <array>
++#include <cstddef>
++#include <cstdint>
++namespace ShaderHashMemo {
++// Heap-allocated per thread. Registration generation and size invalidate reuse;
++// changed code at the same registration is periodically rehashed in full.
++class Cache {
++    struct Entry { uint64_t address=0, generation=0, hash=0; size_t bytes=0; unsigned uses=0; bool valid=false, unstable=false; };
++    std::array<Entry,8192> entries {};
++public:
++    template<class Hash> uint64_t Get(uint64_t address, size_t bytes, uint64_t generation, bool verify, Hash hash) {
++        auto& e=entries[((address>>8)^(address>>20)) & (entries.size()-1)];
++        if (!e.valid || e.address!=address || e.bytes!=bytes || e.generation!=generation) {
++            e={address,generation,hash(),bytes,0,true,false};
++            return e.hash;
++        }
++        if (verify || e.unstable || ++e.uses>=64) {
++            const auto fresh=hash();
++            e.unstable |= fresh!=e.hash;
++            e.hash=fresh; e.uses=0;
++        }
++        return e.hash;
++    }
++};
++}
+diff --git a/src/local/vram-pressure.h b/src/local/vram-pressure.h
+new file mode 100644
+--- /dev/null
++++ b/src/local/vram-pressure.h
+@@ -0,0 +1,22 @@
++#pragma once
++#include <cstdint>
++#include <algorithm>
++#include <cstdlib>
++namespace VramPressure {
++inline bool Enabled() { static const bool enabled=[] {const char* v=std::getenv("KYTY_VRAM_PRESSURE");return v ? std::atoi(v)!=0 : true;}(); return enabled; }
++// Keep headroom proportional to the current Vulkan budget, including small GPUs.
++template<class Image,class MetadataKind> bool CpuBackedSampled(const Image& image,MetadataKind none) {
++    return image.registered && image.usage.texture && !image.usage.storage &&
++           !image.usage.render_target && !image.usage.depth_target && !image.usage.video_out &&
++           !image.depth_id && !image.info.IsDepth() && !image.info.HasStencil() &&
++           image.info.metadata.kind==none && !image.IsGpuModified() &&
++           !image.IsStencilModified() && !image.IsBufferModified();
++}
++inline uint64_t Target(uint64_t budget) {return budget-std::min<uint64_t>(budget/16,256ull<<20);}
++inline uint64_t PoolLimit(uint64_t usage,uint64_t budget,uint64_t pooled,uint64_t limit) {
++    const auto outside=usage-std::min(usage,pooled);
++    const auto target=Target(budget);
++    return std::min(limit,target>outside ? target-outside : uint64_t{0});
++}
++inline bool Reclaim(uint64_t usage,uint64_t budget) {return budget!=0 && usage>=Target(budget);}
++}
+diff --git a/src/local/vulkan-recording.cpp b/src/local/vulkan-recording.cpp
+--- a/src/local/vulkan-recording.cpp
++++ b/src/local/vulkan-recording.cpp
+@@ -1,5 +1,6 @@
+ #include "vulkan-recording.h"
+ #include "graphics/host_gpu/vulkanCommon.h"
++#include "live-census.h"
+ #include "live-trace-gpu.h"
+ #include "local-platform.h"
+ #include "time-census.h"
+@@ -294,12 +295,14 @@
+ // Work calls recorded by this thread (read by the render thread's barrier dedupe, which orders
+ // only its own command stream): a plain increment, not a locked add on every command.
+ thread_local uint64_t g_work_calls = 0;
++thread_local uint64_t g_packets    = 0;
+ #include "local-vulkan-recording.inc"
+ } // namespace
+ 
+ void Install() { InstallDispatch(); }
+ const vk::detail::DispatchLoaderDynamic& DirectDispatch() { return original; }
+ uint64_t WorkCalls() { return g_work_calls; }
++uint64_t RecordedWork() { return g_work_calls + g_packets; }
+ void Drain() { if (producer) producer->Drain(); }
+ bool PacketsEnabled() {
+     return producer && kyty_local_vulkan_recording_mode.load(std::memory_order_relaxed) != 0;
+@@ -312,6 +315,7 @@
+     if (!PacketsEnabled() || !replay || segments.size() > 8) return false;
+     for (const auto& segment : segments)
+         if (segment.size && !segment.data) return false;
++    ++g_packets;
+     auto* stream = RecordingStream();
+     return stream->Enqueue([&](Writer& writer) {
+         std::array<Segment, 8> copied {};
+diff --git a/src/local/vulkan-recording.h b/src/local/vulkan-recording.h
+--- a/src/local/vulkan-recording.h
++++ b/src/local/vulkan-recording.h
+@@ -48,6 +48,8 @@
+ // Commands the calling thread recorded that do GPU work or synchronize (draws, dispatches,
+ // copies, clears, rendering scopes, barriers): unchanged between two barriers = no work in between.
+ uint64_t WorkCalls();
++// Work calls and packets (draws, descriptors) the calling thread recorded: unchanged = nothing recorded.
++uint64_t RecordedWork();
+ class ProducerScope {
+ public:
+     ProducerScope();
