@@ -1,0 +1,33 @@
+{
+  "baseline": "B146",
+  "status": "frozen",
+  "accepted_packaging_commit": "4d57a73f50bb1ea887c567c80c9d19bd5e94930c",
+  "accepted_packaging_tree": "4b6bb76d590e1c5bbf702090c5f8830919c47b9e",
+  "frozen_branch": "best146-frozen-stability-hitches",
+  "working_branch": "best132-shader-precompile-settings",
+  "accepted_by_user": "Build is good; freeze and make the new base",
+  "build_run_id": 37168895686,
+  "build_url": "https://github.com/MILLYONYT/Demon-Souls-KytyPS5/actions/runs/37168895686",
+  "build_conclusion": "success",
+  "artifact": {
+    "id": 11290739029,
+    "name": "KytyPS5-B146-STABILITY-HITCHES-Windows-x64-146",
+    "sha256": "b0dfba5765123f6b5b6b66bcc071295926f53be379f18a9b49d501f07f3be22b",
+    "expires_at": "2027-01-02T01:43:51Z"
+  },
+  "upstream_source": {
+    "repository": "chenxiao07/KytyPS5",
+    "commit": "bb0fbe7e9f22d9bf2455f486fbf1a9aa33a6354d",
+    "atrac9_commit": "ec8899dadf393f655f2871a94e0fe4b3d6220c9a"
+  },
+  "preserve": [
+    "All B123, B127 and B131 rendering/FPS/performance patches",
+    "B145 guarded fiber stacks, migrating TLS and Windows stack bounds fixes",
+    "B146 isolated optimizer cache, periodic driver-cache snapshots and shader recording restart",
+    "Existing shader preparation, cache identity, settings and launcher behavior",
+    "Fast first-use pipeline builds, partial dirty image uploads and row-band uploads",
+    "All Windows regression and patch-preservation checks"
+  ],
+  "driver_cache_key": "98edcf312ef7ea126af9bb5a876005fc746955313ea0535ba2563c766289753b",
+  "future_changes": "Use this exact frozen B146 commit as the baseline; apply only additive, reviewable fixes and retain all existing improvements. Do not move the frozen branch for later builds."
+}
