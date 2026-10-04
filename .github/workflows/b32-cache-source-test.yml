@@ -1,4 +1,4 @@
-name: KytyPS5 B145 fiber stack stability
+name: KytyPS5 B146 stability and hitch reduction
 on:
   push:
     branches: [best132-shader-precompile-settings]
@@ -9,12 +9,15 @@ on:
       - patches/b131-inplace-shader-preparation.patch
       - tools/windows/prepare-shaders.ps1
       - tools/ci/fiber-stack-preflight.py
+      - tools/ci/driver-cache-checkpoint-tests.cpp
+      - tools/ci/texture-row-band-preflight.py
+      - patches/b146-driver-checkpoints-hitch-reduction.patch
   workflow_dispatch:
 permissions:
   contents: read
 jobs:
   windows-x64:
-    name: Build B145 with preserved shader caches and guarded fiber stacks
+    name: Build B146 with preserved performance patches, guarded fibers and persistent pipelines
     runs-on: windows-2022
     steps:
       - uses: actions/checkout@v4
@@ -111,6 +114,27 @@ jobs:
           if ($LASTEXITCODE) { throw 'Fiber stack fix does not match pinned baseline' }
           git -C source apply ../fiber-stack-fix.patch
           if ($LASTEXITCODE) { throw 'Fiber stack fix failed' }
+      - name: Apply incremental gameplay checkpoint and hitch fixes
+        shell: pwsh
+        run: |
+          git -C source apply --check ../patches/b146-driver-checkpoints-hitch-reduction.patch
+          if ($LASTEXITCODE) { throw 'B146 incremental patch does not match preserved B145 source' }
+          git -C source apply ../patches/b146-driver-checkpoints-hitch-reduction.patch
+          if ($LASTEXITCODE) { throw 'B146 incremental patch failed' }
+      - name: Verify checkpoint races and production texture row selection
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force _Build | Out-Null
+          clang-cl /std:c++20 /O2 /EHsc /Isource/src/local tools/ci/driver-cache-checkpoint-tests.cpp /Fe:_Build/checkpoint-tests.exe
+          if ($LASTEXITCODE) { throw 'Checkpoint regression compilation failed' }
+          & _Build/checkpoint-tests.exe
+          if ($LASTEXITCODE) { throw 'Checkpoint concurrency regression failed' }
+          python tools/ci/texture-row-band-preflight.py source _Build/row-band-tests.cpp
+          if ($LASTEXITCODE) { throw 'Texture row-band extraction failed' }
+          clang-cl /std:c++20 /O2 /EHsc _Build/row-band-tests.cpp /Fe:_Build/row-band-tests.exe
+          if ($LASTEXITCODE) { throw 'Texture row-band regression compilation failed' }
+          & _Build/row-band-tests.exe
+          if ($LASTEXITCODE) { throw 'Texture row-band regression failed' }
       - name: Preflight production fiber switches before the full build
         shell: pwsh
         run: |
@@ -129,7 +153,7 @@ jobs:
           -DCMAKE_BUILD_TYPE=Release -DKYTY_BUILD_LAUNCHER=OFF
           -DKYTY_MARCH=x86-64-v3 -DKYTY_THIN_LTO=ON
           -DKYTY_BUILD_ORIGIN=Fork -DKYTY_BUILD_REPOSITORY=${{ github.repository }}
-          -DKYTY_RELEASE_TAG=B145-FIBER-STACKS-${{ github.run_number }}
+          -DKYTY_RELEASE_TAG=B146-STABILITY-HITCHES-${{ github.run_number }}
           "-DCMAKE_CXX_FLAGS=/DWIN32 /D_WINDOWS /W3 /GR /EHsc /DKYTY_B32_FAST_CPU_SETS /DKYTY_B32_QUIET_SHADER_PHASES"
           -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl
       - name: Verify required Windows compiler flags
@@ -169,6 +193,10 @@ jobs:
           $null = $process.Handle
           if (!$process.WaitForExit(120000)) { $process.Kill(); $process.WaitForExit(); throw 'Fiber migration regression timed out' }
           if ($process.ExitCode) { throw "Fiber migration/headroom regression failed ($($process.ExitCode))" }
+          git -C source apply --reverse --check ../patches/b146-driver-checkpoints-hitch-reduction.patch
+          if ($LASTEXITCODE) { throw 'B146 checkpoint/diagnostic/lifecycle patch missing from compiled source' }
+          git -C source apply --reverse ../patches/b146-driver-checkpoints-hitch-reduction.patch
+          if ($LASTEXITCODE) { throw 'Incremental B146 verification undo failed' }
           git -C source apply --reverse --check ../fiber-stack-fix.patch
           if ($LASTEXITCODE) { throw 'Fiber stack fix or regression coverage missing' }
       - name: Verify frozen rendering fix and exact performance patch
@@ -192,6 +220,10 @@ jobs:
           if ($LASTEXITCODE) { throw 'Incremental verification restore failed' }
           git -C source apply ../patches/b131-inplace-shader-preparation.patch
           if ($LASTEXITCODE) { throw 'Shader preparation verification restore failed' }
+          git -C source apply --check ../patches/b146-driver-checkpoints-hitch-reduction.patch
+          if ($LASTEXITCODE) { throw 'Preserved performance source no longer accepts B146 fixes' }
+          git -C source apply ../patches/b146-driver-checkpoints-hitch-reduction.patch
+          if ($LASTEXITCODE) { throw 'B146 verification restore failed' }
       - name: Package portable candidate
         shell: pwsh
         run: |
@@ -227,7 +259,7 @@ jobs:
           Set-Content "$out/run.cmd" -Encoding ASCII -Value @(
             '@echo off',
             'if /I "%~1"=="settings" goto settings',
-            'powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0run-windows.ps1" -Baseline -Prompt -Set KYTY_PORTABLE_SHADERS=0,KYTY_DRIVER_CACHE_KEY=98edcf312ef7ea126af9bb5a876005fc746955313ea0535ba2563c766289753b,KYTY_SHADER_WARMUP=1,KYTY_SHADER_WARMUP_THREADS=12,KYTY_SHADER_WARMUP_SECONDS=60,KYTY_SHADER_WARMUP_FILE=_PipelineCache/warmup-legacy/recording.shaders,KYTY_PREPARATION_SCRATCH=1,KYTY_DISPATCH_BATCH=128,KYTY_BACKING_READ=1,KYTY_FRAME_PIPELINE=1,KYTY_READBACK_QUEUE=1,KYTY_READBACK_SLOTS=1,KYTY_ASYNC_UPLOAD=2,KYTY_BDA_DIRTY_REGIONS=1,KYTY_NATIVE_XPR=1,KYTY_NATIVE_XPR_RELOCATE=1,KYTY_NATIVE_XPR_STORE_BUDGET=256,KYTY_NATIVE_XPR_KEEP_FRAMES=600,KYTY_NATIVE_IMAGE_PROOF=1,KYTY_ASYNC_XPR_PIPELINES=1,KYTY_VULKAN_RECORDING=0,KYTY_DEFERRED_SUBMIT=0 %*',
+            'powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0run-windows.ps1" -Baseline -Prompt -Set KYTY_PORTABLE_SHADERS=0,KYTY_DRIVER_CACHE_KEY=98edcf312ef7ea126af9bb5a876005fc746955313ea0535ba2563c766289753b,KYTY_SHADER_WARMUP=1,KYTY_SHADER_WARMUP_THREADS=12,KYTY_SHADER_WARMUP_SECONDS=60,KYTY_SHADER_WARMUP_FILE=_PipelineCache/warmup-legacy/recording.shaders,KYTY_PREPARATION_SCRATCH=1,KYTY_DISPATCH_BATCH=128,KYTY_BACKING_READ=1,KYTY_FRAME_PIPELINE=1,KYTY_READBACK_QUEUE=1,KYTY_READBACK_SLOTS=1,KYTY_ASYNC_UPLOAD=2,KYTY_BDA_DIRTY_REGIONS=1,KYTY_NATIVE_XPR=1,KYTY_NATIVE_XPR_RELOCATE=1,KYTY_NATIVE_XPR_STORE_BUDGET=256,KYTY_NATIVE_XPR_KEEP_FRAMES=600,KYTY_NATIVE_IMAGE_PROOF=1,KYTY_ASYNC_XPR_PIPELINES=1,KYTY_PIPELINE_FAST_BUILD=1,KYTY_PARTIAL_IMAGE_DIRTY=1,KYTY_PARTIAL_ROW_BANDS=1,KYTY_VULKAN_RECORDING=0,KYTY_DEFERRED_SUBMIT=0 %*',
             'goto finish',
             ':settings',
             'powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0settings.ps1"',
@@ -305,13 +337,22 @@ jobs:
             memory_stack_temporary_fix_upstream='9d1fabe240c274a64b0b54904bf1c399208b2f55'
             fiber_regression='16 KiB context; nested 2 KiB frames plus 48 KiB probed frame; active NT_TIB bounds read with volatile noinline helper on migration and restored on yield'
             prior_candidate_configuration_included=$false
-            source_modifications=@('ATRAC9 public dependency substitution','Initialize indexed shader before mesh-stage inspection','Reviewed performance ports from accepted B102/B103 lineage','Driver cache survives Save','Hash-bucketed SRT planning and shader compiler optimizations','GPU readback batching','Native XPR relocation retention and rebinding','Per-region BDA proofs and range-scoped upload waits','BryKytyPS5 BDA suballocation and exact fp32 math','Small CPU index range synchronization','GPU-completed descriptor reuse pool expansion','Recording worker and deferred submission disabled after B129 regression','In-place shader resource specialization and fused image remap traversal','In-place shader interface collection','Workspace-owned indirect sort storage reuse')
+            source_modifications=@('ATRAC9 public dependency substitution','Initialize indexed shader before mesh-stage inspection','Reviewed performance ports from accepted B102/B103 lineage','Driver cache survives Save','Hash-bucketed SRT planning and shader compiler optimizations','GPU readback batching','Native XPR relocation retention and rebinding','Per-region BDA proofs and range-scoped upload waits','BryKytyPS5 BDA suballocation and exact fp32 math','Small CPU index range synchronization','GPU-completed descriptor reuse pool expansion','Recording worker and deferred submission disabled after B129 regression','In-place shader resource specialization and fused image remap traversal','In-place shader interface collection','Workspace-owned indirect sort storage reuse','Background snapshots of foreground and isolated optimizer driver caches','Shader recording resumes after manual Save','Pipeline driver phase hitch diagnostics','Partial dirty image and row-band upload controls','Cross-thread fiber termination and guarded-stack reuse regression')
             launcher_mode='upstream -Baseline'
             settings_window_included=$true
             shader_precompile_settings_modes=@('Recorded cache','Full game')
             full_game_seeds_from_selected_title_and_version=$true
             shader_precompile_python_numpy_required_only_for_full=$true
-            rendering_source_identical_to_b132=$true
+            rendering_source_identical_to_b132=$false
+            previous_rendering_performance_patches_preserved=$true
+            incremental_gameplay_patch='b146-driver-checkpoints-hitch-reduction'
+            driver_cache_checkpoint_seconds=10
+            optimizer_driver_cache_isolated=$true
+            manual_save_resumes_shader_recording=$true
+            pipeline_fast_build_enabled=$true
+            partial_image_dirty_mode=1
+            partial_row_bands_enabled=$true
+            fiber_termination_reuse_cycles=64
             settings_vblank_range_hz=@(30,360)
             settings_vblank_default_hz=60
             settings_vblank_persists=$true
@@ -379,17 +420,17 @@ jobs:
           $config.command = @('--','kyty_emulator.exe','--screen-width','1920','--screen-height','1080','--fullscreen','--present-mode','Mailbox','--shader-optimization-type','Performance','--vblank-frequency','120')
           $testConfig = Join-Path $env:RUNNER_TEMP 'launcher-test.json'
           $config | ConvertTo-Json -Depth 4 | Set-Content $testConfig -Encoding UTF8
-          $text = (& "$out/run-windows.ps1" -Config $testConfig -Game $fake -Baseline -Set KYTY_PORTABLE_SHADERS=0,KYTY_DRIVER_CACHE_KEY=98edcf312ef7ea126af9bb5a876005fc746955313ea0535ba2563c766289753b,KYTY_SHADER_WARMUP=1,KYTY_SHADER_WARMUP_THREADS=12,KYTY_SHADER_WARMUP_SECONDS=60,KYTY_SHADER_WARMUP_FILE=_PipelineCache/warmup-legacy/recording.shaders,KYTY_PREPARATION_SCRATCH=1,KYTY_DISPATCH_BATCH=128,KYTY_BACKING_READ=1,KYTY_FRAME_PIPELINE=1,KYTY_READBACK_QUEUE=1,KYTY_READBACK_SLOTS=1,KYTY_ASYNC_UPLOAD=2,KYTY_BDA_DIRTY_REGIONS=1,KYTY_NATIVE_XPR=1,KYTY_NATIVE_XPR_RELOCATE=1,KYTY_NATIVE_XPR_STORE_BUDGET=256,KYTY_NATIVE_XPR_KEEP_FRAMES=600,KYTY_NATIVE_IMAGE_PROOF=1,KYTY_ASYNC_XPR_PIPELINES=1,KYTY_VULKAN_RECORDING=0,KYTY_DEFERRED_SUBMIT=0 -DryRun 6>&1 | Out-String)
+          $text = (& "$out/run-windows.ps1" -Config $testConfig -Game $fake -Baseline -Set KYTY_PORTABLE_SHADERS=0,KYTY_DRIVER_CACHE_KEY=98edcf312ef7ea126af9bb5a876005fc746955313ea0535ba2563c766289753b,KYTY_SHADER_WARMUP=1,KYTY_SHADER_WARMUP_THREADS=12,KYTY_SHADER_WARMUP_SECONDS=60,KYTY_SHADER_WARMUP_FILE=_PipelineCache/warmup-legacy/recording.shaders,KYTY_PREPARATION_SCRATCH=1,KYTY_DISPATCH_BATCH=128,KYTY_BACKING_READ=1,KYTY_FRAME_PIPELINE=1,KYTY_READBACK_QUEUE=1,KYTY_READBACK_SLOTS=1,KYTY_ASYNC_UPLOAD=2,KYTY_BDA_DIRTY_REGIONS=1,KYTY_NATIVE_XPR=1,KYTY_NATIVE_XPR_RELOCATE=1,KYTY_NATIVE_XPR_STORE_BUDGET=256,KYTY_NATIVE_XPR_KEEP_FRAMES=600,KYTY_NATIVE_IMAGE_PROOF=1,KYTY_ASYNC_XPR_PIPELINES=1,KYTY_PIPELINE_FAST_BUILD=1,KYTY_PARTIAL_IMAGE_DIRTY=1,KYTY_PARTIAL_ROW_BANDS=1,KYTY_VULKAN_RECORDING=0,KYTY_DEFERRED_SUBMIT=0 -DryRun 6>&1 | Out-String)
           foreach ($expected in @('--screen-width 1920','--screen-height 1080','--fullscreen','--present-mode Mailbox','--shader-optimization-type Performance','--vblank-frequency 120')) {
             if (!$text.Contains($expected)) { throw "Launcher ignored setting: $expected" }
           }
           if (!$text.Contains('KYTY_PORTABLE_SHADERS=0') -or !$text.Contains('KYTY_DRIVER_CACHE_KEY=98edcf312ef7ea126af9bb5a876005fc746955313ea0535ba2563c766289753b')) {
             throw 'Launcher ignored the legacy binding or isolated cache override'
           }
-          foreach ($expected in @('KYTY_VULKAN_RECORDING=0','KYTY_DEFERRED_SUBMIT=0','KYTY_FRAME_PIPELINE=1','KYTY_NATIVE_XPR=1','KYTY_NATIVE_XPR_STORE_BUDGET=256','KYTY_BDA_DIRTY_REGIONS=1','KYTY_ASYNC_UPLOAD=2','KYTY_READBACK_QUEUE=1','KYTY_SHADER_WARMUP=1','KYTY_PREPARATION_SCRATCH=1','KYTY_DISPATCH_BATCH=128')) {
+          foreach ($expected in @('KYTY_VULKAN_RECORDING=0','KYTY_DEFERRED_SUBMIT=0','KYTY_FRAME_PIPELINE=1','KYTY_NATIVE_XPR=1','KYTY_NATIVE_XPR_STORE_BUDGET=256','KYTY_BDA_DIRTY_REGIONS=1','KYTY_ASYNC_UPLOAD=2','KYTY_READBACK_QUEUE=1','KYTY_SHADER_WARMUP=1','KYTY_PREPARATION_SCRATCH=1','KYTY_DISPATCH_BATCH=128','KYTY_PIPELINE_FAST_BUILD=1','KYTY_PARTIAL_IMAGE_DIRTY=1','KYTY_PARTIAL_ROW_BANDS=1')) {
             if (!$text.Contains($expected)) { throw "Launcher ignored proven performance override: $expected" }
           }
-          $override = (& "$out/run-windows.ps1" -Config $testConfig -Game $fake -Baseline -Set KYTY_PORTABLE_SHADERS=0,KYTY_DRIVER_CACHE_KEY=98edcf312ef7ea126af9bb5a876005fc746955313ea0535ba2563c766289753b,KYTY_SHADER_WARMUP=1,KYTY_SHADER_WARMUP_THREADS=12,KYTY_SHADER_WARMUP_SECONDS=60,KYTY_SHADER_WARMUP_FILE=_PipelineCache/warmup-legacy/recording.shaders,KYTY_PREPARATION_SCRATCH=1,KYTY_DISPATCH_BATCH=128,KYTY_BACKING_READ=1,KYTY_FRAME_PIPELINE=1,KYTY_READBACK_QUEUE=1,KYTY_READBACK_SLOTS=1,KYTY_ASYNC_UPLOAD=2,KYTY_BDA_DIRTY_REGIONS=1,KYTY_NATIVE_XPR=1,KYTY_NATIVE_XPR_RELOCATE=1,KYTY_NATIVE_XPR_STORE_BUDGET=256,KYTY_NATIVE_XPR_KEEP_FRAMES=600,KYTY_NATIVE_IMAGE_PROOF=1,KYTY_ASYNC_XPR_PIPELINES=1,KYTY_VULKAN_RECORDING=0,KYTY_DEFERRED_SUBMIT=0 -Vblank 240 -DryRun 6>&1 | Out-String)
+          $override = (& "$out/run-windows.ps1" -Config $testConfig -Game $fake -Baseline -Set KYTY_PORTABLE_SHADERS=0,KYTY_DRIVER_CACHE_KEY=98edcf312ef7ea126af9bb5a876005fc746955313ea0535ba2563c766289753b,KYTY_SHADER_WARMUP=1,KYTY_SHADER_WARMUP_THREADS=12,KYTY_SHADER_WARMUP_SECONDS=60,KYTY_SHADER_WARMUP_FILE=_PipelineCache/warmup-legacy/recording.shaders,KYTY_PREPARATION_SCRATCH=1,KYTY_DISPATCH_BATCH=128,KYTY_BACKING_READ=1,KYTY_FRAME_PIPELINE=1,KYTY_READBACK_QUEUE=1,KYTY_READBACK_SLOTS=1,KYTY_ASYNC_UPLOAD=2,KYTY_BDA_DIRTY_REGIONS=1,KYTY_NATIVE_XPR=1,KYTY_NATIVE_XPR_RELOCATE=1,KYTY_NATIVE_XPR_STORE_BUDGET=256,KYTY_NATIVE_XPR_KEEP_FRAMES=600,KYTY_NATIVE_IMAGE_PROOF=1,KYTY_ASYNC_XPR_PIPELINES=1,KYTY_PIPELINE_FAST_BUILD=1,KYTY_PARTIAL_IMAGE_DIRTY=1,KYTY_PARTIAL_ROW_BANDS=1,KYTY_VULKAN_RECORDING=0,KYTY_DEFERRED_SUBMIT=0 -Vblank 240 -DryRun 6>&1 | Out-String)
           if (!$override.Contains('--vblank-frequency 240') -or $override.Contains('--vblank-frequency 120')) { throw 'Explicit vblank override did not take precedence' }
           $defaults = (& "$out/run-windows.ps1" -Config "$out/launch.json" -Game $fake -Baseline -DryRun 6>&1 | Out-String)
           if (!$defaults.Contains('--vblank-frequency 60')) { throw 'Missing vblank setting did not default to 60 Hz' }
@@ -417,7 +458,7 @@ jobs:
       - name: Upload clean standalone public fork
         uses: actions/upload-artifact@v4
         with:
-          name: KytyPS5-B145-FIBER-STACKS-Windows-x64-${{ github.run_number }}
+          name: KytyPS5-B146-STABILITY-HITCHES-Windows-x64-${{ github.run_number }}
           path: _Build/package/**
           if-no-files-found: error
 

@@ -1,0 +1,435 @@
+diff --git a/src/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp b/src/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp
+--- a/src/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp
++++ b/src/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp
+@@ -28,6 +28,7 @@
+ #include "local-platform.h"
+ #include "slow-log.h"
+ #include "startup-progress.h"
++#include "driver-cache-checkpoint.h"
+ 
+ #include <algorithm>
+ #include <array>
+@@ -39,6 +40,7 @@
+ #include <cstdlib>
+ #include <cstring>
+ #include <deque>
++#include <exception>
+ #include <mutex>
+ #include <fstream>
+ #include <functional>
+@@ -1139,6 +1141,7 @@
+ 	Workers().Push([this, optimized = pipeline.optimized, layouts, build = std::move(build)]() mutable {
+ 		if (!m_stopping.load(std::memory_order_relaxed)) build(layouts);
+ 		optimized->pipeline = layouts.pipeline;
++		if (layouts.pipeline != nullptr) MarkDriverCacheDirty();
+ 		optimized->done.store(true, std::memory_order_release);
+ 		m_optimized_builds.fetch_add(1, std::memory_order_release);
+ 	});
+@@ -1197,6 +1200,7 @@
+     : m_graphics(graphics), m_program_cache(std::make_unique<ProgramCache>(graphics.device)) {
+ 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
+ 	InitializeDriverCache();
++	InitializeOptimizerCache();
+ 	StartupProgress::Report("Loading the pipeline cache", 0, 0);
+ 	InitializeStaticCache(false);
+ 	// Not in the static precompile: a shell that ran the game passes its KYTY_SHADER_WARMUP(_ONLY) on.
+@@ -1260,6 +1264,17 @@
+ 		    PipelineCacheTitleId() + ShaderInputDeviceSignature(m_graphics.GetPhysicalDeviceProperties()), std::move(warm));
+ 	}
+ #endif
++	if (m_driver_cache != nullptr) {
++		m_driver_checkpoint = std::make_unique<DriverCacheCheckpoint>([this] {
++			try { return SaveDriverCache(); }
++			catch (const std::exception& error) {
++				PipelineCacheLog("Vulkan pipeline cache: checkpoint failed ({})", error.what());
++				return false;
++			}
++		});
++		// Includes newly compiled startup pipelines not followed by a synchronous Save.
++		MarkDriverCacheDirty();
++	}
+ }
+ 
+ PipelineCache::PrefetchProgress PipelineCache::GetPrefetchProgress() const {
+@@ -1359,6 +1374,9 @@
+ }
+ 
+ PipelineCache::~PipelineCache() {
++	// The callback uses the device and both cache handles. Join it before teardown.
++	// Keep its object alive until compile workers finish, since they can mark it dirty.
++	if (m_driver_checkpoint != nullptr) m_driver_checkpoint->Stop();
+ 	FinishCompileWorkers();
+ 	Save();
+ 	auto destroy = [this](const auto& pipelines) {
+@@ -1380,6 +1398,9 @@
+ 	}
+ 	if (m_driver_cache != nullptr) {
+ 		m_graphics.device.destroyPipelineCache(m_driver_cache, nullptr);
++	}
++	if (m_optimizer_cache != nullptr) {
++		m_graphics.device.destroyPipelineCache(m_optimizer_cache, nullptr);
+ 	}
+ 	if (m_static_cache != nullptr) {
+ 		m_graphics.static_pipeline_cache = nullptr;
+@@ -1570,14 +1591,57 @@
+ 	}
+ }
+ 
++void PipelineCache::InitializeOptimizerCache() {
++	if (m_driver_cache == nullptr) return;
++	const vk::PipelineCacheCreateInfo info {};
++	const auto result = m_graphics.device.createPipelineCache(&info, nullptr, &m_optimizer_cache);
++	if (result != vk::Result::eSuccess) {
++		m_optimizer_cache = nullptr;
++		PipelineCacheLog("Vulkan pipeline cache: isolated optimizer cache unavailable ({})", vk::to_string(result));
++	} else {
++		// Reuse the previous session's optimized builds without sharing the
++		// foreground cache with long-running optimization work.
++		const auto seeded = m_graphics.device.mergePipelineCaches(m_optimizer_cache, 1, &m_driver_cache);
++		if (seeded != vk::Result::eSuccess)
++			PipelineCacheLog("Vulkan pipeline cache: optimizer seed failed ({})", vk::to_string(seeded));
++	}
++}
++
++void PipelineCache::MarkDriverCacheDirty() {
++	if (m_driver_checkpoint != nullptr) m_driver_checkpoint->MarkDirty();
++}
++
+ bool PipelineCache::Save() {
+ 	Common::LockGuard lock(m_mutex);
+ 	const bool inputs_saved = m_program_cache->warmup.Save();
+ 	if (!inputs_saved) PipelineCacheLog("Shader warmup: cache save failed");
+ 	else if (m_program_cache->warmup.Enabled()) PipelineCacheLog("Shader warmup: saved {} inputs and {} pipelines",
+ 	    m_program_cache->warmup.records.size(), m_program_cache->warmup.pipelines.size());
+-	if (m_driver_cache == nullptr) {
+-		return inputs_saved;
++	// A manual gameplay Save must not permanently stop recording later shaders.
++	if (!m_stopping.load(std::memory_order_acquire)) m_program_cache->warmup.StartWriter();
++	return SaveDriverCache() && inputs_saved;
++}
++
++bool PipelineCache::SaveDriverCache() {
++	std::lock_guard save_lock(m_driver_save_mutex);
++	if (m_driver_cache == nullptr) return true;
++	// Snapshot into a private destination: the live caches stay available to their
++	// respective callers. Only this thread accesses the merge destination. Source
++	// caches use Vulkan's default internal synchronization (no external-sync flag).
++	struct Snapshot {
++		vk::Device device;
++		vk::PipelineCache cache = nullptr;
++		~Snapshot() { if (cache != nullptr) device.destroyPipelineCache(cache, nullptr); }
++	} snapshot {m_graphics.device};
++	const vk::PipelineCacheCreateInfo info {};
++	auto merged = m_graphics.device.createPipelineCache(&info, nullptr, &snapshot.cache);
++	if (merged == vk::Result::eSuccess) {
++		const vk::PipelineCache sources[] {m_driver_cache, m_optimizer_cache};
++		merged = m_graphics.device.mergePipelineCaches(snapshot.cache, m_optimizer_cache != nullptr ? 2u : 1u, sources);
++	}
++	if (merged != vk::Result::eSuccess) {
++		PipelineCacheLog("Vulkan pipeline cache: checkpoint merge failed ({})", vk::to_string(merged));
++		return false;
+ 	}
+ 
+ 	size_t               size = 0;
+@@ -1585,13 +1649,13 @@
+ 	std::vector<uint8_t> payload;
+ 	for (uint32_t attempt = 0; attempt < 3; attempt++) {
+ 		size   = 0;
+-		result = m_graphics.device.getPipelineCacheData(m_driver_cache, &size, nullptr);
++		result = m_graphics.device.getPipelineCacheData(snapshot.cache, &size, nullptr);
+ 		if (result != vk::Result::eSuccess || size == 0 ||
+ 		    size > std::numeric_limits<uint32_t>::max()) {
+ 			break;
+ 		}
+ 		payload.resize(size);
+-		result = m_graphics.device.getPipelineCacheData(m_driver_cache, &size, payload.data());
++		result = m_graphics.device.getPipelineCacheData(snapshot.cache, &size, payload.data());
+ 		if (result != vk::Result::eIncomplete) {
+ 			break;
+ 		}
+@@ -1631,7 +1695,7 @@
+ 	                 Common::PathToString(m_driver_cache_path));
+ 	// Save may run after warmup while gameplay still compiles pipelines.
+ 	// Keep the driver cache alive until the destructor, and save later additions at exit.
+-	return inputs_saved;
++	return true;
+ }
+ 
+ namespace {
+@@ -1997,7 +2061,8 @@
+ 			CreatePipelineInternal(m_graphics, *job->pipeline, job->rendering, job->vertex_input,
+ 			                       job->vs_input_info, job->vertex_program,
+ 			                       job->ps_active ? &job->ps_input_info : nullptr, job->pixel_program,
+-			                       job->static_params, m_driver_cache, job->native_bindings);
++			                       job->static_params, m_optimizer_cache, job->native_bindings);
++			if (job->pipeline->pipeline != nullptr) MarkDriverCacheDirty();
+ 			job->done.store(true, std::memory_order_release);
+ 		});
+ 		LiveCounters::Add(LiveCounters::AsyncPipelines);
+@@ -2027,6 +2092,7 @@
+ 
+ 	EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr);
+ 	EXIT_NOT_IMPLEMENTED(cached->pipeline_layout == nullptr);
++	MarkDriverCacheDirty();
+ 
+ 	auto [iter, inserted] = m_graphics_pipelines.emplace(std::move(key), std::move(cached));
+ 	EXIT_IF(!inserted);
+@@ -2039,7 +2105,7 @@
+ 	                               pixel_info, vertex_program, pixel_program, static_params,
+ 	                               native_bindings](Pipeline& layouts) {
+ 		CreatePipelineInternal(m_graphics, layouts, rendering, vertex_input, vs_input_info, vertex_program,
+-		                       pixel_info ? &*pixel_info : nullptr, pixel_program, static_params, m_driver_cache,
++		                       pixel_info ? &*pixel_info : nullptr, pixel_program, static_params, m_optimizer_cache,
+ 		                       native_bindings, PipelineBuild::Optimize);
+ 	});
+ 	// Warmup recipes describe the normal variant only.
+@@ -2090,11 +2156,12 @@
+ 
+ 	EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr);
+ 	EXIT_NOT_IMPLEMENTED(cached->pipeline_layout == nullptr);
++	MarkDriverCacheDirty();
+ 
+ 	auto [iter, inserted] = m_compute_pipelines.emplace(compute_program.id, std::move(cached));
+ 	EXIT_IF(!inserted);
+ 	BuildOptimized(*iter->second, [this, input_info, module = compute_program.module](Pipeline& layouts) {
+-		CreatePipelineInternal(m_graphics, layouts, input_info, module, m_driver_cache, PipelineBuild::Optimize);
++		CreatePipelineInternal(m_graphics, layouts, input_info, module, m_optimizer_cache, PipelineBuild::Optimize);
+ 	});
+ 	LocalShaderWarmup::PipelineRecord recipe;
+ 	recipe.compute = m_program_cache->RecordedIndex(compute_program);
+diff --git a/src/graphics/host_gpu/renderer/pipeline/pipelineCache.h b/src/graphics/host_gpu/renderer/pipeline/pipelineCache.h
+--- a/src/graphics/host_gpu/renderer/pipeline/pipelineCache.h
++++ b/src/graphics/host_gpu/renderer/pipeline/pipelineCache.h
+@@ -15,11 +15,14 @@
+ #include <filesystem>
+ #include <functional>
+ #include <memory>
++#include <mutex>
+ #include <span>
+ #include <string>
+ #include <type_traits>
+ #include <unordered_map>
+ #include <vector>
++
++class DriverCacheCheckpoint;
+ 
+ namespace Libs::Graphics {
+ 
+@@ -301,6 +304,10 @@
+ 	GraphicContext&               m_graphics;
+ 	std::unique_ptr<ProgramCache> m_program_cache;
+ 	vk::PipelineCache             m_driver_cache = nullptr;
++	// Background optimization must not monopolize the cache probed by first-use draws.
++	vk::PipelineCache             m_optimizer_cache = nullptr;
++	std::mutex                   m_driver_save_mutex;
++	std::unique_ptr<DriverCacheCheckpoint> m_driver_checkpoint;
+ 	// The static precompile's pipelines (_PipelineCache/static), kept across emulator builds:
+ 	// GraphicContext::static_pipeline_cache while loaded.
+ 	vk::PipelineCache             m_static_cache = nullptr;
+@@ -341,6 +348,9 @@
+ 	void            BuildOptimized(Pipeline& pipeline, std::function<void(Pipeline&)> build);
+ 	void            PromoteOptimized();
+ 	void InitializeDriverCache();
++	void InitializeOptimizerCache();
++	void MarkDriverCacheDirty();
++	bool SaveDriverCache();
+ 	void InitializeStaticCache(bool create);
+ 	void WarmPipelines();
+ #ifdef KYTY_STATIC_PRECOMPILE
+diff --git a/src/graphics/host_gpu/renderer/pipeline/shaders.cpp b/src/graphics/host_gpu/renderer/pipeline/shaders.cpp
+--- a/src/graphics/host_gpu/renderer/pipeline/shaders.cpp
++++ b/src/graphics/host_gpu/renderer/pipeline/shaders.cpp
+@@ -17,6 +17,7 @@
+ #include "graphics/shader/recompiler/ir/ShaderIR.h"
+ #include "graphics/shader/rectListShader.h"
+ #include "graphics/shader/shader.h"
++#include "slow-log.h"
+ 
+ #include <algorithm>
+ #include <cstdio>
+@@ -258,11 +259,20 @@
+ template <typename Info, typename Create>
+ static vk::Result CreatePipelineHandle(GraphicContext& graphics, PipelineCache::Pipeline& pipeline, Info info,
+                                        vk::PipelineCache driver_cache, PipelineBuild build, Create create) {
++	const char* phase = "cache-probe";
++	const auto timed_create = [&](vk::PipelineCache cache, const auto& request) {
++		SlowLog::Scope slow([&](double ms) {
++			std::printf("SLOW VulkanPipelineCreate %.1f ms build=%s phase=%s cache=%s\n", ms,
++			            build == PipelineBuild::Fast ? "fast" : build == PipelineBuild::Optimize ? "optimize" : "full",
++			            phase, cache != nullptr ? "present" : "none");
++		}, SlowLog::HitchThreshold());
++		return create(cache, request);
++	};
+ 	const auto cached = [&](vk::PipelineCache cache) {
+ 		if (cache == nullptr || !graphics.pipeline_cache_control_enabled) return false;
+ 		auto lookup = info;
+ 		lookup.flags |= vk::PipelineCreateFlagBits::eFailOnPipelineCompileRequired;
+-		if (create(cache, lookup) == vk::Result::eSuccess) return true;
++		if (timed_create(cache, lookup) == vk::Result::eSuccess) return true;
+ 		pipeline.pipeline = nullptr;
+ 		return false;
+ 	};
+@@ -282,23 +292,31 @@
+ 				auto with              = info;
+ 				from.pNext             = with.pNext;
+ 				with.pNext             = &from;
+-				if (create(nullptr, with) == vk::Result::eSuccess) {
++				phase = "binary-restore";
++				if (timed_create(nullptr, with) == vk::Result::eSuccess) {
+ 					if (writer != nullptr) writer->Copy(key, *store);
+ 					return vk::Result::eSuccess;
+ 				}
+ 				pipeline.pipeline = nullptr;
+ 			}
+-			if (writer != nullptr) return CapturePipelineBinaries(graphics, pipeline, info, driver_cache, key, create);
+-		}
+-	}
++			if (writer != nullptr) {
++				phase = "binary-capture";
++				return CapturePipelineBinaries(graphics, pipeline, info, driver_cache, key, timed_create);
++			}
++		}
++	}
++	phase = "static-probe";
+ 	if (build != PipelineBuild::Optimize && store == nullptr && cached(graphics.static_pipeline_cache))
+ 		return vk::Result::eSuccess;
+-	if (build != PipelineBuild::Fast) return create(driver_cache, info);
++	phase = build == PipelineBuild::Optimize ? "optimization" : "full-build";
++	if (build != PipelineBuild::Fast) return timed_create(driver_cache, info);
++	phase = "driver-probe";
+ 	if (cached(driver_cache)) return vk::Result::eSuccess;
+ 	// In no cache: NVIDIA compiles this ~100x faster, so the draw or dispatch does not stall.
+ 	info.flags |= vk::PipelineCreateFlagBits::eDisableOptimization;
+ 	pipeline.unoptimized = true;
+-	return create(nullptr, info);
++	phase = "fast-build";
++	return timed_create(nullptr, info);
+ }
+ 
+ // NOLINTNEXTLINE(readability-function-cognitive-complexity)
+diff --git a/tests/FiberMigrationTests.cpp b/tests/FiberMigrationTests.cpp
+--- a/tests/FiberMigrationTests.cpp
++++ b/tests/FiberMigrationTests.cpp
+@@ -94,6 +94,20 @@
+ 
+ void KYTY_SYSV_ABI Entry(uint64_t expected_address, uint64_t argument) {
+   EnterWithHostFrames(24, expected_address, argument);
++}
++
++void KYTY_SYSV_ABI EndingEntry(uint64_t expected_address, uint64_t argument) {
++  volatile uint8_t frame[48 * 1024];
++  for (size_t i = 0; i < sizeof(frame); i += 4096) frame[i] = 0xa5;
++  Check(argument == 10, "initial lifecycle argument");
++  Check(FiberReturnToThread(11, &argument) == 0 && argument == 12,
++        "resume terminating fiber on another worker");
++  FiberObject* current = nullptr;
++  Check(FiberGetSelf(&current) == 0 && reinterpret_cast<uint64_t>(current) == expected_address,
++        "terminating fiber owns destination thread TLS");
++  for (size_t i = 0; i < sizeof(frame); i += 4096)
++    Check(frame[i] == 0xa5, "terminating frame survives migration");
++  // Return naturally: exercise FiberFinishOnCurrentThread, not another yield.
+ }
+ }
+ 
+@@ -164,6 +178,43 @@
+   Check(FiberFinalize(fiber) == 0, "finalize suspended fiber");
+   for (size_t i = sizeof(uint64_t); i < stack.size(); ++i)
+     Check(stack[i] == std::byte {}, "fiber must not overwrite adjacent game context storage");
++  std::puts("FiberMigrationTests: repeated migration, termination and stack reuse");
++  for (unsigned cycle = 0; cycle < 64; ++cycle) {
++    Check(FiberInitialize(fiber, "lifecycle", EndingEntry, reinterpret_cast<uint64_t>(fiber),
++                          stack.data(), stack.size(), nullptr, 0x03500000) == 0,
++          "reinitialize guarded fiber");
++    std::thread starter([&] {
++      uint64_t returned = 0;
++      Check(FiberRun(fiber, 10, &returned) == 0 && returned == 11, "start lifecycle fiber");
++    });
++    starter.join();
++    std::thread finisher([&] {
++#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
++      const auto before = ReadWindowsStackBounds();
++#endif
++      uint64_t returned = 99;
++      Check(FiberRun(fiber, 12, &returned) == -2141650938 && returned == 0,
++            "natural entry return reports terminated state");
++      FiberObject* current = fiber;
++      Check(FiberGetSelf(&current) == 0 && current == nullptr,
++            "termination clears destination thread ownership");
++#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
++      const auto after = ReadWindowsStackBounds();
++      const auto address = reinterpret_cast<uintptr_t>(&returned);
++      Check(after.high == before.high && after.low <= before.low &&
++            address >= after.low && address < after.high,
++            "termination restores destination thread stack bounds");
++#endif
++      Check(FiberRun(fiber, 13, nullptr) == -2141650938, "terminated fiber cannot resume");
++    });
++    finisher.join();
++    for (size_t i = sizeof(uint64_t); i < stack.size(); ++i)
++      Check(stack[i] == std::byte {}, "recycling preserves adjacent game context storage");
++  }
++  Check(FiberInitialize(fiber, "cleanup", EndingEntry, reinterpret_cast<uint64_t>(fiber),
++                        stack.data(), stack.size(), nullptr, 0x03500000) == 0,
++        "reinitialize terminated fiber for cleanup");
++  Check(FiberFinalize(fiber) == 0, "release recycled guarded stack");
+   subsystems.Destroy();
+   std::puts("FiberMigrationTests: all cases passed");
+ }
+diff --git a/src/local/driver-cache-checkpoint.h b/src/local/driver-cache-checkpoint.h
+new file mode 100644
+--- /dev/null
++++ b/src/local/driver-cache-checkpoint.h
+@@ -0,0 +1,53 @@
++#pragma once
++
++#include <atomic>
++#include <chrono>
++#include <condition_variable>
++#include <cstdint>
++#include <functional>
++#include <mutex>
++#include <thread>
++#include <utility>
++
++// Keep disk writes off the render thread. A failed save leaves the generation
++// dirty; changes made during a save are checkpointed on the following pass.
++class DriverCacheCheckpoint {
++public:
++    explicit DriverCacheCheckpoint(std::function<bool()> save,
++                                   std::chrono::milliseconds interval = std::chrono::seconds(10))
++        : worker([this, save = std::move(save), interval](std::stop_token stop) {
++            uint64_t saved = 0;
++            for (;;) {
++                {
++                    std::unique_lock lock(wait_mutex);
++                    wake.wait_for(lock, stop, interval, [] { return false; });
++                }
++                if (stop.stop_requested()) return;
++                const auto wanted = generation.load(std::memory_order_acquire);
++                if (wanted == saved) continue;
++                try {
++                    if (save()) saved = wanted;
++                } catch (...) {
++                    // Allocation/I/O failures must not terminate a play session.
++                    // The dirty generation is retried on the next interval.
++                }
++            }
++        }) {}
++    ~DriverCacheCheckpoint() { Stop(); }
++    DriverCacheCheckpoint(const DriverCacheCheckpoint&) = delete;
++    DriverCacheCheckpoint& operator=(const DriverCacheCheckpoint&) = delete;
++    void MarkDirty() { generation.fetch_add(1, std::memory_order_release); }
++    void Stop() {
++        if (!worker.joinable()) return;
++        worker.request_stop();
++        wake.notify_all();
++        worker.join();
++    }
++
++private:
++    std::atomic<uint64_t> generation {0};
++    std::mutex wait_mutex;
++    std::condition_variable_any wake;
++    // Last: all state exists before the worker can start, and outlives its join.
++    std::jthread worker;
++};
